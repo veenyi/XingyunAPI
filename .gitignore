@@ -17,3 +17,4 @@ Thumbs.db
 # 敏感信息
 .env
 credentials.txt
+xingyun-api/app/bin/

@@ -1,7 +1,0 @@
-#!/bin/bash
-
-### 行云API 卸载前回调 — 停止进程
-
-"${TRIM_APPDEST}/cmd/main" stop 2>/dev/null || true
-pkill -f "bin/JoyCode2Api" 2>/dev/null || true
-exit 0
