@@ -173,8 +173,20 @@ const Chat: React.FC = () => {
         </Space>
       </Card>
 
-      {/* 消息列表 */}
-      <Card size="small" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {/* 消息列表 — 普通 div（antd Card 的 body 不收缩会导致列表无法滚动） */}
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+          background: 'var(--jc-bg-elevated)',
+          border: '1px solid var(--jc-card-border)',
+          borderRadius: 12,
+          padding: '12px',
+        }}
+      >
         <div ref={listRef} style={{ flex: 1, overflowY: 'auto', paddingRight: 4, minHeight: 0 }}>
           {messages.length === 0 && (
             <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center' }}>
@@ -234,7 +246,7 @@ const Chat: React.FC = () => {
             </div>
           ))}
         </div>
-      </Card>
+      </div>
 
       {/* 输入区 — 固定在页面底部（独立于聊天卡片，永不随内容滚动/下移） */}
       <div
