@@ -1,0 +1,37 @@
+#!/bin/bash
+
+### 行云API 升级回调 — 数据保留，权限与版本确认
+
+set -e
+
+TRIM_APPDEST="${TRIM_APPDEST:-/var/apps/xingyun-api}"
+TRIM_PKGHOME="${TRIM_PKGHOME:-/var/apps/xingyun-api/home}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/xingyun-api/var}"
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+
+log_msg() {
+    local msg="$(date '+%Y-%m-%d %H:%M:%S') - [upgrade] $1"
+    echo "$msg"
+    echo "$msg" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+toast_err() {
+    echo "$*" > "$TRIM_TEMP_LOGFILE"
+}
+
+trap 'toast_err "脚本出错(L${LINENO}): $(tail -3 "${LOG_FILE}" 2>/dev/null)"' ERR
+
+log_msg "=== upgrade_callback start ==="
+
+chmod 755 "${TRIM_APPDEST}/bin/JoyCode2Api" 2>/dev/null || true
+mkdir -p "${TRIM_PKGVAR}" "${TRIM_PKGHOME}"
+echo "$(cat "${TRIM_APPDEST}/manifest" 2>/dev/null | grep '^version' | awk '{print $3}')" > "${TRIM_PKGVAR}/app_version" 2>/dev/null || true
+
+if [ -n "${TRIM_USERNAME}" ]; then
+    chown -R "${TRIM_USERNAME}:${TRIM_USERNAME}" "${TRIM_PKGVAR}" 2>>"${LOG_FILE}" || true
+    chown -R "${TRIM_USERNAME}:${TRIM_USERNAME}" "${TRIM_PKGHOME}" 2>>"${LOG_FILE}" || true
+fi
+
+trap - ERR
+log_msg "upgrade_callback finished."
+exit 0

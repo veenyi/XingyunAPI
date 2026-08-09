@@ -1,0 +1,19 @@
+# 依赖与构建产物
+node_modules/
+web/dist/
+web/node_modules/
+*.fpk
+xingyun-api-slim/
+pkg/
+.fpk
+
+# 系统与 IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# 敏感信息
+.env
+credentials.txt

@@ -1,0 +1,889 @@
+import React, { useEffect, useState } from 'react';
+import {
+  Alert, Card, Row, Col, Statistic, Typography, Skeleton, Tag, Select, Button,
+  message, Space, Table, Badge, Segmented, Popconfirm, Tooltip, Divider, Progress,
+} from 'antd';
+import {
+  ArrowLeftOutlined, ApiOutlined, ThunderboltOutlined,
+  CheckCircleOutlined, ReloadOutlined,
+  ClockCircleOutlined, GlobalOutlined, FireOutlined, CopyOutlined,
+  DeleteOutlined, QuestionCircleOutlined, InfoCircleOutlined,
+  CloseCircleOutlined, SwapOutlined,
+} from '@ant-design/icons';
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip,
+  ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area,
+} from 'recharts';
+import { useParams, useNavigate } from 'react-router-dom';
+import { api, accountDisplayName } from '../api';
+import type { Account, AccountStats, ModelInfo, RequestLog } from '../api';
+import SvgClaudeCode from '../components/ClaudeCodeIcon';
+import SvgCodex from '../components/CodexIcon';
+import CommandTooltip from '../components/CommandTooltip';
+
+// 兜底模型列表（上游 modelList 获取失败时使用；优先显示上游实时模型）
+const BUILTIN_MODELS = [
+  { label: 'JoyAI-Code-1.5', value: 'JoyAI-Code-1.5' },
+  { label: 'MiniMax-M3', value: 'MiniMax-M3' },
+  { label: 'MiniMax-M2.7', value: 'MiniMax-M2.7' },
+  { label: 'Kimi-K2.6', value: 'Kimi-K2.6' },
+  { label: 'GLM-5.1', value: 'GLM-5.1' },
+  { label: 'GLM-5', value: 'GLM-5' },
+  { label: 'DeepSeek-V4-Pro', value: 'DeepSeek-V4-Pro' },
+  { label: 'Doubao-Seed-2.0-pro', value: 'Doubao-Seed-2.0-pro' },
+  { label: 'Claude-Opus-4.7', value: 'Claude-Opus-4.7' },
+];
+
+const isClaudeModel = (model?: string) => model === 'Claude-Opus-4.7';
+
+const PIE_COLORS = ['#22C55E', '#3B82F6', '#F59E0B', '#EF4444', '#A855F7', '#06B6D4', '#EC4899', '#84CC16'];
+
+const CHART_COLORS = {
+  primary: '#22C55E',
+  secondary: '#3B82F6',
+  danger: '#EF4444',
+  warning: '#F59E0B',
+  grid: '#1F2937',
+  axis: '#475569',
+};
+
+const latencyColor = (ms: number) => {
+  if (ms < 500) return '#22C55E';
+  if (ms < 1500) return '#F59E0B';
+  return '#EF4444';
+};
+
+const fmtTokens = (n: number) => {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return n.toLocaleString();
+};
+
+const statusTag = (code: number) => {
+  if (code >= 200 && code < 300) return <Tag color="success">{code}</Tag>;
+  if (code >= 400 && code < 500) return <Tag color="warning">{code}</Tag>;
+  return <Tag color="error">{code}</Tag>;
+};
+
+const formatTime = (t: string) => {
+  if (!t) return '-';
+  const d = new Date(t + (t.includes('Z') || t.includes('+') ? '' : 'Z'));
+  if (isNaN(d.getTime())) return t;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+};
+
+const formatLatency = (ms: number) => {
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  const remainMs = ms % 1000;
+  if (s < 60) return `${s}s${remainMs > 0 ? ` ${remainMs}ms` : ''}`;
+  const m = Math.floor(s / 60);
+  const remainS = s % 60;
+  return `${m}m${remainS > 0 ? ` ${remainS}s` : ''}`;
+};
+
+const getBaseURL = () => `${window.location.protocol}//${window.location.host}`;
+
+const buildClaudeCodeCmd = (apiKey: string, model = 'GLM-5.1') => [
+  `API_TIMEOUT_MS=6000000 \\`,
+  `CLAUDE_CODE_MAX_RETRIES=3 \\`,
+  `NODE_TLS_REJECT_UNAUTHORIZED=0 \\`,
+  `ANTHROPIC_BASE_URL=${getBaseURL()} \\`,
+  `ANTHROPIC_API_KEY="${apiKey}" \\`,
+  `CLAUDE_CODE_MAX_OUTPUT_TOKENS=6553655 \\`,
+  `ANTHROPIC_MODEL=${model} \\`,
+  `claude --dangerously-skip-permissions`,
+].join('\n');
+
+const buildCodexCmd = (apiKey: string, model = 'GLM-5.1') => [
+  `OPENAI_BASE_URL=${getBaseURL()}/v1 \\`,
+  `OPENAI_API_KEY="${apiKey}" \\`,
+  `OPENAI_MODEL=${model} \\`,
+  `codex`,
+].join('\n');
+
+const copyCmd = async (text: string, label: string) => {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    message.success(`${label} 命令已复制到剪贴板`);
+  } catch {
+    message.error('复制失败');
+  }
+};
+
+const AccountDetail: React.FC = () => {
+  const { userId } = useParams<{ userId: string }>();
+  const navigate = useNavigate();
+  const [account, setAccount] = useState<Account | null>(null);
+  const [stats, setStats] = useState<AccountStats | null>(null);
+  const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [savingModel, setSavingModel] = useState(false);
+  const [logFilter, setLogFilter] = useState<string>('all');
+  const [activeSessions, setActiveSessions] = useState(0);
+  const [pointData, setPointData] = useState<any>(null);
+
+  const decodedKey = userId ? decodeURIComponent(userId) : '';
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [accounts, statsData, logsData] = await Promise.all([
+        api.listAccounts(),
+        api.getAccountStats(decodedKey),
+        api.getAccountLogs(decodedKey, 500),
+      ]);
+      const acc = accounts.find((a) => a.user_id === decodedKey);
+      setAccount(acc || null);
+      setStats(statsData);
+      setLogs(logsData.logs || []);
+    } catch (e: unknown) {
+      message.error(e instanceof Error ? e.message : '加载失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchModels = async () => {
+    setModelLoading(true);
+    try {
+      const data = await api.listAccountModels(decodedKey);
+      setModels(data);
+    } catch {
+      // fallback to builtin
+    } finally {
+      setModelLoading(false);
+    }
+  };
+
+  useEffect(() => { fetchData(); }, [decodedKey]);
+  useEffect(() => { fetchModels(); }, [decodedKey]);
+  useEffect(() => {
+    api.getAccountPoint(decodedKey)
+      .then((d) => setPointData(d))
+      .catch(() => setPointData(null));
+  }, [decodedKey]);
+
+  // Poll active sessions every 5s
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const accounts = await api.listAccounts();
+        const acc = accounts.find((a) => a.user_id === decodedKey);
+        if (acc) setActiveSessions(acc.active_sessions);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => clearInterval(id);
+  }, [decodedKey]);
+
+  const handleModelChange = async (newModel: string) => {
+    setSavingModel(true);
+    try {
+      await api.updateAccountModel(decodedKey, newModel);
+      message.success(`默认模型已更新为「${newModel || '未设置'}」`);
+      fetchData();
+    } catch (e: unknown) {
+      message.error(e instanceof Error ? e.message : '更新失败');
+    } finally {
+      setSavingModel(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="jc-page">
+        <Skeleton.Button active block style={{ height: 80, marginBottom: 16, borderRadius: 10 }} />
+        <Row gutter={[16, 16]}>
+          <Col xs={24} md={12}><Card size="small"><Skeleton active paragraph={{ rows: 5 }} /></Card></Col>
+          <Col xs={24} md={12}><Card size="small"><Skeleton active paragraph={{ rows: 5 }} /></Card></Col>
+        </Row>
+      </div>
+    );
+  }
+  if (!account) return <div style={{ textAlign: 'center', padding: 100 }}>账号不存在</div>;
+
+  const allModelOptions = [
+    ...BUILTIN_MODELS,
+    ...models
+      .filter((m) => !BUILTIN_MODELS.some((b) => b.value === m.id))
+      .map((m) => ({ label: m.name || m.id, value: m.id })),
+  ];
+
+  const filteredLogs = logFilter === 'all'
+    ? logs
+    : logFilter === 'errors'
+      ? logs.filter((l) => l.status_code >= 400)
+      : logs.filter((l) => l.stream);
+
+  const endpointData = stats?.by_endpoint.map((e) => ({
+    name: e.endpoint.replace('/v1/', ''),
+    value: e.count,
+  })) || [];
+
+  const logColumns = [
+    {
+      title: '时间',
+      dataIndex: 'created_at',
+      key: 'time',
+      width: 170,
+      render: (t: string) => (
+        <Typography.Text style={{ fontSize: 12, fontFamily: 'monospace' }}>
+          {formatTime(t)}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: '端点',
+      dataIndex: 'endpoint',
+      key: 'endpoint',
+      width: 200,
+      render: (ep: string) => (
+        <Typography.Text code style={{ fontSize: 12 }}>{ep}</Typography.Text>
+      ),
+    },
+    {
+      title: '模型',
+      dataIndex: 'model',
+      key: 'model',
+      width: 140,
+      ellipsis: true,
+      render: (m: string) => m || <Typography.Text type="secondary">-</Typography.Text>,
+    },
+    {
+      title: '流式',
+      dataIndex: 'stream',
+      key: 'stream',
+      width: 60,
+      render: (s: boolean) => s
+        ? <Badge status="processing" text="" />
+        : <Badge status="default" text="" />,
+    },
+    {
+      title: '状态',
+      dataIndex: 'status_code',
+      key: 'status',
+      width: 70,
+      render: (code: number) => statusTag(code),
+    },
+    {
+      title: '输入',
+      dataIndex: 'input_tokens',
+      key: 'input',
+      width: 80,
+      sorter: (a: RequestLog, b: RequestLog) => a.input_tokens - b.input_tokens,
+      render: (n: number) => (
+        <Typography.Text style={{ fontSize: 12, fontFamily: 'monospace' }}>
+          {n > 0 ? fmtTokens(n) : '-'}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: '输出',
+      dataIndex: 'output_tokens',
+      key: 'output',
+      width: 80,
+      sorter: (a: RequestLog, b: RequestLog) => a.output_tokens - b.output_tokens,
+      render: (n: number) => (
+        <Typography.Text style={{ fontSize: 12, fontFamily: 'monospace' }}>
+          {n > 0 ? fmtTokens(n) : '-'}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: '延迟',
+      dataIndex: 'latency_ms',
+      key: 'latency',
+      width: 100,
+      sorter: (a: RequestLog, b: RequestLog) => a.latency_ms - b.latency_ms,
+      render: (ms: number) => (
+        <Typography.Text style={{ color: latencyColor(ms), fontFamily: 'monospace', fontWeight: 500 }}>
+          {formatLatency(ms)}
+        </Typography.Text>
+      ),
+    },
+  ];
+
+  return (
+    <div className="jc-page">
+      {/* Header */}
+      <div style={{
+        marginBottom: 20, display: 'flex', alignItems: 'center', gap: 12,
+        borderBottom: '1px solid #1F2937', paddingBottom: 16, flexWrap: 'wrap',
+      }}>
+        <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/accounts')} type="text" />
+        <div style={{ flex: 1, minWidth: 240 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Typography.Title level={4} style={{ margin: 0 }}>{accountDisplayName(account)}</Typography.Title>
+            {account.is_default && <Tag color="blue">默认</Tag>}
+          </div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {account.user_id} · 创建于 {account.created_at?.slice(0, 10) || '-'}
+          </Typography.Text>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>Token:</Typography.Text>
+            <Typography.Text code copyable style={{ fontSize: 11 }}>
+              {account.api_token}
+            </Typography.Text>
+          </div>
+          <div style={{ marginTop: 6 }}>
+            {activeSessions > 0 ? (
+              <Badge status="processing" color="#22C55E" text={
+                <Typography.Text style={{ fontSize: 12, color: '#22C55E' }}>
+                  {activeSessions} 个活跃会话
+                </Typography.Text>
+              } />
+            ) : (
+              <Badge status="default" text={
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>无活跃会话</Typography.Text>
+              } />
+            )}
+          </div>
+        </div>
+        <Space wrap>
+          <Tooltip title="此模型的用途仅限生成下方的快速启动命令。实际请求中的模型由客户端指定（如 ANTHROPIC_MODEL 环境变量），始终优先于本设置。模型列表来自 JoyCode API 支持的模型 + 服务器动态获取的扩展模型。">
+            <QuestionCircleOutlined style={{ color: 'var(--jc-fg-muted)', cursor: 'help' }} />
+          </Tooltip>
+          <Select
+            style={{ width: 220 }}
+            value={account.default_model || undefined}
+            placeholder="默认模型"
+            options={allModelOptions}
+            allowClear
+            loading={modelLoading}
+            onChange={handleModelChange}
+            disabled={savingModel}
+            size="small"
+          />
+          {isClaudeModel(account.default_model) && (
+            <Tooltip title="Claude 模型需要本机登录 JoyCode IDE">
+              <InfoCircleOutlined style={{ color: '#F59E0B' }} />
+            </Tooltip>
+          )}
+          <Button size="small" onClick={async () => {
+            try {
+              await api.renewToken(decodedKey);
+              message.success('API Token 已更新');
+              fetchData();
+            } catch (e: unknown) {
+              message.error(e instanceof Error ? e.message : '更新失败');
+            }
+          }}>
+            重置 Token
+          </Button>
+          <Button size="small" icon={<ReloadOutlined />} onClick={() => { fetchData(); fetchModels(); }}>
+            刷新
+          </Button>
+          <Popconfirm
+            title={`确定要删除账号「${accountDisplayName(account)}」吗？`}
+            description="删除后使用该密钥的客户端将无法访问"
+            onConfirm={async () => {
+              try {
+                await api.removeAccount(decodedKey);
+                message.success(`账号「${accountDisplayName(account)}」已删除`);
+                navigate('/accounts');
+              } catch (e: unknown) {
+                message.error(e instanceof Error ? e.message : '删除账号失败');
+              }
+            }}
+          >
+            <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
+          </Popconfirm>
+        </Space>
+      </div>
+
+      {/* 积分用量（上游 getNewIdePoint） */}
+      {pointData && Array.isArray(pointData.usageItems) && pointData.usageItems.length > 0 && (
+        <Card size="small" style={{ marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <Typography.Text strong style={{ fontSize: 13 }}>
+              <ApiOutlined /> 积分用量
+            </Typography.Text>
+            <Space size={10}>
+              <Typography.Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
+                {pointData.accountRole === 'sub' ? '子账号' : '主账号'}
+                {pointData.title ? ` · ${pointData.title}` : ''}
+              </Typography.Text>
+              {pointData.detail?.url && (
+                <Button
+                  size="small"
+                  type="link"
+                  href={`https://joycode.jd.com${pointData.detail.url}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ padding: 0, fontSize: 12, height: 'auto' }}
+                >
+                  {pointData.detail.text || '官方明细'}
+                </Button>
+              )}
+            </Space>
+          </div>
+          <Row gutter={[16, 12]}>
+            {pointData.usageItems.map((item: any, idx: number) => (
+              <Col xs={24} md={12} key={idx}>
+                <div style={{ background: 'var(--jc-card-bg)', borderRadius: 10, padding: '12px 14px', border: '1px solid var(--jc-card-border)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <Typography.Text strong style={{ fontSize: 13 }}>{item.title}</Typography.Text>
+                    {item.badge && <Tag color="green" style={{ fontSize: 11, marginInlineEnd: 0 }}>{item.badge}</Tag>}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 22, fontWeight: 700, color: 'var(--jc-fg)' }}>{item.used ?? 0}</span>
+                    <span style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
+                      / {item.total != null ? item.total : ''} {item.unit || ''}
+                    </span>
+                  </div>
+                  <Progress
+                    percent={Math.min(100, Math.max(0, item.usedPercent ?? 0))}
+                    size="small"
+                    strokeColor={item.status === 'exhausted' ? '#EF4444' : '#22C55E'}
+                    trailColor="var(--jc-card-border)"
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--jc-fg-muted)', marginTop: 4 }}>
+                    <span>剩余 {item.remain ?? 0} {item.unit || ''}</span>
+                    <span>{item.expireText || ''}</span>
+                  </div>
+                  {item.description && <div style={{ fontSize: 11, color: 'var(--jc-fg-muted)', marginTop: 4, lineHeight: 1.5 }}>{item.description}</div>}
+                </div>
+              </Col>
+            ))}
+          </Row>
+        </Card>
+      )}
+
+      {/* Quick start commands */}
+      {isClaudeModel(account.default_model) && (
+        <Alert
+          type="warning"
+          showIcon
+          message="Claude 模型需要 JoyCode IDE 登录态"
+          description="请确保本机 JoyCode IDE 已登录，否则 Claude 模型无法使用。"
+          style={{ marginBottom: 16 }}
+        />
+      )}
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+          <Typography.Text strong style={{ fontSize: 13 }}>
+            快速启动命令
+          </Typography.Text>
+          <Tooltip title="模型优先级：客户端指定的模型（如启动命令中的 ANTHROPIC_MODEL）始终优先。上方设置的「默认模型」仅用于生成这些命令中的模型参数。如果你手动修改了启动命令中的模型，以你手动指定的为准。">
+            <Typography.Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)', cursor: 'help' }}>
+              <InfoCircleOutlined /> 模型优先级说明
+            </Typography.Text>
+          </Tooltip>
+        </div>
+        <Row gutter={[16, 12]}>
+          <Col xs={24} md={12}>
+            <div className="jc-code-block">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <SvgClaudeCode />
+                  <Typography.Text strong style={{ fontSize: 13 }}>Claude Code</Typography.Text>
+                </div>
+                <CommandTooltip
+                  command={buildClaudeCodeCmd(account.api_token, account.default_model || undefined)}
+                  label="Claude Code"
+                >
+                  <Button
+                    type="text" size="small" icon={<CopyOutlined />}
+                    onClick={() => copyCmd(buildClaudeCodeCmd(account.api_token, account.default_model || undefined), 'Claude Code')}
+                  />
+                </CommandTooltip>
+              </div>
+              <pre style={{ margin: 0, fontFamily: 'inherit', fontSize: 11, lineHeight: 1.6, whiteSpace: 'pre-wrap', color: '#cdd6f4' }}>
+{buildClaudeCodeCmd(account.api_token, account.default_model || undefined)}
+              </pre>
+            </div>
+          </Col>
+          <Col xs={24} md={12}>
+            <div className="jc-code-block">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <SvgCodex />
+                  <Typography.Text strong style={{ fontSize: 13 }}>Codex</Typography.Text>
+                </div>
+                <CommandTooltip
+                  command={buildCodexCmd(account.api_token, account.default_model || undefined)}
+                  label="Codex"
+                >
+                  <Button
+                    type="text" size="small" icon={<CopyOutlined />}
+                    onClick={() => copyCmd(buildCodexCmd(account.api_token, account.default_model || undefined), 'Codex')}
+                  />
+                </CommandTooltip>
+              </div>
+              <pre style={{ margin: 0, fontFamily: 'inherit', fontSize: 11, lineHeight: 1.6, whiteSpace: 'pre-wrap', color: '#cdd6f4' }}>
+{buildCodexCmd(account.api_token, account.default_model || undefined)}
+              </pre>
+            </div>
+          </Col>
+        </Row>
+      </Card>
+
+      {/* Live session status */}
+      <Card
+        size="small"
+        style={{ marginBottom: 16, background: activeSessions > 0 ? 'rgba(34, 197, 94, 0.06)' : undefined, borderColor: activeSessions > 0 ? 'rgba(34, 197, 94, 0.3)' : undefined }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <Badge status={activeSessions > 0 ? 'processing' : 'default'} />
+          <Typography.Text strong style={{ fontSize: 13 }}>
+            实时状态
+          </Typography.Text>
+          <Typography.Text style={{ fontSize: 13 }}>
+            当前有 <Typography.Text strong style={{ fontSize: 16, color: activeSessions > 0 ? '#22C55E' : undefined }}>{activeSessions}</Typography.Text> 个活跃连接
+          </Typography.Text>
+          {activeSessions > 0 && (
+            <Tag color="blue">请求处理中</Tag>
+          )}
+          <Typography.Text type="secondary" style={{ fontSize: 11, marginLeft: 'auto' }}>
+            每 5 秒自动刷新
+          </Typography.Text>
+        </div>
+      </Card>
+
+      {/* Stats panels */}
+      {stats && (
+        <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
+          <Col xs={24} md={12}>
+            <Card
+              size="small"
+              style={{ height: '100%' }}
+              title={<span className="jc-section-title"><ApiOutlined />请求统计</span>}
+            >
+              <Row gutter={[8, 12]}>
+                <Col span={12}>
+                  <Statistic title="今日请求" value={stats.total_requests} valueStyle={{ fontSize: 20, color: CHART_COLORS.primary }} prefix={<ApiOutlined />} />
+                </Col>
+                <Col span={12}>
+                  <Statistic title="累计请求" value={stats.all_time?.total_requests ?? 0} valueStyle={{ fontSize: 20 }} />
+                </Col>
+                <Col span={12}>
+                  <Statistic
+                    title="今日成功"
+                    value={stats.success_count}
+                    prefix={<CheckCircleOutlined />}
+                    valueStyle={{ fontSize: 18, color: CHART_COLORS.primary }}
+                  />
+                  <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                    占比 {stats.total_requests > 0 ? Math.round((stats.success_count / stats.total_requests) * 100) : 100}%
+                  </Typography.Text>
+                </Col>
+                <Col span={12}>
+                  <Statistic
+                    title="今日失败"
+                    value={stats.error_count}
+                    prefix={<CloseCircleOutlined />}
+                    valueStyle={{ fontSize: 18, color: stats.error_count > 0 ? CHART_COLORS.danger : CHART_COLORS.primary }}
+                  />
+                  <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                    占比 {stats.total_requests > 0 ? Math.round((stats.error_count / stats.total_requests) * 100) : 0}%
+                  </Typography.Text>
+                </Col>
+                <Col span={24}>
+                  <Divider style={{ margin: '4px 0 8px' }} />
+                  <Row gutter={8}>
+                    <Col span={12}>
+                      <Statistic
+                        title="流式请求"
+                        value={stats.stream_count}
+                        prefix={<SwapOutlined />}
+                        valueStyle={{ fontSize: 16 }}
+                      />
+                      <Tag color="blue" style={{ marginTop: 2 }}>
+                        {stats.total_requests > 0 ? Math.round((stats.stream_count / stats.total_requests) * 100) : 0}%
+                      </Tag>
+                    </Col>
+                    <Col span={12}>
+                      <Statistic
+                        title="平均延迟"
+                        value={Math.round(stats.avg_latency_ms)}
+                        suffix="ms"
+                        prefix={<ThunderboltOutlined />}
+                        valueStyle={{ fontSize: 16, color: stats.avg_latency_ms < 500 ? CHART_COLORS.primary : stats.avg_latency_ms < 1500 ? CHART_COLORS.warning : CHART_COLORS.danger }}
+                      />
+                    </Col>
+                  </Row>
+                </Col>
+              </Row>
+            </Card>
+          </Col>
+
+          <Col xs={24} md={12}>
+            <Card
+              size="small"
+              style={{ height: '100%' }}
+              title={<span className="jc-section-title"><FireOutlined />请求统计</span>}
+            >
+              <Row gutter={[8, 12]}>
+                <Col span={12}>
+                  <Statistic
+                    title="今日请求"
+                    value={stats.total_requests}
+                    valueStyle={{ fontSize: 20, color: CHART_COLORS.primary }}
+                  />
+                </Col>
+                <Col span={12}>
+                  <Statistic
+                    title="累计请求"
+                    value={stats.all_time?.total_requests ?? 0}
+                    valueStyle={{ fontSize: 20 }}
+                  />
+                </Col>
+                <Col span={12}>
+                  <Statistic title="今日成功" value={stats.success_count} valueStyle={{ fontSize: 16, color: CHART_COLORS.primary }} />
+                </Col>
+                <Col span={12}>
+                  <Statistic title="今日失败" value={stats.error_count} valueStyle={{ fontSize: 16, color: stats.error_count > 0 ? CHART_COLORS.danger : CHART_COLORS.primary }} />
+                </Col>
+                <Col span={24}>
+                  <Divider style={{ margin: '4px 0 8px' }} />
+                  <Row gutter={8}>
+                    <Col span={12}>
+                      <Statistic
+                        title="流式请求"
+                        value={stats.stream_count}
+                        valueStyle={{ fontSize: 15 }}
+                      />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic
+                        title="成功率"
+                        value={stats.total_requests > 0 ? Math.round((stats.success_count / stats.total_requests) * 100) : 100}
+                        suffix="%"
+                        valueStyle={{ fontSize: 15, color: CHART_COLORS.primary }}
+                      />
+                    </Col>
+                  </Row>
+                </Col>
+              </Row>
+            </Card>
+          </Col>
+        </Row>
+      )}
+
+      {/* Hourly trend charts */}
+      {stats && stats.hourly && stats.hourly.length > 0 && (() => {
+        // Build hourly chart with date-aware keys to avoid cross-day merging
+        const hMap = new Map<string, { count: number; input_tokens: number; output_tokens: number; errors: number }>();
+        for (const h of stats.hourly) {
+          hMap.set(h.hour, h);
+        }
+        const now = new Date();
+        const hourlyChartData: { label: string; count: number; input_tokens: number; output_tokens: number; errors: number }[] = [];
+        for (let i = 23; i >= 0; i--) {
+          const d = new Date(now.getTime() - i * 3600000);
+          const key = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}`;
+          const entry = hMap.get(key);
+          hourlyChartData.push({
+            label: `${String(d.getHours()).padStart(2, '0')}:00`,
+            count: entry?.count ?? 0,
+            input_tokens: entry?.input_tokens ?? 0,
+            output_tokens: entry?.output_tokens ?? 0,
+            errors: entry?.errors ?? 0,
+          });
+        }
+        return (
+        <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
+          <Col xs={24} lg={12}>
+            <Card size="small" title="24 小时请求趋势">
+              <ResponsiveContainer width="100%" height={200}>
+                <AreaChart data={hourlyChartData} margin={{ left: -10 }}>
+                  <defs>
+                    <linearGradient id="gradDetailReq" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={CHART_COLORS.primary} stopOpacity={0.4} />
+                      <stop offset="100%" stopColor={CHART_COLORS.primary} stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="gradDetailErr" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={CHART_COLORS.danger} stopOpacity={0.3} />
+                      <stop offset="100%" stopColor={CHART_COLORS.danger} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
+                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: CHART_COLORS.axis }} interval={2} stroke={CHART_COLORS.grid} />
+                  <YAxis tick={{ fontSize: 11, fill: CHART_COLORS.axis }} stroke={CHART_COLORS.grid} />
+                  <RTooltip contentStyle={{ background: 'var(--jc-bg-elevated)', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: 'var(--jc-fg-muted)' }} itemStyle={{ color: 'var(--jc-fg)' }} />
+                  <Area type="monotone" dataKey="count" name="请求数" stroke={CHART_COLORS.primary} fill="url(#gradDetailReq)" strokeWidth={2} />
+                  <Area type="monotone" dataKey="errors" name="错误数" stroke={CHART_COLORS.danger} fill="url(#gradDetailErr)" strokeWidth={1.5} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </Card>
+          </Col>
+          <Col xs={24} lg={12}>
+            <Card size="small" title="24 小时请求趋势（成功 / 失败）">
+              <ResponsiveContainer width="100%" height={200}>
+                <AreaChart data={hourlyChartData} margin={{ left: -10 }}>
+                  <defs>
+                    <linearGradient id="gradDetailIn" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={CHART_COLORS.secondary} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={CHART_COLORS.secondary} stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="gradDetailOut" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={CHART_COLORS.primary} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={CHART_COLORS.primary} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
+                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: CHART_COLORS.axis }} interval={2} stroke={CHART_COLORS.grid} />
+                  <YAxis tick={{ fontSize: 11, fill: CHART_COLORS.axis }} stroke={CHART_COLORS.grid} />
+                  <RTooltip contentStyle={{ background: 'var(--jc-bg-elevated)', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: 'var(--jc-fg-muted)' }} itemStyle={{ color: 'var(--jc-fg)' }} />
+                  <Area type="monotone" dataKey="count" name="请求数" stroke={CHART_COLORS.primary} fill="url(#gradDetailOut)" strokeWidth={2} />
+                  <Area type="monotone" dataKey="errors" name="失败数" stroke={CHART_COLORS.danger} fill="url(#gradDetailIn)" strokeWidth={1.5} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </Card>
+          </Col>
+        </Row>
+        );
+      })()}
+
+      {/* Charts row */}
+      {stats && (stats.by_model.length > 0 || endpointData.length > 0) && (
+        <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
+          {stats.by_model.length > 0 && (
+            <Col xs={24} lg={14}>
+              <Card size="small" title={<span className="jc-section-title"><FireOutlined />模型使用分布</span>}>
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={stats.by_model} layout="vertical" margin={{ left: 10 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
+                    <XAxis type="number" tick={{ fill: CHART_COLORS.axis }} stroke={CHART_COLORS.grid} />
+                    <YAxis dataKey="model" type="category" width={100} tick={{ fontSize: 11, fill: CHART_COLORS.axis }} stroke={CHART_COLORS.grid} />
+                    <RTooltip contentStyle={{ background: 'var(--jc-bg-elevated)', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: 'var(--jc-fg-muted)' }} itemStyle={{ color: 'var(--jc-fg)' }} />
+                    <Bar dataKey="count" name="请求数" fill={CHART_COLORS.primary} radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </Card>
+            </Col>
+          )}
+          {endpointData.length > 0 && (
+            <Col xs={24} lg={10}>
+              <Card size="small" title={<span className="jc-section-title"><GlobalOutlined />端点调用分布</span>}>
+                <ResponsiveContainer width="100%" height={200}>
+                  <PieChart>
+                    <Pie
+                      data={endpointData}
+                      dataKey="value"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      outerRadius={70}
+                      label={({ name, percent }: any) => `${name || ''} ${((percent || 0) * 100).toFixed(0)}%`}
+                      labelLine={{ stroke: '#475569', strokeWidth: 1 }}
+                    >
+                      {endpointData.map((_, i) => (
+                        <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <RTooltip contentStyle={{ background: 'var(--jc-bg-elevated)', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: 'var(--jc-fg-muted)' }} itemStyle={{ color: 'var(--jc-fg)' }} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </Card>
+            </Col>
+          )}
+        </Row>
+      )}
+
+      {/* Request logs */}
+      <Card
+        size="small"
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <ClockCircleOutlined style={{ color: '#22C55E' }} />
+            <span>请求日志</span>
+            <Tag>{logs.length} 条</Tag>
+          </div>
+        }
+        extra={
+          <Segmented
+            size="small"
+            value={logFilter}
+            onChange={(v) => setLogFilter(v as string)}
+            options={[
+              { label: '全部', value: 'all' },
+              { label: '流式', value: 'stream' },
+              { label: '错误', value: 'errors' },
+            ]}
+          />
+        }
+      >
+        <Table
+          dataSource={filteredLogs}
+          columns={logColumns}
+          rowKey="id"
+          size="small"
+          pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (t) => `共 ${t} 条` }}
+          scroll={{ x: 980 }}
+          locale={{ emptyText: '暂无请求记录' }}
+          expandable={{
+            expandedRowRender: (record) => (
+              <div style={{ padding: '8px 0 8px 12px' }}>
+                {record.status_code >= 400 && (
+                  <div style={{
+                    marginBottom: 10,
+                    padding: '10px 12px',
+                    border: '1px solid rgba(239, 68, 68, 0.3)',
+                    borderRadius: 6,
+                    background: 'rgba(239, 68, 68, 0.08)',
+                  }}>
+                    <Typography.Text strong style={{ display: 'block', marginBottom: 6, color: CHART_COLORS.danger }}>
+                      错误详情
+                    </Typography.Text>
+                    <pre style={{
+                      margin: 0,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      fontSize: 12,
+                      lineHeight: 1.6,
+                      color: CHART_COLORS.danger,
+                      fontFamily: "'Fira Code', monospace",
+                    }}>
+                      {record.error_message || `HTTP ${record.status_code}`}
+                    </pre>
+                  </div>
+                )}
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: '120px minmax(0, 1fr)',
+                  gap: '6px 12px',
+                  fontSize: 12,
+                }}>
+                  <Typography.Text type="secondary">请求 ID</Typography.Text>
+                  <Typography.Text code>{record.id}</Typography.Text>
+                  <Typography.Text type="secondary">时间</Typography.Text>
+                  <Typography.Text>{formatTime(record.created_at)}</Typography.Text>
+                  <Typography.Text type="secondary">端点</Typography.Text>
+                  <Typography.Text code>{record.endpoint}</Typography.Text>
+                  <Typography.Text type="secondary">模型</Typography.Text>
+                  <Typography.Text>{record.model || '-'}</Typography.Text>
+                  <Typography.Text type="secondary">流式</Typography.Text>
+                  <Typography.Text>{record.stream ? '是' : '否'}</Typography.Text>
+                  <Typography.Text type="secondary">状态</Typography.Text>
+                  <Typography.Text>{record.status_code}</Typography.Text>
+                  <Typography.Text type="secondary">输入 / 输出</Typography.Text>
+                  <Typography.Text>{record.input_tokens || 0} / {record.output_tokens || 0}</Typography.Text>
+                  <Typography.Text type="secondary">延迟</Typography.Text>
+                  <Typography.Text>{formatLatency(record.latency_ms)}</Typography.Text>
+                </div>
+              </div>
+            ),
+          }}
+        />
+      </Card>
+    </div>
+  );
+};
+
+export default AccountDetail;
