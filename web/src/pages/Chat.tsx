@@ -136,7 +136,7 @@ const Chat: React.FC = () => {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 140px)', minHeight: 480, overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
       {/* 顶栏 */}
       <Card size="small" style={{ marginBottom: 12 }}>
         <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
@@ -173,7 +173,7 @@ const Chat: React.FC = () => {
 
       {/* 消息列表 */}
       <Card size="small" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-        <div ref={listRef} style={{ flex: 1, overflowY: 'auto', paddingRight: 4 }}>
+        <div ref={listRef} style={{ flex: 1, overflowY: 'auto', paddingRight: 4, minHeight: 0 }}>
           {messages.length === 0 && (
             <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center' }}>
               <Empty
@@ -232,27 +232,36 @@ const Chat: React.FC = () => {
             </div>
           ))}
         </div>
-
-        {/* 输入区 */}
-        <div style={{ borderTop: '1px solid var(--jc-card-border)', paddingTop: 12, marginTop: 8, flexShrink: 0 }}>
-          <Input.TextArea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="输入问题，Ctrl+Enter 发送"
-            autoSize={{ minRows: 2, maxRows: 6 }}
-            style={{ minHeight: 52 }}
-            onPressEnter={(e) => { if (!e.shiftKey) { e.preventDefault(); send(); } }}
-          />
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
-            <Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
-              {mode === 'qa' ? '问答模式 · 简洁直接回答' : '编程模式 · 面向开发任务'}
-            </Text>
-            <Button type="primary" icon={<SendOutlined />} loading={sending} onClick={send}>
-              发送
-            </Button>
-          </div>
-        </div>
       </Card>
+
+      {/* 输入区 — 固定在页面底部（独立于聊天卡片，永不随内容滚动/下移） */}
+      <div
+        style={{
+          flexShrink: 0,
+          marginTop: 12,
+          background: 'var(--jc-bg-elevated)',
+          border: '1px solid var(--jc-card-border)',
+          borderRadius: 12,
+          padding: '12px 14px',
+        }}
+      >
+        <Input.TextArea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="输入问题，Ctrl+Enter 发送"
+          autoSize={{ minRows: 2, maxRows: 6 }}
+          style={{ minHeight: 52 }}
+          onPressEnter={(e) => { if (!e.shiftKey) { e.preventDefault(); send(); } }}
+        />
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
+          <Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
+            {mode === 'qa' ? '问答模式 · 简洁直接回答' : '编程模式 · 面向开发任务'}
+          </Text>
+          <Button type="primary" icon={<SendOutlined />} loading={sending} onClick={send}>
+            发送
+          </Button>
+        </div>
+      </div>
     </div>
   );
 };

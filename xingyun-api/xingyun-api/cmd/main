@@ -1,0 +1,151 @@
+#!/bin/bash
+#
+# 行云API — 生命周期管理（单服务：JoyCode2Api）
+# 用法: main start|stop|status
+
+TRIM_APPDEST="${TRIM_APPDEST:-/var/apps/xingyun-api}"
+TRIM_PKGHOME="${TRIM_PKGHOME:-/var/apps/xingyun-api/home}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/xingyun-api/var}"
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+ENV_FILE="${TRIM_PKGVAR}/.env"
+CRED_FILE="${TRIM_PKGVAR}/credentials.txt"
+MARK_FILE="${TRIM_PKGVAR}/.initialized"
+
+PORT=34891
+BASE="http://127.0.0.1:${PORT}"
+
+BIN="${TRIM_APPDEST}/bin/JoyCode2Api"
+
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}; }
+
+fix_perms() {
+    if [ -d "${TRIM_APPDEST}" ]; then
+        APP_OWNER=$(stat -c '%U:%G' "${TRIM_APPDEST}" 2>/dev/null)
+        if [ -n "$APP_OWNER" ]; then
+            [ -d "${TRIM_PKGVAR}" ] && chown -R "$APP_OWNER" "${TRIM_PKGVAR}" 2>/dev/null || true
+            [ -d "${TRIM_PKGHOME}" ] && chown -R "$APP_OWNER" "${TRIM_PKGHOME}" 2>/dev/null || true
+        fi
+    fi
+}
+
+gen_password() {
+    local p=""
+    p=$(head -c 64 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 16)
+    if [ -z "$p" ]; then
+        p=$(openssl rand -base64 48 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 16)
+    fi
+    [ -z "$p" ] && p="Xingyun$(date +%s)X9a"
+    echo "$p"
+}
+
+load_pw() {
+    [ -f "${ENV_FILE}" ] && grep "^PASSWORD=" "${ENV_FILE}" | tail -1 | cut -d= -f2-
+}
+
+save_pw() {
+    if [ -f "${ENV_FILE}" ] && grep -q "^PASSWORD=" "${ENV_FILE}"; then
+        return 0
+    fi
+    echo "PASSWORD=$1" >> "${ENV_FILE}" 2>/dev/null || true
+    chmod 600 "${ENV_FILE}" 2>/dev/null || true
+}
+
+wait_http() {
+    local url="$1" tries="${2:-30}"
+    local i
+    for i in $(seq 1 ${tries}); do
+        if curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "${url}" 2>/dev/null | grep -qE '^(200|401|403|404)$'; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+first_run_init() {
+    [ -f "${MARK_FILE}" ] && return 0
+    log_msg "--- first run init ---"
+    if wait_http "${BASE}/api/health" 30; then
+        local status initialized pass token
+        status=$(curl -s --connect-timeout 3 "${BASE}/api/auth/status" 2>/dev/null)
+        initialized=$(echo "$status" | grep -o '"initialized":[a-z]*' | head -1 | cut -d: -f2)
+        if [ "$initialized" = "true" ]; then
+            log_msg "auth already initialized"
+        else
+            pass=$(load_pw)
+            [ -z "$pass" ] && pass=$(gen_password) && save_pw "$pass"
+            token=$(curl -s --connect-timeout 5 -X POST "${BASE}/api/auth/setup" \
+                -H 'Content-Type: application/json' \
+                -d "{\"password\":\"${pass}\"}" 2>/dev/null | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
+            if [ -n "$token" ]; then
+                log_msg "auth initialized (token obtained)"
+                if [ ! -f "${CRED_FILE}" ]; then
+                    cat > "${CRED_FILE}" <<EOF
+
+[行云API 面板] http://<NAS-IP>:${PORT}
+面板密码: ${pass}  (登录后请及时修改)
+EOF
+                    chmod 600 "${CRED_FILE}"
+                fi
+            else
+                log_msg "WARNING: auth setup failed"
+            fi
+        fi
+    else
+        log_msg "WARNING: service not ready after 30s"
+    fi
+    touch "${MARK_FILE}"
+    log_msg "--- first run init done ---"
+}
+
+start_process() {
+    if status; then log_msg "already running"; return 0; fi
+    if [ ! -x "${BIN}" ]; then
+        log_msg "FATAL: binary not found: ${BIN}"
+        return 1
+    fi
+    fix_perms
+    mkdir -p "${TRIM_PKGVAR}/logs" "${TRIM_PKGHOME}"
+    log_msg "Starting 行云API on :${PORT} ..."
+    HOME="${TRIM_PKGHOME}" "${BIN}" serve --skip-validation --tls=false --port "${PORT}" \
+        >> "${TRIM_PKGVAR}/logs/joycode.log" 2>&1 &
+    printf "%s" "$!" > "${PID_FILE}"
+    first_run_init
+    log_msg "Started (pid=$(cat ${PID_FILE}))"
+    return 0
+}
+
+stop_process() {
+    log_msg "Stopping 行云API ..."
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            local i
+            for i in $(seq 1 3); do
+                sleep 1
+                kill -0 "$pid" 2>/dev/null || break
+            done
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    fi
+    pkill -TERM -f "bin/JoyCode2Api" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "bin/JoyCode2Api" 2>/dev/null || true
+    rm -f "${PID_FILE}"
+    log_msg "Stopped (incl. leftover cleanup)"
+    return 0
+}
+
+status() {
+    [ -f "${PID_FILE}" ] && pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]') && kill -0 "$pid" 2>/dev/null
+}
+
+case $1 in
+start)   start_process ;;
+stop)    stop_process ;;
+status)  status && exit 0 || exit 3 ;;
+*)       exit 1 ;;
+esac

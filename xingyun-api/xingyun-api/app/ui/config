@@ -1,0 +1,13 @@
+{
+    ".url": {
+        "xingyun-api.Main": {
+            "title": "行云API 面板",
+            "icon": "images/icon.png",
+            "type": "url",
+            "protocol": "http",
+            "port": "34891",
+            "url": "/",
+            "allUsers": false
+        }
+    }
+}
