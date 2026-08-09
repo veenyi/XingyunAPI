@@ -19,36 +19,38 @@ const { Text } = Typography;
 
 const FALLBACK_MODELS = ["JoyAI-Code-1.5", "MiniMax-M3", "MiniMax-M2.7", "Kimi-K2.6", "GLM-5.1", "GLM-5", "DeepSeek-V4-Pro", "Doubao-Seed-2.0-pro"];
 
-// 聊天历史持久化（localStorage，刷新后保留）
-const HISTORY_KEY = 'joycode_chat_history';
-const HISTORY_LIMIT = 100; // 最多保留 100 条消息
-
-const loadHistory = (): Msg[] => {
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr.filter((m) => m && m.role) : [];
-  } catch { return []; }
-};
+const HISTORY_LIMIT = 200; // 最多保留 200 条消息
 
 const Chat: React.FC = () => {
-  const [messages, setMessages] = useState<Msg[]>(loadHistory);
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState('');
   const [model, setModel] = useState<string>('GLM-5.1');
   const [mode, setMode] = useState<string>('qa');
   const [webSearch, setWebSearch] = useState(true);
   const [models, setModels] = useState<string[]>(FALLBACK_MODELS);
   const [sending, setSending] = useState(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // 消息变化时自动保存（最多保留 HISTORY_LIMIT 条）
+  // 从服务器加载聊天历史（所有浏览器/设备共享）
   useEffect(() => {
-    try {
-      const toSave = messages.slice(-HISTORY_LIMIT);
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(toSave));
-    } catch { /* 存储满时忽略 */ }
-  }, [messages]);
+    api.getChatHistory()
+      .then((res) => {
+        if (Array.isArray(res.messages)) {
+          const valid = res.messages.filter((m) => m && m.role);
+          setMessages(valid);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setHistoryLoaded(true));
+  }, []);
+
+  // 消息变化时保存到服务器
+  useEffect(() => {
+    if (!historyLoaded) return;
+    const toSave = messages.slice(-HISTORY_LIMIT);
+    api.saveChatHistory(toSave).catch(() => {});
+  }, [messages, historyLoaded]);
 
   useEffect(() => {
     api.listModels().then((ms) => {
@@ -132,7 +134,7 @@ const Chat: React.FC = () => {
 
   const clearAll = () => {
     setMessages([]);
-    try { localStorage.removeItem(HISTORY_KEY); } catch { /* ignore */ }
+    api.saveChatHistory([]).catch(() => {});
   };
 
   return (

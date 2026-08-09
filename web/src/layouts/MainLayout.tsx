@@ -58,7 +58,7 @@ const MainLayout: React.FC = () => {
     : '/dashboard';
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout style={{ minHeight: '100vh', height: '100vh', overflow: 'hidden' }}>
       <Sider
         collapsible
         collapsed={collapsed}
@@ -151,7 +151,7 @@ const MainLayout: React.FC = () => {
           </Tooltip>
           </div>
         </Header>
-        <Content>
+        <Content style={{ overflow: 'auto' }}>
           <Outlet />
         </Content>
       </Layout>

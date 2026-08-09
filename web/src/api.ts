@@ -183,6 +183,9 @@ export const api = {
   validateAccount: (userId: string) =>
     request<{ valid: boolean }>(`/api/accounts/${encodeURIComponent(userId)}/validate`, { method: 'POST' }),
   listModels: () => request<{ models: ModelInfo[] }>('/api/models').then(r => r.models),
+  getChatHistory: () => request<{ messages: any[] }>('/api/chat-history'),
+  saveChatHistory: (messages: any[]) =>
+    request<{ ok: boolean }>('/api/chat-history', { method: 'POST', body: JSON.stringify({ messages }) }),
   chatStream: (
     params: { messages: { role: string; content: string }[]; model?: string; mode?: string; web_search?: boolean },
     onEvent: (e: any) => void,
