@@ -55,8 +55,8 @@ const Dashboard: React.FC = () => {
   const [points, setPoints] = useState<Record<string, { used: number; remain: number; total: number }>>({});
   const [loading, setLoading] = useState(true);
 
-  const fetchData = async () => {
-    setLoading(true);
+  const fetchData = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [statsData, accountsData] = await Promise.all([
         api.getStats(),
@@ -85,11 +85,18 @@ const Dashboard: React.FC = () => {
     } catch (e) {
       console.error(e);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => { fetchData(); }, []);
+
+  // 自动刷新：积分消费、请求统计随上游结算实时更新，无需手动刷新页面。
+  // 60s 间隔与上游 getNewIdePoint 结算节奏匹配，避免频繁调用上游。
+  useEffect(() => {
+    const id = setInterval(() => { fetchData(true); }, 60000);
+    return () => clearInterval(id);
+  }, []);
 
   if (loading) {
     return (
