@@ -1,8 +1,0 @@
-#!/bin/bash
-
-### 行云API 升级前回调 — 停止旧进程
-
-"${TRIM_APPDEST}/cmd/main" stop 2>/dev/null || true
-pkill -f "bin/JoyCode2Api" 2>/dev/null || true
-sleep 1
-exit 0

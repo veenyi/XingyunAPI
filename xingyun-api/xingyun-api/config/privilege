@@ -1,7 +1,0 @@
-{
-    "defaults": {
-        "run-as": "package"
-    },
-    "username": "xingyun-api",
-    "groupname": "xingyun-api"
-}
