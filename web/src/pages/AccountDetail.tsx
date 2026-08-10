@@ -17,6 +17,7 @@ import {
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, accountDisplayName } from '../api';
 import type { Account, AccountStats, ModelInfo, RequestLog } from '../api';
+import { copyToClipboard as copyText } from '../utils/clipboard';
 import SvgClaudeCode from '../components/ClaudeCodeIcon';
 import SvgCodex from '../components/CodexIcon';
 import CommandTooltip from '../components/CommandTooltip';
@@ -104,20 +105,10 @@ const buildCodexCmd = (apiKey: string, model = 'GLM-5.1') => [
 ].join('\n');
 
 const copyCmd = async (text: string, label: string) => {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.cssText = 'position:fixed;left:-9999px';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-    }
+  const ok = await copyText(text);
+  if (ok) {
     message.success(`${label} 命令已复制到剪贴板`);
-  } catch {
+  } else {
     message.error('复制失败');
   }
 };
