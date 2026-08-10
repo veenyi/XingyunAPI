@@ -108,8 +108,13 @@ start_process() {
     fi
     fix_perms
     mkdir -p "${TRIM_PKGVAR}/logs" "${TRIM_PKGHOME}"
-    log_msg "Starting 行云API on :${PORT} ..."
-    HOME="${TRIM_PKGHOME}" "${BIN}" serve --skip-validation --tls=false --port "${PORT}" \
+    # 兜底：确保 HOME 指向正确数据目录（防止读错库导致数据/密码"消失"）
+    APP_HOME="${TRIM_PKGHOME}"
+    if [ -z "${APP_HOME}" ] || [ ! -d "${APP_HOME}" ]; then
+        APP_HOME="/var/apps/xingyun-api/home"
+    fi
+    log_msg "Starting 行云API on :${PORT} ... (HOME=${APP_HOME})"
+    HOME="${APP_HOME}" "${BIN}" serve --skip-validation --tls=false --port "${PORT}" \
         >> "${TRIM_PKGVAR}/logs/joycode.log" 2>&1 &
     printf "%s" "$!" > "${PID_FILE}"
     first_run_init
