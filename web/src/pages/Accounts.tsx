@@ -151,8 +151,8 @@ const Accounts: React.FC = () => {
 
 ;
 
-  const fetchAccounts = async () => {
-    setLoading(true);
+  const fetchAccounts = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const data = await api.listAccounts();
       setAccounts(data);
@@ -175,13 +175,19 @@ const Accounts: React.FC = () => {
       }));
       setPoints(pmap);
     } catch (e: unknown) {
-      message.error(e instanceof Error ? e.message : '获取账号列表失败');
+      if (!silent) message.error(e instanceof Error ? e.message : '获取账号列表失败');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => { fetchAccounts(); }, []);
+
+  // 自动刷新：积分列随上游结算实时更新，无需手动点刷新
+  useEffect(() => {
+    const id = setInterval(() => { fetchAccounts(true); }, 60000);
+    return () => clearInterval(id);
+  }, []);
 
 
   const handleAdd = async (values: { pt_key: string; user_id: string; is_default?: boolean; default_model?: string }) => {
@@ -526,7 +532,7 @@ const Accounts: React.FC = () => {
       <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <Typography.Title level={4} style={{ margin: 0 }}>账号管理</Typography.Title>
         <Space wrap>
-          <Button onClick={fetchAccounts} icon={<ReloadOutlined />}>刷新</Button>
+          <Button onClick={() => fetchAccounts()} icon={<ReloadOutlined />}>刷新</Button>
           <Button
             onClick={async () => {
               try {

@@ -163,9 +163,15 @@ const AccountDetail: React.FC = () => {
   useEffect(() => { fetchData(); }, [decodedKey]);
   useEffect(() => { fetchModels(); }, [decodedKey]);
   useEffect(() => {
-    api.getAccountPoint(decodedKey)
-      .then((d) => setPointData(d))
-      .catch(() => setPointData(null));
+    const loadPoint = () => {
+      api.getAccountPoint(decodedKey)
+        .then((d) => setPointData(d))
+        .catch(() => setPointData(null));
+    };
+    loadPoint();
+    // 自动刷新：积分/用量随上游结算实时更新，无需手动刷新页面
+    const id = setInterval(loadPoint, 60000);
+    return () => clearInterval(id);
   }, [decodedKey]);
 
   // Poll active sessions every 5s
