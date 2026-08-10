@@ -16,8 +16,11 @@
 
 ### 方式一：飞牛 fnOS 应用中心安装（推荐）
 
-1. 下载最新的 `xingyun-api_vX.X.X.fpk`（GitHub Releases）
-2. 打开飞牛应用中心 → 手动安装 → 上传 FPK
+1. 按设备架构下载 FPK（GitHub Releases）：
+   - `xingyun-api_vX.X.X.fpk` — x86_64 设备
+   - `xingyun-api_vX.X.X_arm64.fpk` — ARM 设备（如飞牛 ARM 机型）
+   - `xingyun-api-docker_vX.X.X.fpk` — Docker 版安装包（自动拉取 ghcr.io 镜像，x86_64 / ARM 通用）
+2. 打开飞牛应用中心 → 手动安装 → 上传对应 FPK
 3. 安装向导中设置面板密码（≥6 位，留空自动生成）
 4. 安装完成后点击「打开」进入面板（端口 **34891**）
 
@@ -40,7 +43,7 @@ chmod +x xingyun-api-linux-amd64
 ### 方式三：Docker 部署
 
 ```bash
-# 方式 A：直接拉取官方镜像（ghcr.io，推荐）
+# 方式 A：直接拉取官方镜像（ghcr.io，推荐，支持 amd64 / arm64 双架构）
 docker pull ghcr.io/veenyi/xingyun-api:latest
 docker run -d --name xingyun-api \
   -p 34891:34891 \
