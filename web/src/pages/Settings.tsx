@@ -10,6 +10,7 @@ import {
 } from '@ant-design/icons';
 import { api, authApi, clearToken } from '../api';
 import type { Settings } from '../api';
+import { copyToClipboard } from '../utils/clipboard';
 
 
 interface FieldConfig {
@@ -307,11 +308,13 @@ const SettingsPage: React.FC = () => {
           <Button
             size="small"
             icon={<CopyOutlined />}
-            onClick={() => {
-              navigator.clipboard?.writeText(aggKey).then(
-                () => message.success('聚合 Key 已复制'),
-                () => message.error('复制失败'),
-              );
+            onClick={async () => {
+              const ok = await copyToClipboard(aggKey);
+              if (ok) {
+                message.success('聚合 Key 已复制');
+              } else {
+                message.error('复制失败');
+              }
             }}
           >
             复制

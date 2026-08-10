@@ -32,6 +32,7 @@ import CommandTooltip from '../components/CommandTooltip';
 import { useNavigate } from 'react-router-dom';
 import { api, accountDisplayName } from '../api';
 import type { Account } from '../api';
+import { copyToClipboard as copyText } from '../utils/clipboard';
 
 const BUILTIN_MODELS = [
   { label: 'JoyAI-Code（推荐）', value: 'JoyAI-Code' },
@@ -77,20 +78,10 @@ const codexCmd = (apiKey: string, model = 'GLM-5.1') => [
 ].join('\n');
 
 const copyToClipboard = async (text: string, label: string) => {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.cssText = 'position:fixed;left:-9999px';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-    }
+  const ok = await copyText(text);
+  if (ok) {
     message.success(`${label} 命令已复制`);
-  } catch {
+  } else {
     message.error('复制失败');
   }
 };
@@ -515,21 +506,13 @@ const Accounts: React.FC = () => {
               onClick={(e) => {
                 e.stopPropagation();
                 const url = `${getBaseURL()}/v1`;
-                if (navigator.clipboard?.writeText) {
-                  navigator.clipboard.writeText(url).then(
-                    () => message.success('服务器地址已复制'),
-                    () => message.error('复制失败'),
-                  );
-                } else {
-                  const ta = document.createElement('textarea');
-                  ta.value = url;
-                  ta.style.cssText = 'position:fixed;left:-9999px';
-                  document.body.appendChild(ta);
-                  ta.select();
-                  document.execCommand('copy');
-                  document.body.removeChild(ta);
-                  message.success('服务器地址已复制');
-                }
+                copyText(url).then((ok) => {
+                  if (ok) {
+                    message.success('服务器地址已复制');
+                  } else {
+                    message.error('复制失败');
+                  }
+                });
               }}
             />
           </Tooltip>
