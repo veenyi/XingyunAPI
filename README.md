@@ -40,10 +40,16 @@ chmod +x xingyun-api-linux-amd64
 ### 方式三：Docker 部署
 
 ```bash
-# 克隆仓库（或直接获取 docker/ 目录）
-git clone https://github.com/veenyi/XingyunAPI.git && cd XingyunAPI
+# 方式 A：直接拉取官方镜像（ghcr.io，推荐）
+docker pull ghcr.io/veenyi/xingyun-api:latest
+docker run -d --name xingyun-api \
+  -p 34891:34891 \
+  -v ./data:/data \
+  --restart unless-stopped \
+  ghcr.io/veenyi/xingyun-api:latest
 
-# 构建镜像并启动（数据持久化到 ./data）
+# 方式 B：源码构建
+git clone https://github.com/veenyi/XingyunAPI.git && cd XingyunAPI
 docker compose -f docker/docker-compose.yml up -d
 
 # 查看状态 / 日志
@@ -51,7 +57,7 @@ docker ps
 docker logs -f xingyun-api
 ```
 
-面板：`http://<主机IP>:34891`，数据（账号、设置、聊天历史）持久化在宿主机 `./data` 目录（镜像内 `/data`，即 `~/.joycode-proxy/`）。自定义端口：修改 compose 的 `PORT` 环境变量与端口映射，或直接 `docker run -e PORT=xxxx -p xxxx:xxxx xingyun-api:latest`。镜像默认以 root 运行以保证绑定卷可写；如需更换数据目录，把 compose 中的 `./data:/data` 改为你的目录即可。
+面板：`http://<主机IP>:34891`，数据（账号、设置、聊天历史）持久化在宿主机 `./data` 目录（镜像内 `/data`，即 `~/.joycode-proxy/`）。自定义端口：修改 `PORT` 环境变量与端口映射，或直接 `docker run -e PORT=xxxx -p xxxx:xxxx ghcr.io/veenyi/xingyun-api:latest`。镜像默认以 root 运行以保证绑定卷可写；如需更换数据目录，把 `-v ./data:/data` 改为你的目录即可。
 
 ## 使用流程
 
