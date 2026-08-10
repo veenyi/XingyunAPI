@@ -4,7 +4,6 @@ web/dist/
 web/node_modules/
 *.fpk
 xingyun-api-slim/
-pkg/
 .fpk
 
 # 系统与 IDE
