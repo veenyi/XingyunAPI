@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,6 +39,39 @@ var (
 	serveTLS        bool
 	requestCounter uint64
 )
+
+// per-account client 缓存：同一账号复用同一个 joycode.Client（共享 SessionID 与连接池）。
+// 每次请求新建 client 会生成全新 SessionID，上游需为新会话重建上下文 → TTFB 波动（时快时慢）。
+// ptKey 变化（keepalive 刷新）时通过对比 PtKey 自动重建缓存。
+var (
+	clientCacheMu sync.RWMutex
+	clientCache   = map[string]*joycode.Client{}
+)
+
+// cachedClient 返回账号对应的复用 client；缓存缺失或 ptKey 已变化时重建。
+func cachedClient(acc *store.Account, timeout time.Duration, sharedTransport *http.Transport) *joycode.Client {
+	if acc == nil || acc.UserID == "" {
+		return nil
+	}
+	clientCacheMu.RLock()
+	cl := clientCache[acc.UserID]
+	clientCacheMu.RUnlock()
+	if cl != nil && cl.PtKey == acc.PtKey {
+		return cl
+	}
+	cl = joycode.NewClient(acc.PtKey, acc.UserID)
+	cl.SetTimeout(timeout)
+	if sharedTransport != nil {
+		cl.SetTransport(sharedTransport)
+	}
+	clientCacheMu.Lock()
+	defer clientCacheMu.Unlock()
+	if existing := clientCache[acc.UserID]; existing != nil && existing.PtKey == acc.PtKey {
+		return existing
+	}
+	clientCache[acc.UserID] = cl
+	return cl
+}
 
 var serveCmd = &cobra.Command{
 	Use:     "serve",
@@ -101,9 +135,12 @@ var serveCmd = &cobra.Command{
 		// Per-request client resolution from database accounts
 		if s != nil {
 			// Shared transport for connection pooling and limits
+			// MaxConnsPerHost 需要足够大：每个流式请求会长期占用一条到上游的连接
+			// （SSE 可能持续数分钟），20 的上限在多个客户端并发对话时会迅速占满，
+			// 后续请求只能排队等连接释放 → 表现为间歇性卡顿。
 			sharedTransport := &http.Transport{
-				MaxIdleConnsPerHost: 10,
-				MaxConnsPerHost:     20,
+				MaxIdleConnsPerHost: 50,
+				MaxConnsPerHost:     100,
 				IdleConnTimeout:     90 * time.Second,
 			}
 
@@ -114,7 +151,7 @@ var serveCmd = &cobra.Command{
 				for {
 					select {
 					case <-ticker.C:
-						maxConns := s.GetIntSetting("max_connections", 20)
+						maxConns := s.GetIntSetting("max_connections", 100)
 						if maxConns < 1 {
 							maxConns = 1
 						}
@@ -143,38 +180,35 @@ var serveCmd = &cobra.Command{
 				if timeout < 60 {
 					timeout = 60
 				}
+				timeoutDur := time.Duration(timeout) * time.Second
 				// 聚合 Key：自动按剩余积分在多个账号间轮询
 				if apiKey != "" && apiKey == getAggregateKey(s) {
-					if cl := resolveAggregateClient(s, time.Duration(timeout)*time.Second); cl != nil {
+					if cl := resolveAggregateClient(s, timeoutDur, sharedTransport); cl != nil {
 						return cl
 					}
 					// 无可用账号 → 回退默认逻辑
 				}
 				if apiKey != "" {
 					if account, _ := s.GetAccountByToken(apiKey); account != nil {
-						cl := joycode.NewClient(account.PtKey, account.UserID)
+						cl := cachedClient(account, timeoutDur, sharedTransport)
 						if systemClient != nil && systemClient.PtKey != "" && systemClient.PtKey != "placeholder" && systemClient.UserID == account.UserID {
 							cl.SetAnthropicPtKey(systemClient.PtKey)
 						}
-						cl.SetTimeout(time.Duration(timeout) * time.Second)
 						return cl
 					}
 					if account, _ := s.GetAccount(apiKey); account != nil {
-						cl := joycode.NewClient(account.PtKey, account.UserID)
+						cl := cachedClient(account, timeoutDur, sharedTransport)
 						if systemClient != nil && systemClient.PtKey != "" && systemClient.PtKey != "placeholder" && systemClient.UserID == account.UserID {
 							cl.SetAnthropicPtKey(systemClient.PtKey)
 						}
-						cl.SetTimeout(time.Duration(timeout) * time.Second)
 						return cl
 					}
 				}
 				if account, _ := s.GetDefaultAccount(); account != nil {
-					cl := joycode.NewClient(account.PtKey, account.UserID)
+					cl := cachedClient(account, timeoutDur, sharedTransport)
 					if systemClient != nil && systemClient.PtKey != "" && systemClient.PtKey != "placeholder" && systemClient.UserID == account.UserID {
 						cl.SetAnthropicPtKey(systemClient.PtKey)
 					}
-					cl.SetTimeout(time.Duration(timeout) * time.Second)
-					cl.SetTransport(sharedTransport)
 					return cl
 				}
 				return systemClient
