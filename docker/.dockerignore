@@ -1,0 +1,13 @@
+node_modules
+web/node_modules
+web/dist
+.git
+*.fpk
+xingyun-api-slim
+pkg
+.dockerignore
+docker
+Dockerfile
+*.log
+.env
+credentials.txt

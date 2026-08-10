@@ -1,0 +1,19 @@
+# 行云API Docker Compose
+# 用法：docker compose up -d
+# 面板：http://<主机IP>:34891
+
+services:
+  xingyun-api:
+    image: xingyun-api:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: xingyun-api
+    restart: unless-stopped
+    ports:
+      - "34891:34891"
+    volumes:
+      - ./data:/data        # 数据持久化（账号、设置、聊天历史）
+    environment:
+      - PORT=34891
+      - TZ=Asia/Shanghai
