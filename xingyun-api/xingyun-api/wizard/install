@@ -1,0 +1,35 @@
+[
+    {
+        "stepTitle": "安装说明",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "<b>行云API</b><br>京东 JoyCode 模型在线服务平台：在线聊天（问答/编程、联网搜索、深度思考）、账号管理（扫码登录）、积分用量、OpenAI/Claude 兼容 API。"
+            },
+            {
+                "type": "tips",
+                "helpText": "<br><b>使用流程：</b><br>1. 打开面板（http://NAS_IP:34891），使用下方设置的密码登录<br>2. 在「账号管理」中用扫码登录 / 一键导入添加京东账号<br>3. 在「聊天」页直接对话，或使用面板提供的 API Token 接入 Claude Code / Codex 等工具"
+            }
+        ]
+    },
+    {
+        "stepTitle": "面板密码",
+        "items": [
+            {
+                "type": "password",
+                "field": "wizard_password",
+                "label": "行云API 面板密码（至少 6 位）",
+                "rules": [
+                    {
+                        "min": 6,
+                        "message": "密码长度至少 6 位"
+                    }
+                ]
+            },
+            {
+                "type": "tips",
+                "helpText": "留空将自动生成随机密码，安装完成后在提示框中直接查看。"
+            }
+        ]
+    }
+]
