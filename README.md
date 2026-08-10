@@ -37,6 +37,22 @@ chmod +x xingyun-api-linux-amd64
 
 首次访问 `http://<主机IP>:34891` 按提示设置 root 密码。
 
+### 方式三：Docker 部署
+
+```bash
+# 克隆仓库（或直接获取 docker/ 目录）
+git clone https://github.com/veenyi/XingyunAPI.git && cd XingyunAPI
+
+# 构建镜像并启动（数据持久化到 ./data）
+docker compose -f docker/docker-compose.yml up -d
+
+# 查看状态 / 日志
+docker ps
+docker logs -f xingyun-api
+```
+
+面板：`http://<主机IP>:34891`，数据（账号、设置、聊天历史）持久化在宿主机 `./data` 目录（镜像内 `/data`，即 `~/.joycode-proxy/`）。自定义端口：修改 compose 的 `PORT` 环境变量与端口映射，或直接 `docker run -e PORT=xxxx -p xxxx:xxxx xingyun-api:latest`。镜像默认以 root 运行以保证绑定卷可写；如需更换数据目录，把 compose 中的 `./data:/data` 改为你的目录即可。
+
 ## 使用流程
 
 1. **登录面板**：浏览器打开 `http://<NAS_IP>:34891`，输入安装时设置的密码
