@@ -128,6 +128,13 @@ var serveCmd = &cobra.Command{
 		// Start credential keepalive: check every 10min, refresh accounts older than 1h
 		keeper := keepalive.NewKeeper(s, 1*time.Hour)
 		keeper.Start(10 * time.Minute)
+		// 账号保活：周期性向每个账号发送随机极短聊天消息（模拟 JoyCode 客户端对话），
+		// 防止账号因长期无客户端活动被上游冻结。间隔默认 12 小时，设置项 keepalive_hours 可调。
+		keepaliveHours := s.GetIntSetting("keepalive_hours", 12)
+		if keepaliveHours < 1 {
+			keepaliveHours = 12
+		}
+		keeper.SetKeepaliveTTL(time.Duration(keepaliveHours) * time.Hour)
 
 		// stopCh is closed on shutdown so background goroutines can exit.
 		stopCh := make(chan struct{})

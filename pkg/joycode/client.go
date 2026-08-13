@@ -665,7 +665,7 @@ func (c *Client) TryActivate() bool {
 
 	body := map[string]interface{}{
 		"model":      DefaultModel,
-		"messages":   []map[string]string{{"role": "user", "content": "hello"}},
+		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
 		"stream":     false,
 		"max_tokens": 16,
 	}
@@ -676,6 +676,41 @@ func (c *Client) TryActivate() bool {
 	}
 	slog.Info("joycode: account activation triggered", "user_id", c.UserID, "code", resp["code"])
 	return true
+}
+
+// SendKeepalive 发送一条随机极短聊天消息，模拟 JoyCode 客户端对话，保持账号"存活"。
+// 京东上游会冻结长期无客户端活动的账号（AI_GRAY_ACCESS_DENIED），定期对话可避免冻结；
+// 若账号已被冻结，这条消息恰好也会触发激活放行。
+// 返回 true 表示消息已发出（无论上游是否返回正常内容）。
+func (c *Client) SendKeepalive() bool {
+	if c == nil || c.PtKey == "" {
+		return false
+	}
+	body := map[string]interface{}{
+		"model":      DefaultModel,
+		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
+		"stream":     false,
+		"max_tokens": 16,
+	}
+	resp, err := c.Post("/api/saas/openai/v1/chat/completions", body)
+	if err != nil {
+		slog.Warn("joycode: keepalive message failed", "user_id", c.UserID, "error", err)
+		return false
+	}
+	slog.Info("joycode: keepalive message sent", "user_id", c.UserID, "code", resp["code"])
+	return true
+}
+
+// randomKeepaliveMessage 生成一条随机极短消息（几个字节~20 字节）。
+// 内容在固定词库 + 随机后缀间变化，避免被上游识别为固定心跳而忽略。
+func randomKeepaliveMessage() string {
+	words := []string{"hi", "hello", "ping", "test", "ok", "in", "1", "ah", "yo"}
+	b := make([]byte, 2)
+	if _, err := rand.Read(b); err != nil {
+		return words[0] + " " + strconv.FormatInt(time.Now().UnixNano()%10000, 10)
+	}
+	n := int(b[0])<<8 | int(b[1])
+	return words[n%len(words)] + " " + strconv.Itoa(n%100000)
 }
 
 // PostWithActivation 与 Post 相同，但遇到激活类错误时自动激活账号并重试一次。

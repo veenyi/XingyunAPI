@@ -20,23 +20,36 @@ type CredentialStatus struct {
 
 // Keeper runs periodic keep-alive checks for all accounts.
 type Keeper struct {
-	store    *store.Store
-	mu       sync.RWMutex
-	status   map[string]*CredentialStatus
-	running  bool
-	stopCh   chan struct{}
-	refreshTTL time.Duration // max age before an account needs refresh
+	store          *store.Store
+	mu             sync.RWMutex
+	status         map[string]*CredentialStatus
+	running        bool
+	stopCh         chan struct{}
+	refreshTTL     time.Duration          // max age before an account needs refresh
+	keepaliveTTL   time.Duration          // max age before an account needs a keepalive chat message
+	lastKeepalive  map[string]time.Time   // userID → 上次保活消息发送时间
 }
 
 // NewKeeper creates a new keepalive keeper.
 // refreshTTL: how old a credential_refreshed_at can be before we re-check (e.g., 1h).
 func NewKeeper(s *store.Store, refreshTTL time.Duration) *Keeper {
 	return &Keeper{
-		store:      s,
-		status:     make(map[string]*CredentialStatus),
-		stopCh:     make(chan struct{}),
-		refreshTTL: refreshTTL,
+		store:         s,
+		status:        make(map[string]*CredentialStatus),
+		stopCh:        make(chan struct{}),
+		refreshTTL:    refreshTTL,
+		lastKeepalive: make(map[string]time.Time),
 	}
+}
+
+// SetKeepaliveTTL 设置账号保活间隔。超过该时长未发送保活消息的账号，
+// 会在下一轮 keepalive 循环中收到一条随机极短聊天消息（模拟 JoyCode 客户端对话，
+// 防止账号因长期无客户端活动被上游冻结）。0 或负值表示关闭保活。
+func (k *Keeper) SetKeepaliveTTL(ttl time.Duration) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.keepaliveTTL = ttl
+	slog.Info("keepalive: keepalive TTL set", "ttl", ttl.String())
 }
 
 // GetStatus returns the credential status for an account.
@@ -97,6 +110,21 @@ func (k *Keeper) Stop() {
 // checkStale queries accounts whose credential_refreshed_at exceeds the TTL
 // and refreshes only those. Accounts never refreshed (empty field) are always checked.
 func (k *Keeper) checkStale() {
+	// 保活：对所有账号检查（独立于凭据刷新状态），防止账号被上游冻结。
+	// ListStaleAccounts 只返回凭据过期的账号，保活必须覆盖全部账号。
+	if all, err := k.store.ListAccounts(); err == nil {
+		for _, acc := range all {
+			if acc.UserID == "" {
+				continue
+			}
+			full, gerr := k.store.GetAccount(acc.UserID)
+			if gerr != nil || full == nil || full.PtKey == "" {
+				continue
+			}
+			k.maybeKeepalive(acc.UserID, full.PtKey)
+		}
+	}
+
 	accounts, err := k.store.ListStaleAccounts(k.refreshTTL)
 	if err != nil {
 		slog.Error("keepalive: failed to list stale accounts", "error", err)
@@ -129,6 +157,9 @@ func (k *Keeper) checkStale() {
 			failedCount++
 		}
 
+		// 保活：模拟 JoyCode 客户端对话，防止账号被上游冻结
+		k.maybeKeepalive(acc.UserID, acc.PtKey)
+
 		if i < len(accounts)-1 {
 			time.Sleep(5 * time.Second)
 		}
@@ -141,6 +172,34 @@ func (k *Keeper) checkStale() {
 		"failed", failedCount,
 		"total", len(accounts),
 	)
+}
+
+// maybeKeepalive 若账号距上次保活超过 keepaliveTTL，则发送一条随机极短聊天消息
+// （模拟 JoyCode 客户端对话）。京东上游会冻结长期无客户端活动的账号
+// （AI_GRAY_ACCESS_DENIED），定期对话可保持账号存活；若账号已被冻结，
+// 这条消息恰好也能触发激活放行。
+// 发送失败同样记录时间：等下一个 TTL 周期再试，避免每轮循环刷上游。
+func (k *Keeper) maybeKeepalive(userID, ptKey string) {
+	if userID == "" || ptKey == "" {
+		return
+	}
+	k.mu.RLock()
+	ttl := k.keepaliveTTL
+	last, seen := k.lastKeepalive[userID]
+	k.mu.RUnlock()
+	if ttl <= 0 {
+		return // 保活关闭
+	}
+	if seen && time.Since(last) < ttl {
+		return // 未到保活时间
+	}
+	k.mu.Lock()
+	k.lastKeepalive[userID] = time.Now()
+	k.mu.Unlock()
+
+	client := joycode.NewClient(ptKey, userID)
+	client.SetTimeout(30 * time.Second)
+	client.SendKeepalive()
 }
 
 // checkOne validates a single account and refreshes pt_key if possible.
