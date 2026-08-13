@@ -32,3 +32,22 @@ func TestTryActivate_Guard(t *testing.T) {
 		t.Error("TryActivate with empty PtKey should return false")
 	}
 }
+
+func TestIsErrorBody(t *testing.T) {
+	cases := []struct {
+		line string
+		want bool
+	}{
+		{`{"error":{"code":"AI_GRAY_ACCESS_DENIED","message":"访问受限"}}`, true},
+		{`{"code":429,"msg":"rate limited"}`, true},
+		{`{"status":"error","msg":"boom"}`, true},
+		{`data: {"choices":[{"delta":{"content":"hi"}}]}`, false},
+		{`data: [DONE]`, false},
+		{`not json at all`, false},
+	}
+	for _, c := range cases {
+		if got := IsErrorBody(c.line); got != c.want {
+			t.Errorf("IsErrorBody(%q) = %v, want %v", c.line, got, c.want)
+		}
+	}
+}

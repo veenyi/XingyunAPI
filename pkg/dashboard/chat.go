@@ -201,6 +201,28 @@ func (h *Handler) chatLoop(
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
+			// 上游偶发返回 200 + 纯 JSON 错误体（非 SSE 格式），如
+			// {"error":{"code":"AI_GRAY_ACCESS_DENIED",...}}——必须透传提示，
+			// 否则前端只收到 done 渲染成空白气泡。
+			if joycode.IsErrorBody(line) {
+				msg := line
+				var e struct {
+					Error struct {
+						Code    string `json:"code"`
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				if json.Unmarshal([]byte(line), &e) == nil && e.Error.Message != "" {
+					msg = e.Error.Message
+					if e.Error.Code != "" {
+						msg = e.Error.Code + ": " + msg
+					}
+				}
+				slog.Error("chat upstream error body", "model", model, "depth", depth, "error", msg)
+				writeChatEvent(w, flusher, map[string]interface{}{"type": "error", "message": msg})
+				writeChatEvent(w, flusher, map[string]interface{}{"type": "done"})
+				return
+			}
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))

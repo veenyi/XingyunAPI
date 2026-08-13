@@ -1,6 +1,7 @@
 package joycode
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/hmac"
@@ -410,6 +411,24 @@ func (c *Client) PostStream(endpoint string, body map[string]interface{}) (*http
 		resp.Body.Close()
 		return nil, err
 	}
+	// 上游偶发返回 200 + 纯 JSON 错误体（非 SSE data: 行），如
+	// {"error":{"code":"AI_GRAY_ACCESS_DENIED",...}}。此时流式解析会把它当
+	// 普通行跳过，导致请求"静默返回空"。这里 peek 首行识别并转为 error，
+	// 让上层（PostStreamWithActivation 等）能触发自动激活与重试。
+	br := bufio.NewReaderSize(resp.Body, 64*1024)
+	firstLine, lerr := br.ReadString('\n')
+	if lerr != nil && lerr != io.EOF {
+		resp.Body.Close()
+		return nil, fmt.Errorf("read stream first line: %w", lerr)
+	}
+	trimmed := strings.TrimSpace(firstLine)
+	if trimmed != "" && !strings.HasPrefix(trimmed, "data:") && IsErrorBody(trimmed) {
+		rest, _ := io.ReadAll(br)
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream error: %s", truncate(trimmed+string(rest), 500))
+	}
+	// 正常：回放首行，保持流式逐行读取
+	resp.Body = &replayReader{first: []byte(firstLine), source: br, body: resp.Body}
 	return resp, nil
 }
 
@@ -429,6 +448,20 @@ func (c *Client) PostAnthropicStream(endpoint string, body map[string]interface{
 		resp.Body.Close()
 		return nil, err
 	}
+	// 同 PostStream：识别 200 + 纯 JSON 错误体（非 SSE data: 行）
+	br := bufio.NewReaderSize(resp.Body, 64*1024)
+	firstLine, lerr := br.ReadString('\n')
+	if lerr != nil && lerr != io.EOF {
+		resp.Body.Close()
+		return nil, fmt.Errorf("read anthropic stream first line: %w", lerr)
+	}
+	trimmed := strings.TrimSpace(firstLine)
+	if trimmed != "" && !strings.HasPrefix(trimmed, "data:") && IsErrorBody(trimmed) {
+		rest, _ := io.ReadAll(br)
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream error: %s", truncate(trimmed+string(rest), 500))
+	}
+	resp.Body = &replayReader{first: []byte(firstLine), source: br, body: resp.Body}
 	return resp, nil
 }
 
@@ -529,6 +562,51 @@ func (c *Client) UserInfoWithRefresh() (string, error) {
 
 func truncate(s string, maxLen int) string {
 	return common.Truncate(s, maxLen)
+}
+
+// IsErrorBody 判断一行文本是否为上游错误体（含 error/code/status/msg 且无 choices）。
+// 上游偶发返回 200 + 纯 JSON 错误（非 SSE data: 行），流式解析会跳过它导致"静默空回复"，
+// 需要在此识别并转为 error 供上层处理（自动激活/错误提示）。
+func IsErrorBody(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "data:") || trimmed == "[DONE]" {
+		return false
+	}
+	var parsed struct {
+		Choices []interface{} `json:"choices"`
+		Error   interface{}   `json:"error"`
+		Code    interface{}   `json:"code"`
+		Status  string        `json:"status"`
+		Msg     string        `json:"msg"`
+	}
+	if json.Unmarshal([]byte(trimmed), &parsed) != nil {
+		return false
+	}
+	if len(parsed.Choices) > 0 {
+		return false
+	}
+	return parsed.Error != nil || parsed.Code != nil || parsed.Status != "" || parsed.Msg != ""
+}
+
+// replayReader 回放已读入的首行，再继续读取底层流（用于 PostStream 的 peek 检测）。
+type replayReader struct {
+	first  []byte
+	offset int
+	source io.Reader
+	body   io.ReadCloser
+}
+
+func (r *replayReader) Read(p []byte) (int, error) {
+	if r.offset < len(r.first) {
+		n := copy(p, r.first[r.offset:])
+		r.offset += n
+		return n, nil
+	}
+	return r.source.Read(p)
+}
+
+func (r *replayReader) Close() error {
+	return r.body.Close()
 }
 
 // ── 账号自动激活 ─────────────────────────────────────────────
