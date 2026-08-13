@@ -121,7 +121,7 @@ func (k *Keeper) checkStale() {
 			if gerr != nil || full == nil || full.PtKey == "" {
 				continue
 			}
-			k.maybeKeepalive(acc.UserID, full.PtKey)
+			k.maybeKeepalive(full)
 		}
 	}
 
@@ -158,7 +158,7 @@ func (k *Keeper) checkStale() {
 		}
 
 		// 保活：模拟 JoyCode 客户端对话，防止账号被上游冻结
-		k.maybeKeepalive(acc.UserID, acc.PtKey)
+		k.maybeKeepalive(&acc)
 
 		if i < len(accounts)-1 {
 			time.Sleep(5 * time.Second)
@@ -179,13 +179,13 @@ func (k *Keeper) checkStale() {
 // （AI_GRAY_ACCESS_DENIED），定期对话可保持账号存活；若账号已被冻结，
 // 这条消息恰好也能触发激活放行。
 // 发送失败同样记录时间：等下一个 TTL 周期再试，避免每轮循环刷上游。
-func (k *Keeper) maybeKeepalive(userID, ptKey string) {
-	if userID == "" || ptKey == "" {
+func (k *Keeper) maybeKeepalive(acc *store.Account) {
+	if acc == nil || acc.UserID == "" || acc.PtKey == "" {
 		return
 	}
 	k.mu.RLock()
 	ttl := k.keepaliveTTL
-	last, seen := k.lastKeepalive[userID]
+	last, seen := k.lastKeepalive[acc.UserID]
 	k.mu.RUnlock()
 	if ttl <= 0 {
 		return // 保活关闭
@@ -194,10 +194,14 @@ func (k *Keeper) maybeKeepalive(userID, ptKey string) {
 		return // 未到保活时间
 	}
 	k.mu.Lock()
-	k.lastKeepalive[userID] = time.Now()
+	k.lastKeepalive[acc.UserID] = time.Now()
 	k.mu.Unlock()
 
-	client := joycode.NewClient(ptKey, userID)
+	client := joycode.NewClient(acc.PtKey, acc.UserID)
+	// 账号专属网关上下文：写死默认值会导致 401 / AI_GRAY_ACCESS_DENIED
+	if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
+		client.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
+	}
 	client.SetTimeout(30 * time.Second)
 	client.SendKeepalive()
 }

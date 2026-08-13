@@ -60,6 +60,11 @@ func cachedClient(acc *store.Account, timeout time.Duration, sharedTransport *ht
 		return cl
 	}
 	cl = joycode.NewClient(acc.PtKey, acc.UserID)
+	// 账号专属网关上下文：官方客户端每个账号的 tenant/loginType/网关地址不同，
+	// 写死默认值会导致 401（账号未登录）或 AI_GRAY_ACCESS_DENIED。
+	if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
+		cl.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
+	}
 	cl.SetTimeout(timeout)
 	if sharedTransport != nil {
 		cl.SetTransport(sharedTransport)

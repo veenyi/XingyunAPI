@@ -26,14 +26,19 @@ const (
 )
 
 type Account struct {
-	UserID       string `json:"user_id"`
-	Nickname     string `json:"nickname"`
-	Remark       string `json:"remark"`
-	APIToken     string `json:"api_token"`
-	PtKey        string `json:"-"`
-	IsDefault    bool   `json:"is_default"`
-	DefaultModel string `json:"default_model"`
-	CreatedAt    string `json:"created_at,omitempty"`
+	UserID        string `json:"user_id"`
+	Nickname      string `json:"nickname"`
+	Remark        string `json:"remark"`
+	APIToken      string `json:"api_token"`
+	PtKey         string `json:"-"`
+	IsDefault     bool   `json:"is_default"`
+	DefaultModel  string `json:"default_model"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	Tenant        string `json:"tenant"`
+	LoginType     string `json:"login_type"`
+	ColorBaseURL  string `json:"color_base_url"`
+	MasterBaseURL string `json:"master_base_url"`
+	OrgFullName   string `json:"org_full_name"`
 }
 
 func (a *Account) DisplayName() string {
@@ -291,6 +296,23 @@ func (s *Store) migrate() error {
 
 	// Migration: add display_order column to accounts
 	if err := addColumnIfMissing(s.db, "accounts", "display_order", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
+	// Migration: 账号专属网关上下文（官方客户端请求必需，写死默认会导致 401/AI_GRAY_ACCESS_DENIED）
+	if err := addColumnIfMissing(s.db, "accounts", "tenant", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(s.db, "accounts", "login_type", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(s.db, "accounts", "color_base_url", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(s.db, "accounts", "master_base_url", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(s.db, "accounts", "org_full_name", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
 
@@ -591,6 +613,10 @@ func (s *Store) decrypt(ciphertext string) (string, error) {
 // --- Account CRUD ---
 
 func (s *Store) AddAccount(userID, ptKey, nickname string, isDefault bool, defaultModel string) error {
+	return s.AddAccountWithContext(userID, ptKey, nickname, isDefault, defaultModel, "", "", "", "", "")
+}
+
+func (s *Store) AddAccountWithContext(userID, ptKey, nickname string, isDefault bool, defaultModel, tenant, loginType, colorBaseURL, masterBaseURL, orgFullName string) error {
 	if userID == "" {
 		return fmt.Errorf("user_id cannot be empty")
 	}
@@ -611,8 +637,8 @@ func (s *Store) AddAccount(userID, ptKey, nickname string, isDefault bool, defau
 			return fmt.Errorf("encrypt pt_key: %w", err)
 		}
 		_, err = s.db.Exec(
-			"UPDATE accounts SET pt_key = ?, nickname = CASE WHEN nickname = '' OR nickname IS NULL THEN ? ELSE nickname END, updated_at = datetime('now', 'localtime') WHERE user_id = ?",
-			encPtKey, nickname, userID,
+			"UPDATE accounts SET pt_key = ?, nickname = CASE WHEN nickname = '' OR nickname IS NULL THEN ? ELSE nickname END, tenant = ?, login_type = ?, color_base_url = ?, master_base_url = ?, org_full_name = ?, updated_at = datetime('now', 'localtime') WHERE user_id = ?",
+			encPtKey, nickname, tenant, loginType, colorBaseURL, masterBaseURL, orgFullName, userID,
 		)
 		if err != nil {
 			slog.Error("store: update account failed", "user_id", userID, "error", err)
@@ -678,8 +704,8 @@ func (s *Store) AddAccount(userID, ptKey, nickname string, isDefault bool, defau
 
 	token := generateToken()
 	_, err = s.db.Exec(
-		"INSERT INTO accounts (user_id, nickname, api_token, pt_key, is_default, default_model, display_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		userID, nickname, token, encPtKey, def, defaultModel, maxOrder+1,
+		"INSERT INTO accounts (user_id, nickname, api_token, pt_key, is_default, default_model, display_order, tenant, login_type, color_base_url, master_base_url, org_full_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		userID, nickname, token, encPtKey, def, defaultModel, maxOrder+1, tenant, loginType, colorBaseURL, masterBaseURL, orgFullName,
 	)
 	if err != nil {
 		slog.Error("store: add account failed", "user_id", userID, "error", err)
@@ -757,9 +783,9 @@ func (s *Store) GetAccount(userID string) (*Account, error) {
 	var encPtKey string
 	var isDef int
 	err := s.db.QueryRow(
-		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at FROM accounts WHERE user_id = ?",
+		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts WHERE user_id = ?",
 		userID,
-	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt)
+	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -783,9 +809,9 @@ func (s *Store) GetAccountByToken(token string) (*Account, error) {
 	var encPtKey string
 	var isDef int
 	err := s.db.QueryRow(
-		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at FROM accounts WHERE api_token = ?",
+		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts WHERE api_token = ?",
 		token,
-	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt)
+	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -818,8 +844,8 @@ func (s *Store) GetDefaultAccount() (*Account, error) {
 	var a Account
 	var encPtKey string
 	err := s.db.QueryRow(
-		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at FROM accounts WHERE is_default = 1 LIMIT 1",
-	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, new(int), &a.DefaultModel, &a.CreatedAt)
+		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts WHERE is_default = 1 LIMIT 1",
+	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, new(int), &a.DefaultModel, &a.CreatedAt, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -923,7 +949,7 @@ func (s *Store) ListStaleAccounts(threshold time.Duration) ([]Account, error) {
 	normalCutoff := time.Now().Add(-threshold).Format("2006-01-02 15:04:05")
 	backoffCutoff := time.Now().Add(-threshold * 4).Format("2006-01-02 15:04:05")
 	rows, err := s.db.Query(
-		`SELECT user_id, nickname, pt_key, default_model FROM accounts
+		`SELECT user_id, nickname, pt_key, default_model, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts
 		 WHERE credential_refreshed_at = ''
 		    OR credential_valid = -1
 		    OR (credential_valid = 1 AND credential_refreshed_at < ?)
@@ -941,7 +967,7 @@ func (s *Store) ListStaleAccounts(threshold time.Duration) ([]Account, error) {
 	for rows.Next() {
 		var a Account
 		var encPtKey string
-		if err := rows.Scan(&a.UserID, &a.Nickname, &encPtKey, &a.DefaultModel); err != nil {
+		if err := rows.Scan(&a.UserID, &a.Nickname, &encPtKey, &a.DefaultModel, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName); err != nil {
 			slog.Error("store: list stale accounts scan failed", "error", err)
 			return nil, err
 		}
