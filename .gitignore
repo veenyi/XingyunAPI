@@ -17,3 +17,8 @@ Thumbs.db
 .env
 credentials.txt
 xingyun-api/app/bin/
+
+# 打包产物目录（含本地脚本，禁止入库）
+xingyun-api/
+*.db
+*.log
