@@ -124,6 +124,30 @@ const FIELD_GROUPS = [
       },
     ],
   },
+  {
+    title: '账号保活',
+    fields: [
+      {
+        key: 'keepalive_interval_minutes',
+        label: '账号保活间隔',
+        tooltip: '定期向每个账号发送随机极短消息，模拟 JoyCode 客户端对话，防止账号因长期无客户端活动被上游冻结。间隔越短越保险，但会增加上游请求量',
+        placeholder: '请选择',
+        type: 'select' as const,
+        options: [
+          { label: '1 分钟', value: '1' },
+          { label: '5 分钟', value: '5' },
+          { label: '15 分钟', value: '15' },
+          { label: '30 分钟', value: '30' },
+          { label: '1 小时', value: '60' },
+          { label: '3 小时', value: '180' },
+          { label: '6 小时（推荐）', value: '360' },
+          { label: '12 小时', value: '720' },
+          { label: '24 小时', value: '1440' },
+        ],
+        tag: '已生效',
+      },
+    ],
+  },
 ];
 
 const SettingsPage: React.FC = () => {

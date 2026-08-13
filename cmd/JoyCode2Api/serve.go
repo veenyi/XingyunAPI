@@ -125,19 +125,48 @@ var serveCmd = &cobra.Command{
 		srv := openai.NewServer(client, s)
 		anth := anthropic.NewHandler(client, s)
 
-		// Start credential keepalive: check every 10min, refresh accounts older than 1h
+		// Start credential keepalive: check every 1min, refresh accounts older than 1h
 		keeper := keepalive.NewKeeper(s, 1*time.Hour)
-		keeper.Start(10 * time.Minute)
-		// 账号保活：周期性向每个账号发送随机极短聊天消息（模拟 JoyCode 客户端对话），
-		// 防止账号因长期无客户端活动被上游冻结。间隔默认 6 小时，设置项 keepalive_hours 可调。
-		keepaliveHours := s.GetIntSetting("keepalive_hours", 6)
-		if keepaliveHours < 1 {
-			keepaliveHours = 6
+		keeper.Start(1 * time.Minute)
+		// 账号保活：周期向每个账号发送随机极短聊天消息（模拟 JoyCode 客户端对话），
+		// 防止账号因长期无客户端活动被上游冻结。间隔用户可在设置页自定义
+		// （keepalive_interval_minutes，1~1440 分钟，默认 360 = 6 小时）。
+		keepaliveMin := s.GetIntSetting("keepalive_interval_minutes", 360)
+		if keepaliveMin < 1 {
+			keepaliveMin = 1
 		}
-		keeper.SetKeepaliveTTL(time.Duration(keepaliveHours) * time.Hour)
+		if keepaliveMin > 1440 {
+			keepaliveMin = 1440
+		}
+		keeper.SetKeepaliveTTL(time.Duration(keepaliveMin) * time.Minute)
 
 		// stopCh is closed on shutdown so background goroutines can exit.
 		stopCh := make(chan struct{})
+
+		// 监听保活间隔设置变化，动态更新（无需重启服务）
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			last := keepaliveMin
+			for {
+				select {
+				case <-ticker.C:
+					m := s.GetIntSetting("keepalive_interval_minutes", 360)
+					if m < 1 {
+						m = 1
+					}
+					if m > 1440 {
+						m = 1440
+					}
+					if m != last {
+						keeper.SetKeepaliveTTL(time.Duration(m) * time.Minute)
+						last = m
+					}
+				case <-stopCh:
+					return
+				}
+			}
+		}()
 
 		// Per-request client resolution from database accounts
 		if s != nil {

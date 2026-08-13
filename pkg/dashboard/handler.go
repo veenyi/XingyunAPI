@@ -464,6 +464,31 @@ func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 同步更新 .env 中的 PASSWORD 记录（TRIM_PKGVAR 由 cmd/main 注入）。
+	// 数据库是密码校验的唯一来源，.env 仅作记录；同步避免用户查 .env 看到旧密码产生困惑。
+	if pkgVar := os.Getenv("TRIM_PKGVAR"); pkgVar != "" {
+		envFile := filepath.Join(pkgVar, ".env")
+		if data, rerr := os.ReadFile(envFile); rerr == nil {
+			lines := strings.Split(string(data), "\n")
+			found := false
+			for i, l := range lines {
+				if strings.HasPrefix(l, "PASSWORD=") {
+					lines[i] = "PASSWORD=" + body.NewPassword
+					found = true
+					break
+				}
+			}
+			if !found {
+				lines = append(lines, "PASSWORD="+body.NewPassword)
+			}
+			if werr := os.WriteFile(envFile, []byte(strings.Join(lines, "\n")), 0600); werr != nil {
+				slog.Warn("change password: sync .env failed", "error", werr)
+			} else {
+				slog.Info("auth: root password changed and synced to .env")
+			}
+		}
+	}
+
 	slog.Info("auth: root password changed")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
