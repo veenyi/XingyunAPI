@@ -56,6 +56,7 @@ var colorEndpoints = map[string]colorEndpoint{
 	"/api/saas/user/v1/userInfo":           {"joycode_userInfo", "/api/saas/user/v2/userInfo"},
 	"/api/saas/anthropic/v1/messages":      {"anthropic_completions", "/api/saas/anthropic/v1/messages"},
 	"/api/saas/point/v1/getNewIdePoint":    {"get_newpoint_ide", "/api/saas/point/v1/getNewIdePoint"},
+	"/api/saas/model-runtime/v1/models/prepare": {"model_runtime_prepare", "/api/saas/model-runtime/v1/models/prepare"},
 }
 
 // Models 为 fallback 模型列表（上游 modelList 失败时使用），与官方模型管理一致。
@@ -81,6 +82,7 @@ type Client struct {
 	Tenant         string
 	LoginType      string
 	OrgFullName    string
+	ModelQueueToken string
 	httpClient     *http.Client
 }
 
@@ -203,7 +205,7 @@ func (c *Client) headers() http.Header {
 	if loginType == "" {
 		loginType = "N_PIN_PC"
 	}
-	return http.Header{
+	h := http.Header{
 		"Content-Type":    {"application/json; charset=UTF-8"},
 		"source-type":     {"joycoder-ide"},
 		"ptKey":           {c.PtKey},
@@ -213,6 +215,18 @@ func (c *Client) headers() http.Header {
 		"Accept-Encoding": {"gzip, deflate"},
 		"Accept-Language": {"zh-CN,zh;q=0.9,en;q=0.8"},
 	}
+	// 官方客户端会在请求头携带 tenant（URL 编码）与模型运行时令牌，
+	// 缺一不可（尤其企业账号 PIN_JD_CLOUD 会返回 AI_GRAY_ACCESS_DENIED）。
+	if c.Tenant != "" {
+		h.Set("tenant", url.QueryEscape(c.Tenant))
+	}
+	if c.ModelQueueToken != "" {
+		h.Set("X-Model-Token", c.ModelQueueToken)
+	}
+	if c.SessionID != "" {
+		h.Set("x-request-id", c.SessionID)
+	}
+	return h
 }
 
 func (c *Client) anthropicHeaders() http.Header {
@@ -224,7 +238,7 @@ func (c *Client) anthropicHeaders() http.Header {
 	if loginType == "" {
 		loginType = "PIN_JD_CLOUD"
 	}
-	return http.Header{
+	h := http.Header{
 		"Content-Type":    {"application/json; charset=utf-8"},
 		"source-type":     {"joycoder-ide"},
 		"ptKey":           {ptKey},
@@ -234,6 +248,16 @@ func (c *Client) anthropicHeaders() http.Header {
 		"Accept-Encoding": {"gzip, deflate"},
 		"Accept-Language": {"zh-CN,zh;q=0.9,en;q=0.8"},
 	}
+	if c.Tenant != "" {
+		h.Set("tenant", url.QueryEscape(c.Tenant))
+	}
+	if c.ModelQueueToken != "" {
+		h.Set("X-Model-Token", c.ModelQueueToken)
+	}
+	if c.SessionID != "" {
+		h.Set("x-request-id", c.SessionID)
+	}
+	return h
 }
 
 func (c *Client) prepareBody(extra map[string]interface{}) map[string]interface{} {
@@ -531,6 +555,40 @@ func (c *Client) Validate() error {
 			msg = "unknown error"
 		}
 		return fmt.Errorf("credential validation failed (code=%.0f): %s", code, msg)
+	}
+	return nil
+}
+
+// PrepareModel 调用 model_runtime_prepare 接口"准备模型运行时"。
+// 官方客户端在发送聊天消息前会先调用此接口申请/轮询模型运行时令牌，
+// 缺失这一步时，部分账号（尤其企业账号 PIN_JD_CLOUD）会被上游直接拒绝
+// （AI_GRAY_ACCESS_DENIED）。chatID 为会话标识（官方客户端用它关联历史会话）。
+func (c *Client) PrepareModel(model, chatID string) (map[string]interface{}, error) {
+	body := map[string]interface{}{
+		"model":      model,
+		"chatId":     chatID,
+		"stream":     true,
+		"client":     "JoyCode",
+		"language":   "UNKNOWN",
+		"orgFullName": c.OrgFullName,
+	}
+	return c.Post("/api/saas/model-runtime/v1/models/prepare", body)
+}
+
+// EnsureModelReady 发送聊天前"准备模型运行时"：调用 model_runtime_prepare 拿令牌，
+// 写入 ModelQueueToken 供 chat 请求头 X-Model-Token 使用。官方客户端每个会话都会先
+// prepare，缺失时企业账号（PIN_JD_CLOUD）会被上游拒绝（AI_GRAY_ACCESS_DENIED）。
+func (c *Client) EnsureModelReady(model string) error {
+	resp, err := c.PrepareModel(model, c.SessionID)
+	if err != nil {
+		return err
+	}
+	data, _ := resp["data"].(map[string]interface{})
+	if data == nil {
+		return nil
+	}
+	if token, ok := data["token"].(string); ok && token != "" {
+		c.ModelQueueToken = token
 	}
 	return nil
 }
