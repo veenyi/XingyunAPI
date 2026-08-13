@@ -1628,7 +1628,10 @@ func (h *Handler) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		userID := "root"
+		userID := r.URL.Query().Get("user_id")
+		if userID == "" {
+			userID = "root"
+		}
 		data, err := h.store.GetChatHistory(userID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -1641,15 +1644,19 @@ func (h *Handler) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var body struct {
+			UserID   string          `json:"user_id"`
 			Messages json.RawMessage `json:"messages"`
 		}
 		if !readJSONBody(w, r, &body) {
 			return
 		}
+		if body.UserID == "" {
+			body.UserID = "root"
+		}
 		if len(body.Messages) == 0 {
 			body.Messages = json.RawMessage("[]")
 		}
-		if err := h.store.SaveChatHistory("root", string(body.Messages)); err != nil {
+		if err := h.store.SaveChatHistory(body.UserID, string(body.Messages)); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

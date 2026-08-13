@@ -183,9 +183,9 @@ export const api = {
   validateAccount: (userId: string) =>
     request<{ valid: boolean }>(`/api/accounts/${encodeURIComponent(userId)}/validate`, { method: 'POST' }),
   listModels: () => request<{ models: ModelInfo[] }>('/api/models').then(r => r.models),
-  getChatHistory: () => request<{ messages: any[] }>('/api/chat-history'),
-  saveChatHistory: (messages: any[]) =>
-    request<{ ok: boolean }>('/api/chat-history', { method: 'POST', body: JSON.stringify({ messages }) }),
+  getChatHistory: (userId?: string) => request<{ messages: any[] }>(`/api/chat-history${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`),
+  saveChatHistory: (messages: any[], userId?: string) =>
+    request<{ ok: boolean }>('/api/chat-history', { method: 'POST', body: JSON.stringify({ messages, user_id: userId || 'root' }) }),
   chatStream: (
     params: { messages: { role: string; content: string; images?: string[] }[]; model?: string; mode?: string; web_search?: boolean; user_id?: string },
     onEvent: (e: any) => void,

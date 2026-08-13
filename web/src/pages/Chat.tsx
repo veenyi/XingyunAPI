@@ -3,7 +3,7 @@ import {
   Card, Typography, Segmented, Select, Switch, Input, Button, Space, Spin, Empty, Tooltip, Upload, message,
 } from 'antd';
 import {
-  SendOutlined, DeleteOutlined, GlobalOutlined, BulbOutlined, PaperClipOutlined, UserOutlined,
+  SendOutlined, DeleteOutlined, GlobalOutlined, BulbOutlined, PaperClipOutlined, UserOutlined, DownloadOutlined,
 } from '@ant-design/icons';
 import { api } from '../api';
 
@@ -55,9 +55,12 @@ const Chat: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 从服务器加载聊天历史（所有浏览器/设备共享）
+  // 从服务器加载聊天历史（按账号隔离，切换账号自动加载对应会话）
   useEffect(() => {
-    api.getChatHistory()
+    if (!accountId) return;
+    setHistoryLoaded(false);
+    setMessages([]);
+    api.getChatHistory(accountId)
       .then((res) => {
         if (Array.isArray(res.messages)) {
           const valid = res.messages.filter((m) => m && m.role);
@@ -66,14 +69,15 @@ const Chat: React.FC = () => {
       })
       .catch(() => {})
       .finally(() => setHistoryLoaded(true));
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountId]);
 
-  // 消息变化时保存到服务器
+  // 消息变化时保存到服务器（按账号隔离）
   useEffect(() => {
     if (!historyLoaded) return;
     const toSave = messages.slice(-HISTORY_LIMIT);
-    api.saveChatHistory(toSave).catch(() => {});
-  }, [messages, historyLoaded]);
+    api.saveChatHistory(toSave, accountId).catch(() => {});
+  }, [messages, historyLoaded, accountId]);
 
   useEffect(() => {
     api.listModels().then((ms) => {
@@ -160,7 +164,44 @@ const Chat: React.FC = () => {
 
   const clearAll = () => {
     setMessages([]);
-    api.saveChatHistory([]).catch(() => {});
+    api.saveChatHistory([], accountId).catch(() => {});
+  };
+
+  // 导出当前会话为 Markdown
+  const exportChat = () => {
+    if (messages.length === 0) {
+      message.info('当前没有可导出的聊天记录');
+      return;
+    }
+    const md = messages.map((m) => {
+      const head = m.role === 'user' ? '## 我' : '## 助手';
+      let body = m.content || '';
+      if (m.reasoning) body += `\n\n<details><summary>深度思考</summary>\n\n${m.reasoning}\n\n</details>`;
+      return `${head}\n\n${body}`;
+    }).join('\n\n---\n\n');
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `行云聊天-${accountId || 'root'}-${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // 通用附件：读取文本/代码文件内容拼接到输入
+  const addTextAttachments = (files: FileList | File[]) => {
+    Array.from(files).forEach((f) => {
+      if (f.size > 2 * 1024 * 1024) {
+        message.error(`文件「${f.name}」超过 2MB，请自行粘贴内容`);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = String(reader.result || '');
+        setInput((prev) => `${prev}\n\n【附件：${f.name}】\n${text}`.trim());
+      };
+      reader.readAsText(f);
+    });
   };
 
   // 把图片文件转 data URL 加入待发列表
@@ -208,7 +249,7 @@ const Chat: React.FC = () => {
             <Select
               size="small"
               value={accountId || undefined}
-              onChange={(v) => { setAccountId(v); setMessages([]); }}
+              onChange={(v) => setAccountId(v)}
               placeholder="选择账号"
               options={accounts}
               suffixIcon={<UserOutlined />}
@@ -238,9 +279,14 @@ const Chat: React.FC = () => {
               </span>
             </Tooltip>
           </Space>
-          <Button size="small" icon={<DeleteOutlined />} onClick={clearAll} disabled={messages.length === 0}>
-            清空
-          </Button>
+          <Space>
+            <Button size="small" icon={<DownloadOutlined />} onClick={exportChat} disabled={messages.length === 0}>
+              导出
+            </Button>
+            <Button size="small" icon={<DeleteOutlined />} onClick={clearAll} disabled={messages.length === 0}>
+              清空
+            </Button>
+          </Space>
         </Space>
       </Card>
 
@@ -282,17 +328,21 @@ const Chat: React.FC = () => {
                   wordBreak: 'break-word',
                 }}
               >
-                {/* 工具提示 */}
+                {/* 联网搜索过程（折叠） */}
                 {m.tools.length > 0 && (
-                  <div style={{ marginBottom: 8 }}>
-                    {m.tools.map((t, ti) => (
-                      <div key={ti} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#22C55E', marginBottom: 2 }}>
-                        <GlobalOutlined />
-                        <span>{t.status === 'running' ? '正在搜索：' : '已搜索：'}{t.query}</span>
-                        {t.status === 'running' && <Spin size="small" />}
-                      </div>
-                    ))}
-                  </div>
+                  <details style={{ marginBottom: 8, fontSize: 12, color: '#22C55E' }}>
+                    <summary style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <GlobalOutlined /> 联网搜索 · {m.tools.length} 次
+                    </summary>
+                    <div style={{ marginTop: 6, padding: '6px 10px', background: 'rgba(34,197,94,0.08)', borderRadius: 8 }}>
+                      {m.tools.map((t, ti) => (
+                        <div key={ti} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                          <span>{t.status === 'running' ? '正在搜索' : '已搜索'}：{t.query}</span>
+                          {t.status === 'running' && <Spin size="small" />}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
                 )}
                 {/* 深度思考（可折叠） */}
                 {m.reasoning && (
@@ -366,12 +416,15 @@ const Chat: React.FC = () => {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
           <Space size={12}>
             <Upload
-              accept="image/*"
               multiple
               showUploadList={false}
-              beforeUpload={(file) => { addImages([file]); return false; }}
+              beforeUpload={(file) => {
+                if (file.type.startsWith('image/')) addImages([file]);
+                else addTextAttachments([file]);
+                return false;
+              }}
             >
-              <Button size="small" icon={<PaperClipOutlined />}>上传图片</Button>
+              <Button size="small" icon={<PaperClipOutlined />}>附件</Button>
             </Upload>
             <Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
               {mode === 'qa' ? '问答模式 · 简洁直接回答' : '编程模式 · 面向开发任务'}
