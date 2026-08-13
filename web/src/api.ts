@@ -187,7 +187,7 @@ export const api = {
   saveChatHistory: (messages: any[]) =>
     request<{ ok: boolean }>('/api/chat-history', { method: 'POST', body: JSON.stringify({ messages }) }),
   chatStream: (
-    params: { messages: { role: string; content: string }[]; model?: string; mode?: string; web_search?: boolean },
+    params: { messages: { role: string; content: string; images?: string[] }[]; model?: string; mode?: string; web_search?: boolean; user_id?: string },
     onEvent: (e: any) => void,
   ): Promise<void> => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };

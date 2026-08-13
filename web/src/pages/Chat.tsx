@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Card, Typography, Segmented, Select, Switch, Input, Button, Space, Spin, Empty, Tooltip,
+  Card, Typography, Segmented, Select, Switch, Input, Button, Space, Spin, Empty, Tooltip, Upload, message,
 } from 'antd';
 import {
-  SendOutlined, DeleteOutlined, GlobalOutlined, BulbOutlined,
+  SendOutlined, DeleteOutlined, GlobalOutlined, BulbOutlined, PaperClipOutlined, UserOutlined,
 } from '@ant-design/icons';
 import { api } from '../api';
 
@@ -12,6 +12,7 @@ interface Msg {
   content: string;
   reasoning: string;   // 深度思考内容（可折叠）
   tools: { tool: string; query: string; status: 'running' | 'done' }[];
+  images?: string[];   // 图片 data URL
   error?: string;
 }
 
@@ -20,6 +21,7 @@ const { Text } = Typography;
 const FALLBACK_MODELS = ["JoyAI-Code-1.5", "MiniMax-M3", "MiniMax-M2.7", "Kimi-K2.6", "GLM-5.1", "GLM-5", "DeepSeek-V4-Pro", "Doubao-Seed-2.0-pro"];
 
 const HISTORY_LIMIT = 200; // 最多保留 200 条消息
+const MAX_IMG_SIZE = 5 * 1024 * 1024; // 单图 5MB
 
 const Chat: React.FC = () => {
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -30,7 +32,28 @@ const Chat: React.FC = () => {
   const [models, setModels] = useState<string[]>(FALLBACK_MODELS);
   const [sending, setSending] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [accounts, setAccounts] = useState<{ label: string; value: string }[]>([]);
+  const [accountId, setAccountId] = useState<string>('');
+  const [pendingImages, setPendingImages] = useState<string[]>([]);
   const listRef = useRef<HTMLDivElement>(null);
+
+  // 加载账号列表（聊天账号切换下拉）
+  useEffect(() => {
+    api.listAccounts()
+      .then((list) => {
+        const opts = (list || []).map((a: any) => ({
+          label: a.nickname || a.remark || a.user_id,
+          value: a.user_id,
+        }));
+        setAccounts(opts);
+        if (opts.length > 0 && !accountId) {
+          const def = (list || []).find((a: any) => a.is_default);
+          setAccountId(def ? def.user_id : opts[0].value);
+        }
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 从服务器加载聊天历史（所有浏览器/设备共享）
   useEffect(() => {
@@ -69,9 +92,11 @@ const Chat: React.FC = () => {
 
   const send = async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    if ((!text && pendingImages.length === 0) || sending) return;
+    const imgs = [...pendingImages];
     setInput('');
-    setMessages((prev) => [...prev, { role: 'user', content: text, reasoning: '', tools: [] }]);
+    setPendingImages([]);
+    setMessages((prev) => [...prev, { role: 'user', content: text, reasoning: '', tools: [], images: imgs }]);
     // 追加一个空的 assistant 消息用于流式填充
     setMessages((prev) => [...prev, { role: 'assistant', content: '', reasoning: '', tools: [] }]);
     setSending(true);
@@ -80,8 +105,9 @@ const Chat: React.FC = () => {
     const history = messages.filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content)).map((m) => ({
       role: m.role,
       content: m.content || '',
+      ...(m.images && m.images.length > 0 ? { images: m.images } : {}),
     }));
-    history.push({ role: 'user', content: text });
+    history.push({ role: 'user', content: text, ...(imgs.length > 0 ? { images: imgs } : {}) });
 
     let reasoningBuf = '';
     let contentBuf = '';
@@ -98,7 +124,7 @@ const Chat: React.FC = () => {
 
     try {
       await api.chatStream(
-        { messages: history, model, mode, web_search: webSearch },
+        { messages: history, model, mode, web_search: webSearch, user_id: accountId || undefined },
         (e: any) => {
           switch (e.type) {
             case 'reasoning':
@@ -137,6 +163,41 @@ const Chat: React.FC = () => {
     api.saveChatHistory([]).catch(() => {});
   };
 
+  // 把图片文件转 data URL 加入待发列表
+  const addImages = (files: FileList | File[]) => {
+    const list = Array.from(files);
+    list.forEach((f) => {
+      if (!f.type.startsWith('image/')) {
+        message.error('仅支持图片文件');
+        return;
+      }
+      if (f.size > MAX_IMG_SIZE) {
+        message.error('单张图片不能超过 5MB');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => setPendingImages((prev) => [...prev, reader.result as string]);
+      reader.readAsDataURL(f);
+    });
+  };
+
+  // 粘贴图片
+  const onPaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      addImages(files);
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
       {/* 顶栏 */}
@@ -144,6 +205,16 @@ const Chat: React.FC = () => {
         <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
           <Space wrap>
             <Text strong style={{ fontSize: 15 }}>AI 聊天</Text>
+            <Select
+              size="small"
+              value={accountId || undefined}
+              onChange={(v) => { setAccountId(v); setMessages([]); }}
+              placeholder="选择账号"
+              options={accounts}
+              suffixIcon={<UserOutlined />}
+              style={{ width: 160 }}
+              popupMatchSelectWidth={false}
+            />
             <Segmented
               value={mode}
               onChange={(v) => setMode(String(v))}
@@ -234,6 +305,14 @@ const Chat: React.FC = () => {
                     </div>
                   </details>
                 )}
+                {/* 用户图片 */}
+                {m.images && m.images.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+                    {m.images.map((img, ii) => (
+                      <img key={ii} src={img} alt="附件" style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, border: '1px solid var(--jc-card-border)' }} />
+                    ))}
+                  </div>
+                )}
                 {/* 正文 / 错误 */}
                 {m.error ? (
                   <div style={{ color: '#EF4444', fontSize: 13 }}>{m.error}</div>
@@ -262,15 +341,42 @@ const Chat: React.FC = () => {
         <Input.TextArea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="输入问题，Ctrl+Enter 发送"
+          placeholder="输入问题，Ctrl+Enter 发送；可直接粘贴或上传图片"
           autoSize={{ minRows: 2, maxRows: 6 }}
           style={{ minHeight: 52 }}
+          onPaste={onPaste}
           onPressEnter={(e) => { if (!e.shiftKey) { e.preventDefault(); send(); } }}
         />
+        {pendingImages.length > 0 && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+            {pendingImages.map((img, i) => (
+              <div key={i} style={{ position: 'relative' }}>
+                <img src={img} alt="待发送" style={{ width: 64, height: 64, objectFit: 'cover', borderRadius: 6, border: '1px solid var(--jc-card-border)' }} />
+                <Button
+                  size="small" type="text" danger
+                  style={{ position: 'absolute', top: -8, right: -8, fontSize: 12, padding: 0, minWidth: 18, height: 18, borderRadius: 9, background: 'var(--jc-bg-elevated)' }}
+                  onClick={() => setPendingImages((prev) => prev.filter((_, idx) => idx !== i))}
+                >
+                  ×
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
-          <Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
-            {mode === 'qa' ? '问答模式 · 简洁直接回答' : '编程模式 · 面向开发任务'}
-          </Text>
+          <Space size={12}>
+            <Upload
+              accept="image/*"
+              multiple
+              showUploadList={false}
+              beforeUpload={(file) => { addImages([file]); return false; }}
+            >
+              <Button size="small" icon={<PaperClipOutlined />}>上传图片</Button>
+            </Upload>
+            <Text style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
+              {mode === 'qa' ? '问答模式 · 简洁直接回答' : '编程模式 · 面向开发任务'}
+            </Text>
+          </Space>
           <Button type="primary" icon={<SendOutlined />} loading={sending} onClick={send}>
             发送
           </Button>

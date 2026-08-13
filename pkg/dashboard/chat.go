@@ -34,11 +34,13 @@ type chatRequest struct {
 	Model     string        `json:"model"`
 	Mode      string        `json:"mode"`       // qa | coding
 	WebSearch bool          `json:"web_search"` // 是否启用联网搜索
+	UserID    string        `json:"user_id"`    // 指定账号（空则用默认账号）
 }
 
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	Images  []string `json:"images,omitempty"` // 图片 data URL 列表（多模态输入）
 }
 
 // defaultAccount 返回当前默认账号（聊天用账号）
@@ -81,25 +83,40 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	account := h.defaultAccount()
-	if account == nil {
-		writeError(w, http.StatusBadRequest, "暂无账号，请先添加 JoyCode 账号")
-		return
-	}
-	fullAccount, err := h.store.GetAccount(account.UserID)
-	if err != nil || fullAccount == nil {
-		writeError(w, http.StatusBadRequest, "获取账号凭据失败")
-		return
+	var fullAccount *store.Account
+	var err error
+	if req.UserID != "" {
+		if a, gerr := h.store.GetAccount(req.UserID); gerr == nil && a != nil {
+			fullAccount = a
+		} else {
+			writeError(w, http.StatusBadRequest, "指定账号不存在")
+			return
+		}
+	} else {
+		if account == nil {
+			writeError(w, http.StatusBadRequest, "暂无账号，请先添加 JoyCode 账号")
+			return
+		}
+		fullAccount, err = h.store.GetAccount(account.UserID)
+		if err != nil || fullAccount == nil {
+			writeError(w, http.StatusBadRequest, "获取账号凭据失败")
+			return
+		}
 	}
 
 	model := req.Model
 	if model == "" {
-		model = account.DefaultModel
+		model = fullAccount.DefaultModel
 		if model == "" {
 			model = "GLM-5.1"
 		}
 	}
 
 	client := joycode.NewClient(fullAccount.PtKey, fullAccount.UserID)
+	// 账号专属网关上下文（企业账号 tenant/loginType 与默认不同，写死会导致 401）
+	if fullAccount.Tenant != "" || fullAccount.LoginType != "" || fullAccount.ColorBaseURL != "" || fullAccount.MasterBaseURL != "" || fullAccount.OrgFullName != "" {
+		client.SetColorContext(fullAccount.ColorBaseURL, fullAccount.MasterBaseURL, fullAccount.Tenant, fullAccount.LoginType, fullAccount.OrgFullName)
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -152,7 +169,21 @@ func (h *Handler) chatLoop(
 	messages := make([]map[string]interface{}, 0, len(history)+1)
 	messages = append(messages, map[string]interface{}{"role": "system", "content": sysPrompt})
 	for _, m := range history {
-		messages = append(messages, map[string]interface{}{"role": m.Role, "content": m.Content})
+		if len(m.Images) > 0 {
+			parts := []map[string]interface{}{}
+			if m.Content != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": m.Content})
+			}
+			for _, img := range m.Images {
+				parts = append(parts, map[string]interface{}{
+					"type":      "image_url",
+					"image_url": map[string]string{"url": img},
+				})
+			}
+			messages = append(messages, map[string]interface{}{"role": m.Role, "content": parts})
+		} else {
+			messages = append(messages, map[string]interface{}{"role": m.Role, "content": m.Content})
+		}
 	}
 
 	body := map[string]interface{}{
