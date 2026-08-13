@@ -649,8 +649,18 @@ func IsActivationError(msg string) bool {
 	return false
 }
 
-// TryActivate 模拟客户端首次聊天激活账号：发送一条最小 chat 请求。
-// 返回 true 表示激活请求已发出（无论上游是否立即放行）。
+// minChatBody 构造保活/激活用的最小流式聊天请求体。
+func minChatBody() map[string]interface{} {
+	return map[string]interface{}{
+		"model":      DefaultModel,
+		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
+		"stream":     true,
+		"max_tokens": 16,
+	}
+}
+
+// TryActivate 模拟客户端首聊激活账号（用流式发送，可检测 AI_GRAY_ACCESS_DENIED）。
+// 发一条消息触发上游解冻 → 等待放行 → 再发一条验证是否真正解冻。返回 true 表示已解冻。
 func (c *Client) TryActivate() bool {
 	if c == nil || c.PtKey == "" {
 		return false
@@ -663,41 +673,44 @@ func (c *Client) TryActivate() bool {
 	activateHistory[c.PtKey] = time.Now()
 	activateMu.Unlock()
 
-	body := map[string]interface{}{
-		"model":      DefaultModel,
-		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
-		"stream":     false,
-		"max_tokens": 16,
+	// 第一次流式消息：触发上游解冻。冻结账号此处会返回 AI_GRAY_ACCESS_DENIED，
+	// 但"发送一条聊天消息"这个动作本身正是官方客户端解冻账号的机制。
+	if resp, err := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody()); err == nil {
+		resp.Body.Close()
+	} else {
+		slog.Info("joycode: activation message sent, waiting for grant", "user_id", c.UserID, "error", err)
 	}
-	resp, err := c.Post("/api/saas/openai/v1/chat/completions", body)
-	if err != nil {
-		slog.Warn("joycode: activation message failed", "user_id", c.UserID, "error", err)
+	time.Sleep(activateWait) // 等上游放行
+
+	// 二次验证：再发一条流式消息，成功即账号已解冻
+	resp2, err2 := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody())
+	if err2 != nil {
+		if resp2 != nil {
+			resp2.Body.Close()
+		}
+		slog.Warn("joycode: activation verify failed", "user_id", c.UserID, "error", err2)
 		return false
 	}
-	slog.Info("joycode: account activation triggered", "user_id", c.UserID, "code", resp["code"])
+	resp2.Body.Close()
+	slog.Info("joycode: account activation verified", "user_id", c.UserID)
 	return true
 }
 
-// SendKeepalive 发送一条随机极短聊天消息，模拟 JoyCode 客户端对话，保持账号"存活"。
-// 京东上游会冻结长期无客户端活动的账号（AI_GRAY_ACCESS_DENIED），定期对话可避免冻结；
-// 若账号已被冻结，这条消息恰好也会触发激活放行。
-// 返回 true 表示消息已发出（无论上游是否返回正常内容）。
+// SendKeepalive 发送一条随机极短流式消息，模拟 JoyCode 客户端对话，保持账号"存活"。
+// 若消息被上游拒绝（AI_GRAY_ACCESS_DENIED，账号已冻结），自动触发激活解冻。
+// 返回 true 表示账号当前可用（消息被上游正常接受）。
 func (c *Client) SendKeepalive() bool {
 	if c == nil || c.PtKey == "" {
 		return false
 	}
-	body := map[string]interface{}{
-		"model":      DefaultModel,
-		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
-		"stream":     false,
-		"max_tokens": 16,
-	}
-	resp, err := c.Post("/api/saas/openai/v1/chat/completions", body)
+	resp, err := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody())
 	if err != nil {
-		slog.Warn("joycode: keepalive message failed", "user_id", c.UserID, "error", err)
-		return false
+		// 冻结/受限 → 触发激活解冻
+		slog.Warn("joycode: keepalive message blocked, trying activation", "user_id", c.UserID, "error", err)
+		return c.TryActivate()
 	}
-	slog.Info("joycode: keepalive message sent", "user_id", c.UserID, "code", resp["code"])
+	resp.Body.Close()
+	slog.Info("joycode: keepalive message sent", "user_id", c.UserID)
 	return true
 }
 
