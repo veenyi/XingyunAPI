@@ -733,11 +733,21 @@ const keepaliveModel = DefaultModel
 func minChatBody() map[string]interface{} {
 	return map[string]interface{}{
 		"model":      keepaliveModel,
-		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
-		"stream":     true,
-		"max_tokens": 16,
+		"messages": []map[string]string{
+			{"role": "system", "content": qaSystemPromptLike},
+			{"role": "user", "content": randomKeepaliveMessage()},
+		},
+		"stream":         true,
+		"max_tokens":     16,
+		"sendSource":     "user",
+		"thinking":       map[string]interface{}{"type": "disabled"},
+		"temperature":    0.7,
 	}
 }
+
+// qaSystemPromptLike 保活/激活消息的 system 提示词（与官方客户端发消息结构一致，
+// 官方消息一定带一个 system 角色；这里用精简版编程助手提示词保持结构相同）。
+const qaSystemPromptLike = "你是一个AI编程助手，善于回答计算机与编程相关的问题。请尽可能使用中文回答。"
 
 // trySendActivationMsg 发送一条激活/保活用流式聊天消息。
 // 关键：先调用 PrepareModel 获取 X-Model-Token，再携带该令牌发送聊天请求。
