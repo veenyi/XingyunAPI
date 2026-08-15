@@ -192,7 +192,9 @@ func (h *Handler) chatLoop(
 		"messages":       messages,
 		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
-		"temperature":    1,
+		"temperature":    0.7,
+		"sendSource":     "user",
+		"thinking":       map[string]interface{}{"type": "disabled"},
 	}
 	if webSearch {
 		body["tools"] = []map[string]interface{}{

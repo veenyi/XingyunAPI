@@ -224,7 +224,9 @@ func (c *Client) headers() http.Header {
 		h.Set("X-Model-Token", c.ModelQueueToken)
 	}
 	if c.SessionID != "" {
-		h.Set("x-request-id", c.SessionID)
+		// 官方客户端 header 名为 x-ms-client-request-id，格式 task-{id}_session-{id}_{timestamp}
+		reqID := "task-" + c.SessionID + "_session-" + c.SessionID + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10)
+		h.Set("x-ms-client-request-id", reqID)
 	}
 	return h
 }
@@ -255,7 +257,9 @@ func (c *Client) anthropicHeaders() http.Header {
 		h.Set("X-Model-Token", c.ModelQueueToken)
 	}
 	if c.SessionID != "" {
-		h.Set("x-request-id", c.SessionID)
+		// 官方客户端 header 名为 x-ms-client-request-id，格式 task-{id}_session-{id}_{timestamp}
+		reqID := "task-" + c.SessionID + "_session-" + c.SessionID + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10)
+		h.Set("x-ms-client-request-id", reqID)
 	}
 	return h
 }
@@ -397,6 +401,12 @@ func decodeStreamBody(resp *http.Response) error {
 }
 
 func (c *Client) Post(endpoint string, body map[string]interface{}) (map[string]interface{}, error) {
+	// 发送聊天前准备模型运行时（与 PostStream 一致）。跳过 prepare 端点自身。
+	if endpoint != "/api/saas/model-runtime/v1/models/prepare" {
+		if model, ok := body["model"].(string); ok && model != "" {
+			_ = c.EnsureModelReady(model)
+		}
+	}
 	resp, err := c.doPost(endpoint, c.prepareBody(body))
 	if err != nil {
 		slog.Error("upstream request failed", "endpoint", endpoint, "error", err)
@@ -420,6 +430,14 @@ func (c *Client) Post(endpoint string, body map[string]interface{}) (map[string]
 }
 
 func (c *Client) PostStream(endpoint string, body map[string]interface{}) (*http.Response, error) {
+	// 发送聊天前准备模型运行时：拿 X-Model-Token（JoyCode 客户端每个会话都会先 prepare）。
+	// PIN_JD_CLOUD 等企业账号缺失该令牌会被上游直接拒绝（AI_GRAY_ACCESS_DENIED）。
+	// 跳过 prepare 端点自身，防止递归。
+	if endpoint != "/api/saas/model-runtime/v1/models/prepare" {
+		if model, ok := body["model"].(string); ok && model != "" {
+			_ = c.EnsureModelReady(model)
+		}
+	}
 	resp, err := c.doPostStream(endpoint, c.prepareBody(body))
 	if err != nil {
 		slog.Error("upstream stream connect", "endpoint", endpoint, "error", err)
@@ -708,13 +726,31 @@ func IsActivationError(msg string) bool {
 }
 
 // minChatBody 构造保活/激活用的最小流式聊天请求体。
+// 模型使用官方默认 JoyAI-Code-1.5——账号套餐允许的模型；MiniMax-M3 会报
+// 9003「当前模型不在套餐允许的模型列表中」。
+const keepaliveModel = DefaultModel
+
 func minChatBody() map[string]interface{} {
 	return map[string]interface{}{
-		"model":      DefaultModel,
+		"model":      keepaliveModel,
 		"messages":   []map[string]string{{"role": "user", "content": randomKeepaliveMessage()}},
 		"stream":     true,
 		"max_tokens": 16,
 	}
+}
+
+// trySendActivationMsg 发送一条激活/保活用流式聊天消息。
+// 关键：先调用 PrepareModel 获取 X-Model-Token，再携带该令牌发送聊天请求。
+// PIN_JD_CLOUD 等企业账号若无 X-Model-Token 会被上游直接拒绝（AI_GRAY_ACCESS_DENIED）。
+func (c *Client) trySendActivationMsg() error {
+	// 准备模型运行时：拿 X-Model-Token（与官方客户端每个会话前 prepare 的行为一致）
+	if err := c.EnsureModelReady(keepaliveModel); err != nil {
+		slog.Warn("joycode: activation PrepareModel failed", "user_id", c.UserID, "error", err)
+	}
+	body := minChatBody()
+	// 保活消息附带 chatId，避免上游因缺少会话标识而拒绝
+	body["chatId"] = c.SessionID
+	return nil // PostStream 在调用者处执行
 }
 
 // TryActivate 模拟客户端首聊激活账号（用流式发送，可检测 AI_GRAY_ACCESS_DENIED）。
@@ -731,8 +767,10 @@ func (c *Client) TryActivate() bool {
 	activateHistory[c.PtKey] = time.Now()
 	activateMu.Unlock()
 
-	// 第一次流式消息：触发上游解冻。冻结账号此处会返回 AI_GRAY_ACCESS_DENIED，
-	// 但"发送一条聊天消息"这个动作本身正是官方客户端解冻账号的机制。
+	// 准备模型运行时 + 发送第一条流式消息：触发上游解冻。
+	// 冻结账号此处会返回 AI_GRAY_ACCESS_DENIED，但"发送一条聊天消息"这个动作本身
+	// 正是官方客户端解冻账号的机制。PIN_JD_CLOUD 企业账号必须携带 X-Model-Token。
+	_ = c.trySendActivationMsg()
 	if resp, err := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody()); err == nil {
 		resp.Body.Close()
 	} else {
@@ -741,6 +779,7 @@ func (c *Client) TryActivate() bool {
 	time.Sleep(activateWait) // 等上游放行
 
 	// 二次验证：再发一条流式消息，成功即账号已解冻
+	_ = c.trySendActivationMsg()
 	resp2, err2 := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody())
 	if err2 != nil {
 		if resp2 != nil {
@@ -755,12 +794,15 @@ func (c *Client) TryActivate() bool {
 }
 
 // SendKeepalive 发送一条随机极短流式消息，模拟 JoyCode 客户端对话，保持账号"存活"。
-// 若消息被上游拒绝（AI_GRAY_ACCESS_DENIED，账号已冻结），自动触发激活解冻。
-// 返回 true 表示账号当前可用（消息被上游正常接受）。
+// 关键：先调用 EnsureModelReady 获取 X-Model-Token，否则 PIN_JD_CLOUD 企业账号
+// 会被上游直接拒绝（AI_GRAY_ACCESS_DENIED）；同时用始终放行的 MiniMax-M3 模型。
+// 若消息仍被拒绝，自动触发激活解冻。返回 true 表示账号当前可用。
 func (c *Client) SendKeepalive() bool {
 	if c == nil || c.PtKey == "" {
 		return false
 	}
+	// 准备模型运行时：与官方客户端每个会话前 prepare 的行为一致
+	_ = c.EnsureModelReady(keepaliveModel)
 	resp, err := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody())
 	if err != nil {
 		// 冻结/受限 → 触发激活解冻
