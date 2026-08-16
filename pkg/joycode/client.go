@@ -72,6 +72,31 @@ var Models = []string{
 	"Claude-Opus-4.7",
 }
 
+// ChatModelMapping 把用户可见的模型 label 映射为上游实际接受的 chatApiModel。
+// 上游 modelList 返回的 chatApiModel 才是 chat 接口真正接受的模型名；
+// 用 label（如 MiniMax-M3）直接调用会得到 9003 "模型不在套餐"。
+// 官方客户端 createMessage 中 model: m.chatApiModel，此处保持一致。
+var ChatModelMapping = map[string]string{
+	"JoyAI-Code-1.5":     "JoyAI-Code-1.5",
+	"MiniMax-M3":         "MiniMax-M3-agent",
+	"MiniMax-M2.7":       "MiniMax-M2.7-agent",
+	"Kimi-K2.6":          "Kimi-K2.6-agent",
+	"GLM-5.3":            "GLM-5.3-agent",
+	"GLM-5.1":            "GLM-5.1-agent",
+	"GLM-5":              "GLM-5-agent",
+	"DeepSeek-V4-Pro":    "DeepSeek-V4-Pro-agent",
+	"Doubao-Seed-2.0-pro": "Doubao-Seed-2.0-pro-agent",
+}
+
+// ResolveChatModel 把用户请求的模型名映射为上游 chatApiModel。
+// 已知 label 返回映射值；未知模型原样透传（可能是自定义/新模型）。
+func ResolveChatModel(model string) string {
+	if v, ok := ChatModelMapping[model]; ok {
+		return v
+	}
+	return model
+}
+
 type Client struct {
 	PtKey          string
 	AnthropicPtKey string
@@ -215,12 +240,14 @@ func (c *Client) headers() http.Header {
 		"Accept-Encoding": {"gzip, deflate"},
 		"Accept-Language": {"zh-CN,zh;q=0.9,en;q=0.8"},
 	}
-	// 官方客户端会在请求头携带 tenant（URL 编码）与模型运行时令牌，
-	// 缺一不可（尤其企业账号 PIN_JD_CLOUD 会返回 AI_GRAY_ACCESS_DENIED）。
+	// 官方客户端会在请求头携带 tenant（URL 编码）。
+	// 注意：X-Model-Token 在"bypass"模式下（token 为 mt_ready_bypass.* 前缀，
+	// 即模型免排队直接放行）官方客户端【不发送】该头，发送反而会被上游拒绝
+	// （MODEL_TOKEN_INVALID）。实测只有真正排队获取的 token 才需要带。
 	if c.Tenant != "" {
 		h.Set("tenant", url.QueryEscape(c.Tenant))
 	}
-	if c.ModelQueueToken != "" {
+	if c.ModelQueueToken != "" && !strings.HasPrefix(strings.ToLower(c.ModelQueueToken), "mt_ready_bypass") {
 		h.Set("X-Model-Token", c.ModelQueueToken)
 	}
 	if c.SessionID != "" {
@@ -253,7 +280,7 @@ func (c *Client) anthropicHeaders() http.Header {
 	if c.Tenant != "" {
 		h.Set("tenant", url.QueryEscape(c.Tenant))
 	}
-	if c.ModelQueueToken != "" {
+	if c.ModelQueueToken != "" && !strings.HasPrefix(strings.ToLower(c.ModelQueueToken), "mt_ready_bypass") {
 		h.Set("X-Model-Token", c.ModelQueueToken)
 	}
 	if c.SessionID != "" {
@@ -402,9 +429,11 @@ func decodeStreamBody(resp *http.Response) error {
 
 func (c *Client) Post(endpoint string, body map[string]interface{}) (map[string]interface{}, error) {
 	// 发送聊天前准备模型运行时（与 PostStream 一致）。跳过 prepare 端点自身。
+	// 模型名需映射为 chatApiModel（label 如 MiniMax-M3 → MiniMax-M3-agent）。
 	if endpoint != "/api/saas/model-runtime/v1/models/prepare" {
 		if model, ok := body["model"].(string); ok && model != "" {
-			_ = c.EnsureModelReady(model)
+			body["model"] = ResolveChatModel(model)
+			_ = c.EnsureModelReady(body["model"].(string))
 		}
 	}
 	resp, err := c.doPost(endpoint, c.prepareBody(body))
@@ -430,12 +459,13 @@ func (c *Client) Post(endpoint string, body map[string]interface{}) (map[string]
 }
 
 func (c *Client) PostStream(endpoint string, body map[string]interface{}) (*http.Response, error) {
-	// 发送聊天前准备模型运行时：拿 X-Model-Token（JoyCode 客户端每个会话都会先 prepare）。
-	// PIN_JD_CLOUD 等企业账号缺失该令牌会被上游直接拒绝（AI_GRAY_ACCESS_DENIED）。
-	// 跳过 prepare 端点自身，防止递归。
+	// 发送聊天前准备模型运行时（与官方客户端一致）。跳过 prepare 端点自身。
+	// 模型名需映射为 chatApiModel；PrepareModel 返回的 mt_ready_bypass token
+	// 按官方逻辑不随请求头发送（见 headers()），因此这里拿 token 主要用于保活判断。
 	if endpoint != "/api/saas/model-runtime/v1/models/prepare" {
 		if model, ok := body["model"].(string); ok && model != "" {
-			_ = c.EnsureModelReady(model)
+			body["model"] = ResolveChatModel(model)
+			_ = c.EnsureModelReady(body["model"].(string))
 		}
 	}
 	resp, err := c.doPostStream(endpoint, c.prepareBody(body))
@@ -475,6 +505,13 @@ func (c *Client) PostStream(endpoint string, body map[string]interface{}) (*http
 }
 
 func (c *Client) PostAnthropicStream(endpoint string, body map[string]interface{}) (*http.Response, error) {
+	// 与 PostStream 一致：模型名映射为 chatApiModel + 发送前 prepare。
+	if endpoint != "/api/saas/model-runtime/v1/models/prepare" {
+		if model, ok := body["model"].(string); ok && model != "" {
+			body["model"] = ResolveChatModel(model)
+			_ = c.EnsureModelReady(body["model"].(string))
+		}
+	}
 	resp, err := c.doAnthropicPostStream(endpoint, c.prepareAnthropicBody(body))
 	if err != nil {
 		slog.Error("upstream anthropic stream connect", "endpoint", endpoint, "error", err)
@@ -734,7 +771,7 @@ func minChatBody() map[string]interface{} {
 	return map[string]interface{}{
 		"model":      keepaliveModel,
 		"messages": []map[string]string{
-			{"role": "system", "content": qaSystemPromptLike},
+			{"role": "system", "content": OfficialSystemPrompt},
 			{"role": "user", "content": randomKeepaliveMessage()},
 		},
 		"stream":         true,
@@ -744,10 +781,6 @@ func minChatBody() map[string]interface{} {
 		"temperature":    0.7,
 	}
 }
-
-// qaSystemPromptLike 保活/激活消息的 system 提示词（与官方客户端发消息结构一致，
-// 官方消息一定带一个 system 角色；这里用精简版编程助手提示词保持结构相同）。
-const qaSystemPromptLike = "你是一个AI编程助手，善于回答计算机与编程相关的问题。请尽可能使用中文回答。"
 
 // trySendActivationMsg 发送一条激活/保活用流式聊天消息。
 // 关键：先调用 PrepareModel 获取 X-Model-Token，再携带该令牌发送聊天请求。

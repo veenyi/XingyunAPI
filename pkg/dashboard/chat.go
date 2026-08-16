@@ -148,10 +148,9 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	sysPrompt := qaSystemPrompt
-	if req.Mode == chatModeCoding {
-		sysPrompt = codingSystemPrompt
-	}
+	// 使用官方客户端完整系统提示词，使请求体与官方一致（对账号激活/存活识别至关重要）
+	sysPrompt := joycode.OfficialSystemPrompt
+	_ = req.Mode
 
 	h.chatLoop(w, flusher, client, sysPrompt, req.Messages, model, req.WebSearch, 0)
 
