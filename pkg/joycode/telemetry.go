@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -25,7 +28,9 @@ const (
 )
 
 // ideFingerprint 是官方 JoyCode IDE 客户端上报的设备指纹。
-// 默认值取自真机抓包，可用环境变量覆盖（多账号需区分时按账号设置）。
+// 默认按运行主机生成：写死某台真机的身份会随安装包分发给所有实例，既能反查打包者，
+// 也让所有实例上报同一设备、易被上游关联。上游按 ptKey 归属账号，指纹只需形态合法。
+// 需要指定时用 JOYCODE_FP_OS/IDE/PLUGIN/HOST/DOMAIN/MAC/PROJECT 覆盖。
 type ideFingerprint struct {
 	OSName         string
 	IDEVersion     string
@@ -36,15 +41,38 @@ type ideFingerprint struct {
 	ProjectName    string
 }
 
+func hostName() string {
+	if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
+		return strings.TrimSpace(h)
+	}
+	return "joycode-client"
+}
+
+// localMAC 取第一块非回环网卡的硬件地址；取不到时用主机名哈希兜底，
+// 保证同一主机每次上报一致、不同安装互不相同。
+func localMAC() string {
+	if ifcs, err := net.Interfaces(); err == nil {
+		for _, ifc := range ifcs {
+			if ifc.Flags&net.FlagLoopback != 0 || len(ifc.HardwareAddr) == 0 {
+				continue
+			}
+			return ifc.HardwareAddr.String()
+		}
+	}
+	sum := sha256.Sum256([]byte(hostName()))
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", (sum[0]&0xfc)|0x02, sum[1], sum[2], sum[3], sum[4], sum[5])
+}
+
 func currentFingerprint() ideFingerprint {
+	host := envOr("JOYCODE_FP_HOST", hostName())
 	return ideFingerprint{
-		OSName:         envOr("JOYCODE_FP_OS", "win32 x64 10.0.26200"),
+		OSName:         envOr("JOYCODE_FP_OS", "win32 x64 10.0.19045"),
 		IDEVersion:     envOr("JOYCODE_FP_IDE", "3.0.10"),
 		PluginVersion:  envOr("JOYCODE_FP_PLUGIN", "joycodeIDE-3.8.67"),
-		ComputerName:   envOr("JOYCODE_FP_HOST", "veenyi"),
-		ComputerDomain: envOr("JOYCODE_FP_DOMAIN", "VEENYI"),
-		MAC:            envOr("JOYCODE_FP_MAC", "00:50:56:c0:00:08"),
-		ProjectName:    envOr("JOYCODE_FP_PROJECT", "keepalive-workspace"),
+		ComputerName:   host,
+		ComputerDomain: envOr("JOYCODE_FP_DOMAIN", strings.ToUpper(host)),
+		MAC:            envOr("JOYCODE_FP_MAC", localMAC()),
+		ProjectName:    envOr("JOYCODE_FP_PROJECT", "xingyun-keepalive"),
 	}
 }
 
@@ -199,7 +227,8 @@ func (c *Client) ReportClientActivity() error {
 		slog.Warn("joycode: client activity report failed", "user_id", c.UserID, "error", lastErr)
 		return lastErr
 	}
-	slog.Info("joycode: client activity reported", "user_id", c.UserID, "trace_id", traceID)
+	slog.Info("joycode: client activity reported", "user_id", c.UserID, "trace_id", traceID,
+		"host", fp.ComputerName, "mac", fp.MAC)
 	return nil
 }
 

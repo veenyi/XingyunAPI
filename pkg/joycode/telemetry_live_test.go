@@ -17,6 +17,10 @@ func TestReportClientActivity_GatewayShape(t *testing.T) {
 	c.LoginType = "N_PIN_PC"
 	c.Tenant = "JOYCODE"
 
+	fp := currentFingerprint()
+	t.Logf("fingerprint: os=%q ide=%q plugin=%q host=%q domain=%q mac=%q project=%q",
+		fp.OSName, fp.IDEVersion, fp.PluginVersion, fp.ComputerName, fp.ComputerDomain, fp.MAC, fp.ProjectName)
+
 	if err := c.ReportClientActivity(); err != nil {
 		t.Fatalf("gateway rejected the report shape: %v", err)
 	}
