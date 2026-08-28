@@ -203,6 +203,10 @@ func (k *Keeper) maybeKeepalive(acc *store.Account) {
 		client.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
 	}
 	client.SetTimeout(30 * time.Second)
+	// 先上报客户端遥测：上游的灰度授权窗口只认这个（chat 流量不计入活跃），
+	// 主动上报既能续期，也能在已冻结时立即解冻，不必等 SendKeepalive 被拒后补救。
+	_ = client.ReportClientActivity()
+	_ = client.ReportUsageMetrics()
 	client.SendKeepalive()
 }
 

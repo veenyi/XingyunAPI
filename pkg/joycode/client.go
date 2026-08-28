@@ -782,22 +782,10 @@ func minChatBody() map[string]interface{} {
 	}
 }
 
-// trySendActivationMsg 发送一条激活/保活用流式聊天消息。
-// 关键：先调用 PrepareModel 获取 X-Model-Token，再携带该令牌发送聊天请求。
-// PIN_JD_CLOUD 等企业账号若无 X-Model-Token 会被上游直接拒绝（AI_GRAY_ACCESS_DENIED）。
-func (c *Client) trySendActivationMsg() error {
-	// 准备模型运行时：拿 X-Model-Token（与官方客户端每个会话前 prepare 的行为一致）
-	if err := c.EnsureModelReady(keepaliveModel); err != nil {
-		slog.Warn("joycode: activation PrepareModel failed", "user_id", c.UserID, "error", err)
-	}
-	body := minChatBody()
-	// 保活消息附带 chatId，避免上游因缺少会话标识而拒绝
-	body["chatId"] = c.SessionID
-	return nil // PostStream 在调用者处执行
-}
-
-// TryActivate 模拟客户端首聊激活账号（用流式发送，可检测 AI_GRAY_ACCESS_DENIED）。
-// 发一条消息触发上游解冻 → 等待放行 → 再发一条验证是否真正解冻。返回 true 表示已解冻。
+// TryActivate 解冻账号：上报客户端遥测（functionId=telemetry + IDE 设备指纹），
+// 上游据此判定"真实客户端使用"并撤销 AI_GRAY_ACCESS_DENIED，随后用一条流式聊天验证。
+// 关键：向已冻结账号发 chat_completions 永远只会再次拿到 AI_GRAY_ACCESS_DENIED，
+// 解冻只能由遥测上报触发（实测 pk0377 / 法罗力中国 一次生效）。
 func (c *Client) TryActivate() bool {
 	if c == nil || c.PtKey == "" {
 		return false
@@ -810,19 +798,13 @@ func (c *Client) TryActivate() bool {
 	activateHistory[c.PtKey] = time.Now()
 	activateMu.Unlock()
 
-	// 准备模型运行时 + 发送第一条流式消息：触发上游解冻。
-	// 冻结账号此处会返回 AI_GRAY_ACCESS_DENIED，但"发送一条聊天消息"这个动作本身
-	// 正是官方客户端解冻账号的机制。PIN_JD_CLOUD 企业账号必须携带 X-Model-Token。
-	_ = c.trySendActivationMsg()
-	if resp, err := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody()); err == nil {
-		resp.Body.Close()
-	} else {
-		slog.Info("joycode: activation message sent, waiting for grant", "user_id", c.UserID, "error", err)
+	if err := c.ReportClientActivity(); err != nil {
+		slog.Warn("joycode: activation telemetry report failed", "user_id", c.UserID, "error", err)
 	}
+	_ = c.ReportUsageMetrics()
 	time.Sleep(activateWait) // 等上游放行
 
-	// 二次验证：再发一条流式消息，成功即账号已解冻
-	_ = c.trySendActivationMsg()
+	// 验证：再发一条流式消息，成功即账号已解冻
 	resp2, err2 := c.PostStream("/api/saas/openai/v1/chat/completions", minChatBody())
 	if err2 != nil {
 		if resp2 != nil {
