@@ -264,7 +264,10 @@ func (h *Handler) ServeStatic(w http.ResponseWriter, r *http.Request) {
 
 	// Intercept known API paths that are missing the /v1/ prefix.
 	// Return a structured JSON 404 so SDKs get a clear error instead of HTML.
-	if knownAPISet[path] {
+	// 例外：/models 也是前端「模型与渠道」页的路由，浏览器刷新（Accept 含
+	// text/html）必须回落到 SPA index.html，否则刷新页面会看到 JSON 报错。
+	// 只有非浏览器（SDK/curl，Accept 不含 text/html）的裸 API 路径才给提示。
+	if knownAPISet[path] && !acceptsHTML(r) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{
 			"error": map[string]string{
 				"type":    "invalid_request_error",
@@ -308,6 +311,12 @@ func (h *Handler) ServeStatic(w http.ResponseWriter, r *http.Request) {
 // readFileSeeker wraps fs.File to implement io.ReadSeeker.
 type readFileSeeker struct {
 	fs.File
+}
+
+// acceptsHTML 判定是否为浏览器导航请求（地址栏直达 / 刷新）。
+// 这类请求要回落到 SPA 前端，而不是当成漏写 /v1 前缀的 API 调用报错。
+func acceptsHTML(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
 func (r readFileSeeker) Seek(offset int64, whence int) (int64, error) {
