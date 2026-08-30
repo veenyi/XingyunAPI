@@ -140,16 +140,19 @@ func (m *Manager) credits(a *Account) (remain, total int64, err error) {
 }
 
 func (m *Manager) stateCredits(id string) int64 {
-	for _, st := range m.loadState() {
-		if st.IDKey() == id {
-			return st.Credits
-		}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st, ok := m.loadState()[id]; ok {
+		return st.Credits
 	}
 	return 0
 }
 
 // persistCredentials 把（可能轮换过的）凭据写回存储。
+// 持 m.mu 防止与 Save 全量覆写竞争导致丢账号。
 func (m *Manager) persistCredentials(a *Account) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	accounts := m.loadAccounts()
 	for i := range accounts {
 		if accounts[i].ID == a.ID {
@@ -164,19 +167,20 @@ func (m *Manager) persistCredentials(a *Account) {
 
 // refreshStale 判断距上次成功刷新是否超过 12h。
 func (m *Manager) refreshStale(id string) bool {
-	for key, st := range m.loadState() {
-		if key != id {
-			continue
-		}
-		if !st.LastRefreshOK || st.LastRefreshAt == "" {
-			return true
-		}
-		if t, err := time.Parse(time.RFC3339, st.LastRefreshAt); err == nil {
-			return time.Since(t) > defaultRefreshAfter
-		}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st, ok := m.loadState()[id]
+	if !ok {
 		return true
 	}
-	return true
+	if !st.LastRefreshOK || st.LastRefreshAt == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339, st.LastRefreshAt)
+	if err != nil {
+		return true
+	}
+	return time.Since(t) > defaultRefreshAfter
 }
 
 // IDKey 便于状态映射（state map 的 key 就是账号 ID，此方法仅为模板兼容）。

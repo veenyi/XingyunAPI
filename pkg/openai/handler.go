@@ -18,10 +18,12 @@ var _ provider.Chat = (*joycode.Client)(nil)
 
 // Server implements the OpenAI-compatible HTTP API.
 type Server struct {
-	Client  *joycode.Client
-	Keyfree provider.Keyless
-	Keyed   provider.Keyless
-	Route   *route.Router
+	Client   *joycode.Client
+	Keyfree  provider.Keyless
+	Keyed    provider.Keyless
+	// Extras 动态返回自定义渠道列表（保存后即时生效）；命中名单时直接派给对应上游。
+	Extras func() []provider.Keyless
+	Route  *route.Router
 	Resolver ClientResolver
 	store    *store.Store
 }
@@ -33,10 +35,17 @@ func NewServer(c *joycode.Client, s *store.Store) *Server {
 
 // extras 返回当前已启用的免登录 / 自带 Key 渠道；开关每次请求重读，改设置不必重启。
 func (s *Server) extras() []provider.Keyless {
-	var out []provider.Keyless
+	out := make([]provider.Keyless, 0, 4)
 	for _, p := range []provider.Keyless{s.Keyfree, s.Keyed} {
 		if p != nil && p.Enabled() {
 			out = append(out, p)
+		}
+	}
+	if s.Extras != nil {
+		for _, p := range s.Extras() {
+			if p != nil && p.Enabled() {
+				out = append(out, p)
+			}
 		}
 	}
 	return out
@@ -131,9 +140,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 额外渠道只有在开关打开后才出现在目录里，未安装/未开启时目录与原来一致。
+	// 额外渠道的模型以 "渠道/模型" 前缀形式输出（B.AI/qwen3.8-max）：
+	// 不同渠道的同名模型互不混淆，聚合 Key 直接点名前缀名即可精确路由。
 	for _, p := range s.extras() {
 		if free, kerr := p.ListModels(); kerr == nil {
-			models = append(models, free...)
+			for _, m := range free {
+				m.ModelID = p.Name() + "/" + m.ModelID
+				m.ChatAPIModel = p.Name() + "/" + m.ChatAPIModel
+				m.Label = p.Name() + "/" + m.Label
+				models = append(models, m)
+			}
 		}
 	}
 	writeJSON(w, 200, TranslateModels(models))

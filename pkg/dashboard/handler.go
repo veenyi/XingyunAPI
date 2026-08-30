@@ -97,6 +97,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/custom_providers", h.handleCustomProviders)
 	mux.HandleFunc("/api/channels/refresh", h.handleChannelsRefresh)
 	mux.HandleFunc("/api/model-blocklist", h.handleModelBlocklist)
+	mux.HandleFunc("/api/channel-presets", h.handleChannelPresets)
 	h.registerCheckinRoutes(mux)
 	mux.HandleFunc("/api/health", h.handleHealth)
 	mux.HandleFunc("/api/errors", h.handleErrors)
@@ -1497,6 +1498,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 免登录 / 自带 Key 渠道的模型也列进下拉，看板聊天框才能直接测它们。
+	// 以 "渠道/模型" 前缀形式输出（B.AI/qwen3.8-max），同名模型按渠道区分。
 	list := append([]string(nil), models...)
 	seen := make(map[string]bool, len(list))
 	for _, m := range list {
@@ -1507,11 +1509,15 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, m := range src.Models() {
-			if m == "" || seen[m] {
+			if m == "" {
 				continue
 			}
-			seen[m] = true
-			list = append(list, m)
+			prefixed := src.Name + "/" + m
+			if seen[prefixed] {
+				continue
+			}
+			seen[prefixed] = true
+			list = append(list, prefixed)
 		}
 	}
 
@@ -1897,4 +1903,20 @@ func (h *Handler) handleModelBlocklist(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handleChannelPresets GET /api/channel-presets — 内置免费渠道预设清单
+// （B.AI/NVIDIA/Groq/Cerebras/Mistral/OpenRouter/ModelScope/SiliconFlow/Z.ai…）。
+// 自定义渠道表单一键填入官方地址，用户到对应官方申请 Key 即接入。
+func (h *Handler) handleChannelPresets(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"presets": keyed.Presets()})
 }

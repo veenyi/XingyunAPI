@@ -96,6 +96,15 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		h.channelChat(w, flusher, home, req)
 		return
 	}
+	// 带 "渠道/" 前缀却没命中任何渠道：显式报错，绝不把前缀名整串发给付费上游。
+	if _, _, isPrefixed := route.SplitPrefixedModel(req.Model); isPrefixed {
+		writeChatEvent(w, flusher, map[string]interface{}{
+			"type":    "error",
+			"message": "模型不存在：请检查渠道/模型名，或在「模型与渠道」页确认渠道已启用",
+		})
+		writeChatEvent(w, flusher, map[string]interface{}{"type": "done"})
+		return
+	}
 
 	account := h.defaultAccount()
 	var fullAccount *store.Account
@@ -464,8 +473,20 @@ func chatHeartbeat(w http.ResponseWriter, flusher http.Flusher) (stop chan struc
 var plainChatRouter = route.New(nil, nil)
 
 // channelCandidate 判定用户点名的模型归哪个免登录 / 自带 Key 渠道。
+// 支持 "渠道/模型" 前缀写法（B.AI/qwen3.8-max），同名模型按渠道精确路由。
 func (h *Handler) channelCandidate(model string) (route.Candidate, bool) {
 	if model == "" {
+		return route.Candidate{}, false
+	}
+	if ch, mm, ok := route.SplitPrefixedModel(model); ok {
+		for _, p := range h.Keyless {
+			if p == nil || !p.Enabled() || !strings.EqualFold(p.Name(), ch) {
+				continue
+			}
+			if p.Supports(mm) {
+				return route.Candidate{Upstream: p, Provider: p.Name(), Model: mm}, true
+			}
+		}
 		return route.Candidate{}, false
 	}
 	for _, p := range h.Keyless {

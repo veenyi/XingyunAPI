@@ -6,10 +6,10 @@ import {
 import {
   SaveOutlined, ReloadOutlined, QuestionCircleOutlined,
   SettingOutlined, CheckCircleOutlined, InfoCircleOutlined, LockOutlined,
-  ApiOutlined, CopyOutlined,
+  ApiOutlined, CopyOutlined, EyeInvisibleOutlined,
 } from '@ant-design/icons';
 import { api, authApi, clearToken } from '../api';
-import type { Settings, CustomProvider } from '../api';
+import type { Settings, CustomProvider, ChannelPreset } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 
 
@@ -247,12 +247,30 @@ const SettingsPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]);
   const [savingCustom, setSavingCustom] = useState(false);
+  const [presets, setPresets] = useState<ChannelPreset[]>([]);
+  const [blocklist, setBlocklist] = useState<string[]>([]);
   const [changePwLoading, setChangePwLoading] = useState(false);
   const [aggKey, setAggKey] = useState('sk-joy-aggregate');
   const [rotating, setRotating] = useState(false);
   const [modelOptions, setModelOptions] = useState<{ label: string; value: string }[]>([]);
   const [form] = Form.useForm();
   const [pwForm] = Form.useForm();
+
+  // 加载内置免费渠道预设 + 屏蔽名单
+  useEffect(() => {
+    api.getChannelPresets().then(setPresets).catch(() => {});
+    api.getModelBlocklist().then(setBlocklist).catch(() => {});
+  }, []);
+
+  const unblockModel = async (key: string) => {
+    try {
+      await api.setModelHidden(key, false);
+      setBlocklist((prev) => prev.filter((k) => k !== key));
+      message.success('已恢复显示');
+    } catch (e: unknown) {
+      message.error(e instanceof Error ? e.message : '恢复失败');
+    }
+  };
 
   // 加载上游实时模型列表（default_model 下拉）
   useEffect(() => {
@@ -533,8 +551,32 @@ const SettingsPage: React.FC = () => {
         >
           <div style={{ fontSize: 13, color: 'var(--jc-fg-muted)', lineHeight: 1.8, marginBottom: 12 }}>
             添加任意 OpenAI 兼容的上游地址和 Key，模型会直接出现在渠道列表中，与免费模型 / API Key 渠道并列。每个渠道独立计费边界，不会串用额度。
-            填根地址即可（会自动尝试 /v1/models）；开启「仅免费模型」后，探针判定为付费墙（欠费/登录失效）的模型自动隐藏，并随目录定期刷新自动跟进官方策略。
+            填根地址即可（会自动尝试 /v1/models）；开启「仅免费」后该渠道加入免费池轮询，探针判定为付费墙（欠费/登录失效）的模型自动隐藏。
           </div>
+          {presets.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <span style={{ fontSize: 13, color: 'var(--jc-fg-muted)', marginRight: 8 }}>快速添加官方免费渠道：</span>
+              <Select
+                style={{ minWidth: 320 }}
+                placeholder="选择预设（B.AI / NVIDIA / Groq / 魔搭 / 硅基流动…）"
+                value={null}
+                options={presets.map((p) => ({ label: `${p.name} — ${p.note}`, value: p.id }))}
+                onChange={(id) => {
+                  const p = presets.find((x) => x.id === id);
+                  if (!p) return;
+                  setCustomProviders((prev) => [...prev, {
+                    id: 'cp_' + Date.now(),
+                    name: p.name,
+                    base_url: p.base_url,
+                    api_key: '',
+                    enabled: true,
+                    free_only: true,
+                  }]);
+                  message.info(`已添加 ${p.name} 预设，填入你的官方 Key 后保存即可`);
+                }}
+              />
+            </div>
+          )}
           {customProviders.map((cp, idx) => (
             <div key={cp.id} style={{ borderBottom: idx < customProviders.length - 1 ? '1px solid var(--jc-border)' : 'none', paddingBottom: 16, marginBottom: 16 }}>
               <Row gutter={[16, 8]} align="middle">
@@ -576,6 +618,31 @@ const SettingsPage: React.FC = () => {
           <div style={{ marginTop: 12 }}>
             <Button size="small" type="dashed" onClick={addCustomProvider}>+ 添加渠道</Button>
           </div>
+        </Card>
+
+        <Card
+          size="small"
+          style={{ marginBottom: 16 }}
+          title={<span className="jc-section-title"><EyeInvisibleOutlined />隐藏的模型（{blocklist.length}）</span>}
+          extra={(
+            <Tooltip title="在「模型与渠道」页点隐藏按钮加入这里；被隐藏的模型不出现在模型列表与自动切换中。">
+              <QuestionCircleOutlined style={{ color: '#bbb' }} />
+            </Tooltip>
+          )}
+        >
+          {blocklist.length === 0 ? (
+            <div style={{ fontSize: 13, color: 'var(--jc-fg-muted)' }}>
+              暂无隐藏的模型。付费/不可用模型可在「模型与渠道」页一键隐藏。
+            </div>
+          ) : (
+            <Space size={[8, 8]} wrap>
+              {blocklist.map((k) => (
+                <Tag key={k} closable onClose={() => unblockModel(k)} style={{ fontSize: 13 }}>
+                  {k}
+                </Tag>
+              ))}
+            </Space>
+          )}
         </Card>
 
                 {FIELD_GROUPS.slice(1).map((group) => (

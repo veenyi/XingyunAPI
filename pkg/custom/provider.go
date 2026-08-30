@@ -269,7 +269,14 @@ func (m *Manager) KeylessList() []provider.Keyless {
 
 func (p *Provider) Name() string        { return p.name }
 func (p *Provider) Enabled() bool       { return p.enabled }
-func (p *Provider) Tier() string        { return p.tier }
+// Tier 计费边界：仅免费模式加入公共免费池（与 opencode-free 互相轮询兜底），
+// 常规模式与其他自带 Key 渠道同一边界。
+func (p *Provider) Tier() string {
+	if p.freeOnly {
+		return provider.TierFree
+	}
+	return p.tier
+}
 func (p *Provider) Supports(model string) bool {
 	return p.client.Supports(model)
 }

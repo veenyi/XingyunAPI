@@ -53,12 +53,13 @@ func TestExcludedStayHidden(t *testing.T) {
 	}
 }
 
-// TestUnknownModelIsNotAutoApproved 上游随时会挂出新模型，但不能因此自动放行：
-// 没实测过的匿名端点很可能直接 401/429。
-func TestUnknownModelIsNotAutoApproved(t *testing.T) {
-	for _, m := range []string{"some-brand-new-free", "hy3", "", "   ", "hy3-free-extra"} {
+// TestExcludedModelsStayHidden 动态发现后名单随上游目录实时变化（v0.6.2 起
+// 不再硬编码固定名单），但实测不可用的模型必须始终被排除；
+// 健康冷却由 compat/health 层收缩可见名单，这里只验证排除表。
+func TestExcludedModelsStayHidden(t *testing.T) {
+	for _, m := range []string{"deepseek-v4-flash-free", "mimo-v2.5-free", "big-pickle", "", "   "} {
 		if visible(m) {
-			t.Fatalf("未实测的 %q 不该被自动放行", m)
+			t.Fatalf("实测不可用的 %q 必须保持隐藏", m)
 		}
 	}
 }

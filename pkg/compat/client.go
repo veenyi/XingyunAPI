@@ -338,7 +338,8 @@ func (c *Client) visibleCatalog() []joycode.ModelInfo {
 }
 
 // cachedIDs 带正/负两级缓存：目录成功 6h 内不重复拉，失败 5min 内不重试，
-// 避免上游目录端点抖动时被我们自己的轮询打死。
+// 避免上游目录端点抖动时被我们自己的轮询打死。退避期内有旧目录回旧目录、
+// 没有才回地板名单——两种情况都如实带错误，让上层知道这是降级名单。
 func (c *Client) cachedIDs() ([]string, error) {
 	c.mu.Lock()
 	now := time.Now()
@@ -347,9 +348,15 @@ func (c *Client) cachedIDs() ([]string, error) {
 		c.mu.Unlock()
 		return ids, nil
 	}
-	if c.catalog == nil && !c.catalogFail.IsZero() && now.Sub(c.catalogFail) < catalogFailTTL {
+	if !c.catalogFail.IsZero() && now.Sub(c.catalogFail) < catalogFailTTL {
+		if c.catalog != nil {
+			ids := idsOf(c.catalog)
+			c.mu.Unlock()
+			return ids, fmt.Errorf("目录刷新处于退避窗口，使用上一次成功的名单")
+		}
+		ids := c.floorIDs()
 		c.mu.Unlock()
-		return c.floorIDs(), fmt.Errorf("目录刷新处于退避窗口")
+		return ids, fmt.Errorf("目录刷新处于退避窗口")
 	}
 	c.mu.Unlock()
 

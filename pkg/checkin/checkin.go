@@ -208,6 +208,22 @@ func (m *Manager) Save(inputs []AccountInput) error {
 	if err := m.saveAccounts(out); err != nil {
 		return err
 	}
+	// 裁剪已删除账号的孤儿状态，防止 List 越积越多。
+	state := m.loadState()
+	alive := map[string]bool{}
+	for _, a := range out {
+		alive[a.ID] = true
+	}
+	pruned := false
+	for id := range state {
+		if !alive[id] {
+			delete(state, id)
+			pruned = true
+		}
+	}
+	if pruned {
+		_ = m.saveState(state)
+	}
 	return nil
 }
 

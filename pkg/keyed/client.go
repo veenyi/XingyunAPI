@@ -43,6 +43,32 @@ const (
 	ProviderName = "B.AI"
 )
 
+// Preset 是一个自带 Key 免费渠道预设：官方免费层，用户到官方申请 Key 后即用。
+type Preset struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	BaseURL string `json:"base_url"`
+	Note    string `json:"note"`
+}
+
+// Presets 面向"增加更多免费 API"的内置预设清单（参考 freellmapi / HyphenBox
+// 的免费层目录，全部走用户自己的官方 Key，不做共享池）。自定义渠道表单里
+// 一键填入；keyed 单渠道预设也兼容这些 ID。
+func Presets() []Preset {
+	return []Preset{
+		{ID: "bai", Name: "B.AI", BaseURL: BaiBaseURL, Note: "一个 Key 拿全站模型（GPT/DeepSeek/Qwen/GLM）"},
+		{ID: "nvidia", Name: "NVIDIA NIM", BaseURL: NvidiaBaseURL, Note: "build.nvidia.com 免费端点，nvapi-… Key"},
+		{ID: "bigmodel", Name: "智谱 BigModel", BaseURL: DefaultBaseURL, Note: "GLM 系列，新用户送额度"},
+		{ID: "groq", Name: "Groq", BaseURL: "https://api.groq.com/openai/v1", Note: "免费层高速推理（Llama/Qwen 等）"},
+		{ID: "cerebras", Name: "Cerebras", BaseURL: "https://api.cerebras.ai/v1", Note: "免费层超低延迟"},
+		{ID: "mistral", Name: "Mistral", BaseURL: "https://api.mistral.ai/v1", Note: "免费实验层（La Plateforme）"},
+		{ID: "openrouter", Name: "OpenRouter", BaseURL: "https://openrouter.ai/api/v1", Note: "聚合多家，带 :free 后缀的模型免费"},
+		{ID: "modelscope", Name: "ModelScope 魔搭", BaseURL: "https://api-inference.modelscope.cn/v1", Note: "阿里魔搭免费推理（Qwen/DeepSeek/GLM）"},
+		{ID: "siliconflow", Name: "SiliconFlow 硅基流动", BaseURL: "https://api.siliconflow.cn/v1", Note: "国内直连，L0 免费层多模型"},
+		{ID: "zai", Name: "Z.ai 智谱国际", BaseURL: "https://api.z.ai/api/paas/v4", Note: "GLM 国际版免费层"},
+	}
+}
+
 type Settings interface {
 	GetSetting(key string) string
 	// GetSecretSetting 读取解密后的敏感设置；缺失或解不开时返回空串。
@@ -79,14 +105,13 @@ func resolveBaseURL(settings Settings) string {
 }
 
 func presetBaseURL(preset string) string {
-	switch strings.ToLower(strings.TrimSpace(preset)) {
-	case PresetNvidia:
-		return NvidiaBaseURL
-	case PresetBai:
-		return BaiBaseURL
-	default:
-		return DefaultBaseURL
+	p := strings.ToLower(strings.TrimSpace(preset))
+	for _, ps := range Presets() {
+		if ps.ID == p {
+			return ps.BaseURL
+		}
 	}
+	return DefaultBaseURL
 }
 
 // Tier 声明这里花的是用户自己的 Key：点名本渠道模型的请求不会被切到

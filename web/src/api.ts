@@ -64,6 +64,13 @@ export interface CustomProvider {
   free_only?: boolean;
 }
 
+export interface ChannelPreset {
+  id: string;
+  name: string;
+  base_url: string;
+  note: string;
+}
+
 // --- 签到中心 ---
 
 export interface CheckinAccount {
@@ -310,6 +317,8 @@ export const api = {
     request<{ blocked: string[] }>('/api/model-blocklist').then(r => r.blocked ?? []),
   setModelHidden: (key: string, hidden: boolean) =>
     request<{ ok: boolean }>('/api/model-blocklist', { method: 'POST', body: JSON.stringify({ key, hidden }) }),
+  getChannelPresets: () =>
+    request<{ presets: ChannelPreset[] }>('/api/channel-presets').then(r => r.presets ?? []),
   // --- 签到中心 ---
   listCheckin: () =>
     request<{ accounts: CheckinAccount[]; times: string[] }>('/api/checkin/accounts'),

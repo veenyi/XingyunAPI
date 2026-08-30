@@ -165,9 +165,11 @@ var serveCmd = &cobra.Command{
 			rt = route.New(s, reg)
 			srv.Keyfree = kf
 			srv.Keyed = kd
+			srv.Extras = func() []provider.Keyless { return cust.KeylessList() }
 			srv.Route = rt
 			anth.Keyfree = kf
 			anth.Keyed = kd
+			anth.Extras = func() []provider.Keyless { return cust.KeylessList() }
 			anth.Route = rt
 			cust = custom.New(s, Version)
 			cust.SetRegistry(reg)

@@ -36,6 +36,8 @@ type Handler struct {
 	Client   *joycode.Client
 	Keyfree  provider.Keyless
 	Keyed    provider.Keyless
+	// Extras 动态返回自定义渠道列表（保存后即时生效）；命中名单时直接派给对应上游。
+	Extras   func() []provider.Keyless
 	Route    *route.Router
 	Resolver ClientResolver
 	store    *store.Store
@@ -55,23 +57,53 @@ func (h *Handler) getClient(r *http.Request) *joycode.Client {
 
 // extras 返回当前已启用的免登录 / 自带 Key 渠道；开关每次请求重读。
 func (h *Handler) extras() []provider.Keyless {
-	var out []provider.Keyless
+	out := make([]provider.Keyless, 0, 4)
 	for _, p := range []provider.Keyless{h.Keyfree, h.Keyed} {
 		if p != nil && p.Enabled() {
 			out = append(out, p)
+		}
+	}
+	if h.Extras != nil {
+		for _, p := range h.Extras() {
+			if p != nil && p.Enabled() {
+				out = append(out, p)
+			}
 		}
 	}
 	return out
 }
 
 // extrasFor 命中某个额外渠道的名单时返回该渠道，否则 nil。
+// 支持 "渠道/模型" 前缀写法（B.AI/qwen3.8-max），同名模型按渠道精确路由。
 func (h *Handler) extrasFor(model string) provider.Keyless {
+	if ch, mm, ok := route.SplitPrefixedModel(model); ok {
+		for _, p := range h.extras() {
+			if strings.EqualFold(p.Name(), ch) && p.Supports(mm) {
+				return prefixedModel{p, mm}
+			}
+		}
+		return nil
+	}
 	for _, p := range h.extras() {
 		if p.Supports(model) {
 			return p
 		}
 	}
 	return nil
+}
+
+// prefixedModel 把带前缀的请求改写为渠道内原名，同时保持渠道语义。
+type prefixedModel struct {
+	provider.Keyless
+	model string
+}
+
+func (p prefixedModel) Supports(model string) bool {
+	if _, _, ok := route.SplitPrefixedModel(model); ok {
+		_, mm, _ := route.SplitPrefixedModel(model)
+		return strings.EqualFold(mm, p.model) && p.Keyless.Supports(mm)
+	}
+	return strings.EqualFold(model, p.model) && p.Keyless.Supports(p.model)
 }
 
 // isKeyfreeUpstream 按能力识别免登录/自带 Key 渠道，不绑定具体实现包。
@@ -136,6 +168,11 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	accountDefault := store.GetAccountDefaultModel(r)
 	systemDefault := h.systemDefault()
 	resolved := resolveModel(req.Model, accountDefault, systemDefault)
+	// 带 "渠道/" 前缀却没命中任何渠道：显式报错，绝不静默换默认付费模型计费。
+	if _, _, isPrefixed := route.SplitPrefixedModel(req.Model); isPrefixed && h.extrasFor(req.Model) == nil {
+		writeAnthropicError(w, 404, fmt.Sprintf("模型不存在：%s。请检查渠道/模型名，或在「模型与渠道」页确认渠道已启用", req.Model))
+		return
+	}
 	reqLog(r).Info("anthropic request", "model", req.Model, "resolved", resolved, "stream", req.Stream, "max_tokens", req.MaxTokens, "messages", len(req.Messages), "tools", len(req.Tools))
 
 	cand := h.pick(r, h.homeCandidate(r, &req, resolved))
@@ -154,9 +191,14 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 // homeCandidate 决定用户点名的模型该派给谁。
+// 带 "渠道/模型" 前缀命中时，上游只收渠道内的原名。
 func (h *Handler) homeCandidate(r *http.Request, req *MessageRequest, resolved string) route.Candidate {
 	if p := h.extrasFor(req.Model); p != nil {
-		return route.Candidate{Upstream: p, Provider: p.Name(), Model: req.Model}
+		model := req.Model
+		if pm, ok := p.(prefixedModel); ok {
+			model = pm.model
+		}
+		return route.Candidate{Upstream: p, Provider: p.Name(), Model: model}
 	}
 	return route.Candidate{Upstream: h.getClient(r), Provider: route.JoyCodeProvider, Model: resolved}
 }

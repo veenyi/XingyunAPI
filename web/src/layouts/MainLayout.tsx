@@ -23,13 +23,28 @@ import { api, clearToken } from '../api';
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
 
+// 菜单分组：行云核心（京东 JoyCode 保活、账号、对话）+ 扩展模块（多渠道/签到/设置）。
+// JoyCode 保活是项目核心，核心功能收纳在「行云核心」组下一体完成；
+// 其余能力按模块独立成组，互不干扰。
 const menuItems = [
-  { key: '/dashboard', icon: <DashboardOutlined />, label: '数据概览' },
-  { key: '/chat', icon: <MessageOutlined />, label: '聊天' },
-  { key: '/accounts', icon: <TeamOutlined />, label: '账号管理' },
-  { key: '/models', icon: <AppstoreOutlined />, label: '模型与渠道' },
-  { key: '/checkin', icon: <GiftOutlined />, label: '签到中心' },
-  { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
+  {
+    type: 'group' as const,
+    label: '行云核心',
+    children: [
+      { key: '/dashboard', icon: <DashboardOutlined />, label: '数据概览' },
+      { key: '/accounts', icon: <TeamOutlined />, label: '账号管理' },
+      { key: '/chat', icon: <MessageOutlined />, label: '聊天' },
+    ],
+  },
+  {
+    type: 'group' as const,
+    label: '扩展模块',
+    children: [
+      { key: '/models', icon: <AppstoreOutlined />, label: '模型与渠道' },
+      { key: '/checkin', icon: <GiftOutlined />, label: '签到中心' },
+      { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
+    ],
+  },
 ];
 
 const COLLAPSED_KEY = 'joycode_sider_collapsed';

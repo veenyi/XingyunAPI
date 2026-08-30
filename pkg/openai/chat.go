@@ -46,17 +46,44 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 // planFor 决定用户点名的模型该派给谁。
 // 免登录 / 自带 Key 渠道按原模型名走，不参与默认模型兜底：
 // 把 hy3-free 静默换成付费模型，比直接返回错误更糟。
+// 支持 "渠道/模型" 前缀写法（B.AI/qwen3.8-max），同名模型按渠道精确路由。
 func (s *Server) planFor(client *joycode.Client, r *http.Request, req *ChatRequest) (route.Candidate, bodyFor) {
 	bodyFor := func(c route.Candidate) map[string]interface{} {
 		return TranslateRequestModel(req, c.Model)
+	}
+	// 前缀写法优先：渠道名 + 原模型名精确命中。
+	if ch, mm, ok := route.SplitPrefixedModel(req.Model); ok {
+		for _, p := range s.extras() {
+			if strings.EqualFold(p.Name(), ch) && p.Supports(mm) {
+				return route.Candidate{Upstream: p, Provider: p.Name(), Model: mm}, bodyFor
+			}
+		}
 	}
 	for _, p := range s.extras() {
 		if p.Supports(req.Model) {
 			return route.Candidate{Upstream: p, Provider: p.Name(), Model: req.Model}, bodyFor
 		}
 	}
+	// 带前缀却没命中任何渠道：宁可明确报错，也不能把 "渠道/模型" 整串发给付费上游。
+	if _, _, ok := route.SplitPrefixedModel(req.Model); ok {
+		return route.Candidate{Upstream: errUpstream{}, Provider: route.JoyCodeProvider, Model: req.Model}, bodyFor
+	}
 	model := ResolveModel(req.Model, store.GetAccountDefaultModel(r), s.systemDefault())
 	return route.Candidate{Upstream: client, Provider: route.JoyCodeProvider, Model: model}, bodyFor
+}
+
+// errUpstream 永远失败：用于"前缀模型没命中渠道"的显式报错路径。
+type errUpstream struct{}
+
+func (errUpstream) Name() string { return "none" }
+func (errUpstream) ListModels() ([]joycode.ModelInfo, error) {
+	return nil, errors.New("模型不存在")
+}
+func (errUpstream) Chat(map[string]interface{}) (map[string]interface{}, error) {
+	return nil, errors.New("模型不存在：请检查渠道/模型名，或在模型与渠道页确认渠道已启用")
+}
+func (errUpstream) ChatStream(map[string]interface{}) (*http.Response, error) {
+	return nil, errors.New("模型不存在：请检查渠道/模型名，或在模型与渠道页确认渠道已启用")
 }
 
 // plan 在自动切换开启时，按用户排好的顺序补齐候选。

@@ -279,6 +279,23 @@ func CleanNames(ids []string) []string {
 	return out
 }
 
+// SplitPrefixedModel 把 "渠道/模型" 写法拆成 (渠道, 模型, true)。
+// 聚合 Key 面向全部渠道开放后，不同渠道的同名模型用前缀区分
+// （如 B.AI/qwen3.8-max 与 opencode-free/qwen3.8-max 互不混淆）；
+// 不带前缀的写法照旧走原解析路径。
+func SplitPrefixedModel(model string) (channel, model2 string, ok bool) {
+	s := strings.TrimSpace(model)
+	idx := strings.Index(s, "/")
+	if idx <= 0 || idx == len(s)-1 {
+		return "", "", false
+	}
+	p, m := strings.TrimSpace(s[:idx]), strings.TrimSpace(s[idx+1:])
+	if p == "" || m == "" {
+		return "", "", false
+	}
+	return p, m, true
+}
+
 func resolve(sources []Source, r Rank) (Candidate, bool) {
 	providerName := strings.TrimSpace(r.Provider)
 	model := strings.TrimSpace(r.Model)
