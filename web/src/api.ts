@@ -55,6 +55,14 @@ export interface Stats {
   }[];
 }
 
+export interface CustomProvider {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key?: string;
+  enabled: boolean;
+}
+
 export interface Settings {
   [key: string]: string;
 }
@@ -99,6 +107,24 @@ export interface RequestLog {
   input_tokens: number;
   output_tokens: number;
   created_at: string;
+}
+
+// 模型健康状态：一次派单候选（渠道 + 模型）此刻的可用性。
+export interface ModelStatus {
+  provider: string;
+  model: string;
+  status: 'ok' | 'cooling';
+  class?: string;
+  reason?: string;
+  failures?: number;
+  until?: string;
+  ranked: boolean;
+}
+
+// 自动切换顺序里的一项。
+export interface ModelRank {
+  provider: string;
+  model: string;
 }
 
 const TOKEN_KEY = 'joycode_jwt';
@@ -231,8 +257,19 @@ export const api = {
   getSettings: () => request<{ settings: Settings }>('/api/settings').then(r => r.settings),
   updateSettings: (data: Settings) =>
     request<{ ok: boolean }>('/api/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  listModelStatus: () =>
+    request<{ models: ModelStatus[] }>('/api/model-status').then(r => r.models ?? []),
+  updateModelRanking: (ranking: ModelRank[]) =>
+    request<{ ok: boolean; count: number }>('/api/model-ranking', {
+      method: 'PUT',
+      body: JSON.stringify({ ranking }),
+    }),
   rotateAggregateKey: () =>
     request<{ ok: boolean; key: string }>('/api/rotate-aggregate-key', { method: 'POST' }),
+  getCustomProviders: () =>
+    request<{ providers: CustomProvider[] }>('/api/custom_providers').then(r => r.providers ?? []),
+  saveCustomProviders: (providers: CustomProvider[]) =>
+    request<{ ok: boolean }>('/api/custom_providers', { method: 'PUT', body: JSON.stringify(providers) }),
   getHealth: () => request<{ status: string; accounts: number }>('/api/health'),
   updateAccountModel: (userId: string, defaultModel: string) =>
     request<{ ok: boolean }>(`/api/accounts/${encodeURIComponent(userId)}/model`, {

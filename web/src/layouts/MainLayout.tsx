@@ -2,6 +2,7 @@ import React, { useContext, useEffect, useState } from 'react';
 import { Layout, Menu, Typography, Tag, theme, Tooltip, Button, message, Dropdown } from 'antd';
 import {
   DashboardOutlined,
+  AppstoreOutlined,
   TeamOutlined,
   SettingOutlined,
   MessageOutlined,
@@ -25,6 +26,7 @@ const menuItems = [
   { key: '/dashboard', icon: <DashboardOutlined />, label: '数据概览' },
   { key: '/chat', icon: <MessageOutlined />, label: '聊天' },
   { key: '/accounts', icon: <TeamOutlined />, label: '账号管理' },
+  { key: '/models', icon: <AppstoreOutlined />, label: '模型与渠道' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
 ];
 

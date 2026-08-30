@@ -23,13 +23,21 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/anthropic"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/custom"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/auth"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/common"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/dashboard"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/health"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keepalive"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyed"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyfree"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/logrot"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/openai"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/probe"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/proxy"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
@@ -129,6 +137,70 @@ var serveCmd = &cobra.Command{
 
 		srv := openai.NewServer(client, s)
 		anth := anthropic.NewHandler(client, s)
+		// 免登录 / 自带 Key 渠道：默认全关，设置页把 keyfree_enabled / keyed_enabled
+		// 置 1 才生效，无需重启。它们不占账号、不参与保活；store 打不开时没有开关
+		// 可读，直接不启用。
+		var (
+			prober  *probe.Prober
+			reg     *health.Registry
+			kf      *keyfree.Client
+			kd      *keyed.Client
+			rt      *route.Router
+			keyless []provider.Keyless
+			cust        *custom.Manager
+			sources func() []route.Source
+		)
+		if s != nil {
+			// 一张健康表管所有渠道：路由与 /v1/models 必须对"这个模型现在能不能用"
+			// 给出同一个答案，所以冷却只由这张表记，写入口收在 pkg/route。
+			reg = health.NewRegistry(health.DefaultPolicy(), func(raw string) {
+				s.SetSetting(route.SettingHealth, raw)
+			})
+			reg.Restore(s.GetSetting(route.SettingHealth))
+
+			kf = keyfree.New(s, Version, reg)
+			kd = keyed.New(s, Version, reg)
+			rt = route.New(s, reg)
+			srv.Keyfree = kf
+			srv.Keyed = kd
+			srv.Route = rt
+			anth.Keyfree = kf
+			anth.Keyed = kd
+			anth.Route = rt
+			cust = custom.New(s, Version)
+			cust.SetRegistry(reg)
+			if err := cust.Load(); err != nil {
+				slog.Warn("custom: 加载自定义渠道失败", "error", err)
+			}
+			keyless = append([]provider.Keyless{kf, kd}, cust.KeylessList()...)
+
+			// 当前参与路由的渠道名单：探针、看板、路由都读这一份，
+			// 免得三处各自过滤"哪个渠道开着"得出不同答案。
+			sources = func() []route.Source {
+				return append([]route.Source{route.JoyCodeSource(client)},
+					route.KeylessSources([]provider.Keyless{kf, kd})...)
+			}
+
+			// 主动嗅探：默认关闭（探针会真实消耗额度），打开后按间隔敲一遍候选，
+			// 被限流的模型不必等用户撞墙才发现，冷却到期的也先确认复活。
+			// 只敲免登录 / 自带 Key 渠道——JoyCode 付费模型用一次扣一次积分，
+			// 它的存活由账号保活负责，不该由探针白烧。
+			prober = probe.New(s, reg, func() []probe.Candidate {
+				var out []probe.Candidate
+				for _, src := range route.KeylessSources([]provider.Keyless{kf, kd}) {
+					// 冷却中的模型已经被可见名单剔除，探针必须看得见它们才能确认复活。
+					list := src.ModelsAll
+					if list == nil {
+						list = src.Models
+					}
+					for _, m := range list() {
+						out = append(out, probe.Candidate{Provider: src.Name, Model: m, Upstream: src.Upstream})
+					}
+				}
+				return out
+			})
+			prober.Start()
+		}
 
 		// Start credential keepalive: check every 1min, refresh accounts older than 1h
 		keeper := keepalive.NewKeeper(s, 1*time.Hour)
@@ -290,6 +362,11 @@ var serveCmd = &cobra.Command{
 			subFS, _ := fs.Sub(staticFiles, "static")
 			dash := dashboard.NewHandler(s, subFS, keeper)
 			dash.Version = Version
+			dash.Health = reg
+			dash.Channels = sources
+			dash.Route = rt
+			dash.Keyless = keyless
+			dash.CustomProviders = cust
 			dash.RegisterRoutes(mux)
 			mux.HandleFunc("/", dash.ServeStatic)
 		}
@@ -383,6 +460,10 @@ var serveCmd = &cobra.Command{
 			log.Printf("Server shutdown error: %v", err)
 		}
 		keeper.Stop()
+		if prober != nil {
+			// 探针会往 store 写健康状态，必须在关库之前停。
+			prober.Stop()
+		}
 		if s != nil {
 			s.Close()
 		}
@@ -515,12 +596,12 @@ func requestLogMiddleware(next http.Handler, s *store.Store) http.Handler {
 			var inTk, outTk int
 			inTk, outTk = store.GetTokenUsage(r)
 			resolvedModel := store.GetModel(r)
-				if resolvedModel != "" {
-					model = resolvedModel
-				}
-				if s.GetSetting("enable_request_logging") != "false" {
-					go s.LogRequest(apiKey, model, path, isStream, rw.statusCode, latency, errMsg, inTk, outTk)
-				}
+			if resolvedModel != "" {
+				model = resolvedModel
+			}
+			if common.SettingEnabledOr(s, "enable_request_logging", true) {
+				go s.LogRequest(apiKey, model, path, isStream, rw.statusCode, latency, errMsg, inTk, outTk)
+			}
 		}
 	})
 }
@@ -584,7 +665,7 @@ func setupLogRotation() {
 		return
 	}
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: logLevel()})))
 	log.SetOutput(rw)
 
 	// Truncate stdout.log if launchd has let it grow too large

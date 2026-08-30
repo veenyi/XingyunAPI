@@ -3,6 +3,7 @@ package anthropic
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,11 +12,17 @@ import (
 	"time"
 
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/common"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/health"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
-const chatEndpoint = "/api/saas/openai/v1/chat/completions"
+// plainRouter 用于没接入路由的构造方式（老测试、store 打不开）：
+// 没有健康度记录、自动切换恒关闭，候选永远只有一个。
+var plainRouter = route.New(nil, nil)
+
 const anthropicEndpoint = "/api/saas/anthropic/v1/messages"
 
 // activateWaitSeconds 自动激活（AI_GRAY_ACCESS_DENIED）后等待上游放行的时间。
@@ -27,6 +34,9 @@ type ClientResolver func(r *http.Request) *joycode.Client
 // Handler serves the Anthropic Messages API.
 type Handler struct {
 	Client   *joycode.Client
+	Keyfree  provider.Keyless
+	Keyed    provider.Keyless
+	Route    *route.Router
 	Resolver ClientResolver
 	store    *store.Store
 }
@@ -41,6 +51,51 @@ func (h *Handler) getClient(r *http.Request) *joycode.Client {
 		return h.Resolver(r)
 	}
 	return h.Client
+}
+
+// extras 返回当前已启用的免登录 / 自带 Key 渠道；开关每次请求重读。
+func (h *Handler) extras() []provider.Keyless {
+	var out []provider.Keyless
+	for _, p := range []provider.Keyless{h.Keyfree, h.Keyed} {
+		if p != nil && p.Enabled() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// extrasFor 命中某个额外渠道的名单时返回该渠道，否则 nil。
+func (h *Handler) extrasFor(model string) provider.Keyless {
+	for _, p := range h.extras() {
+		if p.Supports(model) {
+			return p
+		}
+	}
+	return nil
+}
+
+// isKeyfreeUpstream 按能力识别免登录/自带 Key 渠道，不绑定具体实现包。
+func isKeyfreeUpstream(client provider.Chat) bool {
+	if client == nil {
+		return false
+	}
+	_, ok := client.(provider.Keyless)
+	return ok
+}
+
+// translateFor 按派单里的候选模型构造上游请求体。候选模型已经解析过（点名模型
+// 走账号/系统默认兜底、免登录渠道保留原名、自动切换取下一个候选），这里不能再
+// 按 req.Model 重解析，否则换渠道等于没换。
+func (h *Handler) translateFor(req *MessageRequest, cand route.Candidate, r *http.Request, systemDefault string) map[string]interface{} {
+	return TranslateRequestModel(req, cand.Model)
+}
+
+// reportedModel 是回给客户端的 model 字段：自动切换后必须报实际用的模型。
+func (h *Handler) reportedModel(req *MessageRequest, cand route.Candidate) string {
+	if cand.Rotated {
+		return cand.Model
+	}
+	return req.Model
 }
 
 // RegisterRoutes registers the Anthropic Messages API endpoint.
@@ -78,42 +133,83 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		req.MaxTokens = 32768
 	}
 
-		accountDefault := store.GetAccountDefaultModel(r)
-		systemDefault := ""
-		if h.store != nil {
-			systemDefault = h.store.GetSetting("default_model")
-		}
-		resolved := resolveModel(req.Model, accountDefault, systemDefault)
-		store.SetModel(r, resolved)
-		reqLog(r).Info("anthropic request", "model", req.Model, "resolved", resolved, "stream", req.Stream, "max_tokens", req.MaxTokens, "messages", len(req.Messages), "tools", len(req.Tools))
+	accountDefault := store.GetAccountDefaultModel(r)
+	systemDefault := h.systemDefault()
+	resolved := resolveModel(req.Model, accountDefault, systemDefault)
+	reqLog(r).Info("anthropic request", "model", req.Model, "resolved", resolved, "stream", req.Stream, "max_tokens", req.MaxTokens, "messages", len(req.Messages), "tools", len(req.Tools))
 
-	client := h.getClient(r)
+	cand := h.pick(r, h.homeCandidate(r, &req, resolved))
+	// 免登录 / 自带 Key 模型名不参与 resolveModel 兜底，点名要 free 模型就不能换成付费模型。
+	store.SetModel(r, cand.Model)
+	if cand.Provider != route.JoyCodeProvider {
+		reqLog(r).Info("anthropic request via extra upstream", "provider", cand.Provider,
+			"model", cand.Model, "stream", req.Stream)
+	}
 
 	if req.Stream {
-		h.handleStream(w, r, &req, client)
+		h.handleStream(w, r, &req, cand)
 	} else {
-		h.handleNonStream(w, r, &req, client)
+		h.handleNonStream(w, r, &req, cand)
 	}
 }
 
-func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client) {
+// homeCandidate 决定用户点名的模型该派给谁。
+func (h *Handler) homeCandidate(r *http.Request, req *MessageRequest, resolved string) route.Candidate {
+	if p := h.extrasFor(req.Model); p != nil {
+		return route.Candidate{Upstream: p, Provider: p.Name(), Model: req.Model}
+	}
+	return route.Candidate{Upstream: h.getClient(r), Provider: route.JoyCodeProvider, Model: resolved}
+}
+
+// pick 在自动切换开启时，把正在冷却的首选挪到最后，先派给排序里活着的候选。
+// 这条路径的响应头会提前提交（心跳需要），所以一次请求只派一个候选。
+func (h *Handler) pick(r *http.Request, home route.Candidate) route.Candidate {
+	if h.Route == nil {
+		return home
+	}
+	sources := append([]route.Source{route.JoyCodeSource(h.getClient(r))}, route.KeylessSources(h.extras())...)
+	return h.Route.Pick(home, sources)
+}
+
+func (h *Handler) router() *route.Router {
+	if h.Route == nil {
+		return plainRouter
+	}
+	return h.Route
+}
+
+func (h *Handler) systemDefault() string {
+	if h.store == nil {
+		return ""
+	}
+	return h.store.GetSetting("default_model")
+}
+
+func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, cand route.Candidate) {
+	client := cand.Upstream
 	systemDefault := ""
 	if h.store != nil {
 		systemDefault = h.store.GetSetting("default_model")
 	}
-	if ClaudeNativeEnabled(h.store) && (IsNativeAnthropicModel(req.Model) || IsNativeAnthropicModel(resolveModel(req.Model, store.GetAccountDefaultModel(r), systemDefault))) {
-		h.handleNativeAnthropicNonStream(w, r, req, client, systemDefault)
-		return
+	keyfreeReq := isKeyfreeUpstream(client)
+	if !keyfreeReq {
+		if jc, ok := client.(*joycode.Client); ok && !cand.Rotated && ClaudeNativeEnabled(h.store) && (IsNativeAnthropicModel(req.Model) || IsNativeAnthropicModel(resolveModel(req.Model, store.GetAccountDefaultModel(r), systemDefault))) {
+			h.handleNativeAnthropicNonStream(w, r, req, jc, systemDefault, cand)
+			return
+		}
 	}
 	// Preemptive truncation: estimate tokens and truncate before sending
-	if rounds := PreemptiveTruncate(req); rounds < 0 {
-		writeAnthropicRequestError(w, "上下文过长，自动截断后仍超出限制，请使用 /compact 或开启新对话。")
-		return
-	} else if rounds > 0 {
-		slog.Warn("preemptive truncation applied (non-stream)", "rounds", rounds)
+	// 免登录渠道的上下文预算由上游自己判定，这里不按 JoyCode 模型表预截。
+	if !keyfreeReq {
+		if rounds := PreemptiveTruncate(req); rounds < 0 {
+			writeAnthropicRequestError(w, "上下文过长，自动截断后仍超出限制，请使用 /compact 或开启新对话。")
+			return
+		} else if rounds > 0 {
+			slog.Warn("preemptive truncation applied (non-stream)", "rounds", rounds)
+		}
 	}
 
-	jcBody := TranslateRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+	jcBody := h.translateFor(req, cand, r, systemDefault)
 	logRequestDetails(r, "translated request (non-stream)", jcBody)
 	maxRetries := 3
 	if h.store != nil {
@@ -123,16 +219,17 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *M
 	var lastErr error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		jcResp, lastErr = client.PostWithActivation(chatEndpoint, jcBody)
+		jcResp, lastErr = client.Chat(jcBody)
 		if lastErr != nil {
 			if isContextLimitError(lastErr.Error()) {
 				// Progressive truncation on context limit
 				if truncateMessages(req) {
-					jcBody = TranslateRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+					jcBody = h.translateFor(req, cand, r, systemDefault)
 					reqLog(r).Warn("retrying with truncated messages (non-stream)", "attempt", attempt)
 					continue
 				}
 				reqLog(r).Warn("context limit exceeded, cannot truncate further")
+				h.router().RecordFailure(cand, lastErr)
 				writeAnthropicRequestError(w, "上下文长度超出模型限制，且无法进一步截断。请压缩对话历史或开启新对话。原始错误: "+lastErr.Error())
 				return
 			}
@@ -146,6 +243,7 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *M
 	}
 
 	if lastErr != nil {
+		h.router().RecordFailure(cand, lastErr)
 		errMsg := lastErr.Error()
 		if isContextLimitError(errMsg) {
 			writeAnthropicRequestError(w, "上下文长度超出模型限制。请压缩对话历史或开启新对话。原始错误: "+errMsg)
@@ -158,13 +256,14 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *M
 		}
 		if strings.Contains(errMsg, "content_filter") || strings.Contains(errMsg, "SENSITIVE_CONTENT") {
 			reqLog(r).Warn("upstream content_filter (non-stream), returning detailed error")
-				writeContentFilterError(w, errMsg)
+			writeContentFilterError(w, errMsg)
 			return
 		}
 		writeAnthropicError(w, 500, errMsg)
 		return
 	}
-	resp := TranslateResponse(jcResp, req.Model)
+	h.router().RecordSuccess(cand)
+	resp := TranslateResponse(jcResp, h.reportedModel(req, cand))
 	// Check for content_filter in non-stream response
 	if choices, ok := jcResp["choices"].([]interface{}); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]interface{}); ok {
@@ -205,7 +304,8 @@ func (r *prependReader) Close() error {
 	return r.body.Close()
 }
 
-func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client) {
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, cand route.Candidate) {
+	client := cand.Upstream
 	systemDefault := ""
 	if h.store != nil {
 		systemDefault = h.store.GetSetting("default_model")
@@ -215,25 +315,27 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 		writeAnthropicError(w, 500, "streaming not supported")
 		return
 	}
-	if ClaudeNativeEnabled(h.store) && (IsNativeAnthropicModel(req.Model) || IsNativeAnthropicModel(resolveModel(req.Model, store.GetAccountDefaultModel(r), systemDefault))) {
-		h.handleNativeAnthropicStream(w, r, req, client, flusher, systemDefault)
-		return
+	keyfreeReq := isKeyfreeUpstream(client)
+	if !keyfreeReq {
+		if jc, ok := client.(*joycode.Client); ok && ClaudeNativeEnabled(h.store) && (IsNativeAnthropicModel(req.Model) || IsNativeAnthropicModel(resolveModel(req.Model, store.GetAccountDefaultModel(r), systemDefault))) {
+			h.handleNativeAnthropicStream(w, r, req, jc, flusher, systemDefault, cand)
+			return
+		}
 	}
-
-	jcBody := TranslateRequest(req, store.GetAccountDefaultModel(r), systemDefault)
-	jcBody["stream"] = true
-	logRequestDetails(r, "translated request (stream)", jcBody)
 
 	// Preemptive truncation: estimate tokens and truncate before sending
-	if rounds := PreemptiveTruncate(req); rounds < 0 {
-		writeAnthropicRequestError(w, "上下文过长，自动截断后仍超出限制，请使用 /compact 或开启新对话。")
-		return
-	} else if rounds > 0 {
-		reqLog(r).Warn("preemptive truncation applied (stream)", "rounds", rounds)
+	if !keyfreeReq {
+		if rounds := PreemptiveTruncate(req); rounds < 0 {
+			writeAnthropicRequestError(w, "上下文过长，自动截断后仍超出限制，请使用 /compact 或开启新对话。")
+			return
+		} else if rounds > 0 {
+			reqLog(r).Warn("preemptive truncation applied (stream)", "rounds", rounds)
+		}
 	}
 
-	jcBody = TranslateRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+	jcBody := h.translateFor(req, cand, r, systemDefault)
 	jcBody["stream"] = true
+	logRequestDetails(r, "translated request (stream)", jcBody)
 
 	// Commit SSE headers + message_start early so we can send heartbeat ping
 	// events while waiting for the upstream to respond. The JoyCode upstream
@@ -246,7 +348,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 	w.WriteHeader(200)
 
 	msgID := NewMessageID()
-	model := req.Model
+	model := h.reportedModel(req, cand)
 	totalOutput := 0
 
 	FormatSSE(w, "message_start", sseMessageStart{
@@ -284,13 +386,14 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 		if !truncateMessages(req) {
 			break
 		}
-		jcBody = TranslateRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+		jcBody = h.translateFor(req, cand, r, systemDefault)
 		jcBody["stream"] = true
 		resp, err = h.connectStreamWithRetry(r, jcBody, client)
 	}
 	close(stopHeartbeat)
 	<-heartbeatDone
 	if err != nil {
+		h.router().RecordFailure(cand, err)
 		errMsg := err.Error()
 		if isContextLimitError(errMsg) {
 			reqLog(r).Warn("context limit exceeded (stream), cannot proceed even after progressive truncation")
@@ -312,6 +415,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 		return
 	}
 	defer resp.Body.Close()
+	h.router().RecordSuccess(cand)
 
 	type toolCallAccum struct {
 		ID        string
@@ -329,10 +433,16 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 	chunkCount := 0
 	var streamInTk, streamOutTk int
 	finishReasonSeen := false
+	// problem 记录上游在已建好的流里报出的第一个错误：这类上游的 HTTP 头是 200，
+	// 握手时判"可用"是错的，必须回头把这个模型打进冷却。
+	var problem string
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		chunkCount++
+		if msg := health.StreamProblem(line); msg != "" && problem == "" {
+			problem = msg
+		}
 		chunk := ParseStreamChunk(line)
 		if chunk == nil || len(chunk.Choices) == 0 {
 			if chunk != nil && chunk.Usage != nil {
@@ -480,6 +590,12 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 		}
 	}
 
+	if problem != "" {
+		reqLog(r).Warn("stream: 上游在流内报错，该模型计入冷却", "provider", cand.Provider,
+			"model", cand.Model, "error", problem)
+		h.router().RecordFailure(cand, errors.New(problem))
+	}
+
 	// If the loop ended without ever seeing an upstream finish_reason, the stream
 	// was truncated — a read error (scanner.Err) or a clean EOF mid-generation.
 	// Don't fake a clean completion (issue #2): close any open content blocks for
@@ -515,7 +631,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 	}
 }
 
-func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client, flusher http.Flusher, systemDefault string) {
+func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client, flusher http.Flusher, systemDefault string, cand route.Candidate) {
 	body := TranslateAnthropicRequest(req, store.GetAccountDefaultModel(r), systemDefault)
 	logRequestDetails(r, "translated native anthropic request (stream)", body)
 
@@ -551,11 +667,13 @@ func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Req
 	close(stopHeartbeat)
 	<-heartbeatDone
 	if err != nil {
+		h.router().RecordFailure(cand, err)
 		reqLog(r).Error("native anthropic stream failed after retries", "error", err)
 		writeStreamError(w, flusher, err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	h.router().RecordSuccess(cand)
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -620,17 +738,19 @@ func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Req
 	}
 }
 
-func (h *Handler) handleNativeAnthropicNonStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client, systemDefault string) {
+func (h *Handler) handleNativeAnthropicNonStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client, systemDefault string, cand route.Candidate) {
 	body := TranslateAnthropicRequest(req, store.GetAccountDefaultModel(r), systemDefault)
 	logRequestDetails(r, "translated native anthropic request (non-stream)", body)
 
 	resp, err := h.connectNativeAnthropicStreamWithRetry(r, body, client)
 	if err != nil {
+		h.router().RecordFailure(cand, err)
 		reqLog(r).Error("native anthropic non-stream failed after retries", "error", err)
 		writeAnthropicError(w, 500, err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	h.router().RecordSuccess(cand)
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -734,7 +854,7 @@ func (h *Handler) handleNativeAnthropicNonStream(w http.ResponseWriter, r *http.
 		Type:       "message",
 		Role:       "assistant",
 		Content:    content,
-		Model:      req.Model,
+		Model:      h.reportedModel(req, cand),
 		StopReason: &stopReason,
 		Usage: Usage{
 			InputTokens:  inTk,
@@ -851,7 +971,7 @@ func updateNativeAnthropicUsage(payload string, inputTokens, outputTokens *int) 
 
 // connectStreamWithRetry attempts to connect to upstream with retries.
 // Peeks at the first SSE line to detect errors before returning the response.
-func (h *Handler) connectStreamWithRetry(r *http.Request, jcBody map[string]interface{}, client *joycode.Client) (*http.Response, error) {
+func (h *Handler) connectStreamWithRetry(r *http.Request, jcBody map[string]interface{}, client provider.Chat) (*http.Response, error) {
 	maxRetries := 3
 	if h.store != nil {
 		maxRetries = h.store.GetIntSetting("max_retries", 3)
@@ -859,7 +979,7 @@ func (h *Handler) connectStreamWithRetry(r *http.Request, jcBody map[string]inte
 	var lastErr error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		resp, err := client.PostStreamWithActivation(chatEndpoint, jcBody)
+		resp, err := client.ChatStream(jcBody)
 		if err != nil {
 			lastErr = err
 			reqLog(r).Error("stream connect error", "attempt", attempt, "max", maxRetries, "error", err)
@@ -895,7 +1015,7 @@ func (h *Handler) connectStreamWithRetry(r *http.Request, jcBody map[string]inte
 				return nil, lastErr
 			}
 			// 账号未激活（AI_GRAY_ACCESS_DENIED 等）→ 自动激活并等待放行后重试
-			if joycode.IsActivationError(dataContent) && client.TryActivate() {
+			if jc, ok := client.(*joycode.Client); ok && joycode.IsActivationError(dataContent) && jc.TryActivate() {
 				reqLog(r).Info("activation triggered, waiting for upstream to grant access", "attempt", attempt)
 				time.Sleep(activateWaitSeconds)
 				continue

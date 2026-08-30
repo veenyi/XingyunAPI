@@ -13,7 +13,12 @@ import (
 
 // TranslateRequest converts an Anthropic MessageRequest to a JoyCode API body.
 func TranslateRequest(req *MessageRequest, accountDefault string, systemDefault string) map[string]interface{} {
-	model := resolveModel(req.Model, accountDefault, systemDefault)
+	return TranslateRequestModel(req, resolveModel(req.Model, accountDefault, systemDefault))
+}
+
+// TranslateRequestModel 用给定模型名构造 body。免登录渠道的模型不在
+// joycode.Models 白名单内，必须绕开 resolveModel 的默认兜底。
+func TranslateRequestModel(req *MessageRequest, model string) map[string]interface{} {
 	messages := buildMessages(req)
 
 	body := map[string]interface{}{
@@ -170,6 +175,15 @@ func TranslateResponse(jcResp map[string]interface{}, reqModel string) *MessageR
 	} else {
 		text, _ := msg["content"].(string)
 		content = append(content, ContentBlock{Type: "text", Text: text})
+		// finish_reason 决定对外声明的结束原因：被 max_tokens 截断的一轮必须说
+		// max_tokens，否则客户端以为回答已经完整，不会续写。
+		fr, _ := choice["finish_reason"].(string)
+		switch fr {
+		case "length":
+			stopReason = "max_tokens"
+		case "content_filter":
+			stopReason = "refusal"
+		}
 	}
 
 	return &MessageResponse{

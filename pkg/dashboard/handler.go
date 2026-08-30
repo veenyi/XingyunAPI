@@ -22,9 +22,13 @@ import (
 
 	_ "modernc.org/sqlite"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/auth"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/health"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keepalive"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/proxy"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/custom"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
@@ -33,6 +37,16 @@ type Handler struct {
 	staticFS  fs.FS
 	modelList []string
 	keeper    *keepalive.Keeper
+	// Health 是所有渠道共用的模型健康表；为 nil 时健康接口返回空名单。
+	Health *health.Registry
+	// Channels 返回当前参与路由的上游渠道及其此刻可见的模型名，供排序页使用。
+	Channels func() []route.Source
+	// Keyless 是免登录 / 自带 Key 渠道，供看板聊天框直接按模型名测试。
+	Keyless []provider.Keyless
+	// CustomProviders 是用户自定义渠道管理器，为 nil 时不暴露。
+	CustomProviders *custom.Manager
+	// Route 负责候选排序与冷却记账；为 nil 时看板聊天只按用户点名的模型走一次。
+	Route *route.Router
 	// Version is the proxy version reported by /api/health; set by the server
 	// at startup (the build-time Version lives in package main).
 	Version string
@@ -68,8 +82,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/jdhgpt-login/init", h.handleJdHptInit)
 	mux.HandleFunc("/api/jdhgpt-login/status", h.handleJdHptStatus)
 	mux.HandleFunc("/api/models", h.handleModels)
+	mux.HandleFunc("/api/model-status", h.handleModelStatus)
+	mux.HandleFunc("/api/model-ranking", h.handleModelRanking)
 	mux.HandleFunc("/api/stats", h.handleStats)
 	mux.HandleFunc("/api/settings", h.handleSettings)
+	mux.HandleFunc("/api/custom_providers", h.handleCustomProviders)
 	mux.HandleFunc("/api/health", h.handleHealth)
 	mux.HandleFunc("/api/errors", h.handleErrors)
 	mux.HandleFunc("/api/github-stars", h.handleGitHubStars)
@@ -1468,8 +1485,27 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 免登录 / 自带 Key 渠道的模型也列进下拉，看板聊天框才能直接测它们。
+	list := append([]string(nil), models...)
+	seen := make(map[string]bool, len(list))
+	for _, m := range list {
+		seen[m] = true
+	}
+	for _, src := range h.channels() {
+		if src.Name == route.JoyCodeProvider || src.Models == nil {
+			continue
+		}
+		for _, m := range src.Models() {
+			if m == "" || seen[m] {
+				continue
+			}
+			seen[m] = true
+			list = append(list, m)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"models": modelInfos(models),
+		"models": modelInfos(list),
 	})
 }
 
@@ -1549,6 +1585,13 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if settings == nil {
 			settings = map[string]string{}
 		}
+		// 整表原样返回会把上游 Key 明文带出浏览器；凭据键统一换成占位值，
+		// 键仍然在，前端表单能正常回填，提交时按"未修改"处理。
+		for k := range settings {
+			if store.IsSecretSetting(k) {
+				settings[k] = store.SecretMask
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"settings": settings})
 
 	case http.MethodPut:
@@ -1561,12 +1604,29 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		settings := make(map[string]string, len(raw))
+		secrets := make(map[string]string)
 		for k, v := range raw {
-			settings[k] = coerceSettingValue(v)
+			value := coerceSettingValue(v)
+			if !store.IsSecretSetting(k) {
+				settings[k] = value
+				continue
+			}
+			// 前端把 GET 里的占位值原样回填：这说明用户没改，不能覆盖真值。
+			if value == store.SecretMask {
+				continue
+			}
+			secrets[k] = value
 		}
 		if err := h.store.SetSettings(settings); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		for k, v := range secrets {
+			// 空值 = 删除：上游 Key 不该因为"清空输入框"而继续留在库里。
+			if err := h.store.SetSecretSetting(k, v); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 
@@ -1662,6 +1722,43 @@ func (h *Handler) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleCustomProviders 提供自定义渠道的 GET（列出）和 PUT（保存）接口。
+// GET  返回 []ProviderEntry，api_key 一律为 SecretMask 占位。
+// PUT  接收 []ProviderEntry，将 api_key 加密后写入 settings.custom_providers。
+func (h *Handler) handleCustomProviders(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if h.CustomProviders == nil {
+		writeError(w, http.StatusNotFound, "custom providers not configured")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"providers": h.CustomProviders.ListEntries(),
+		})
+	case http.MethodPut:
+		var entries []custom.ProviderEntry
+		if !readJSONBody(w, r, &entries) {
+			return
+		}
+		if err := h.CustomProviders.Save(entries); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// 重新加载以刷新内存中的客户端实例（无需重启）。
+		if err := h.CustomProviders.Load(); err != nil {
+			slog.Error("custom: reload after save failed", "error", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}

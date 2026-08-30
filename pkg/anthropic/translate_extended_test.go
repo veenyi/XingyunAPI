@@ -702,3 +702,30 @@ func TestFormatSSE_Output(t *testing.T) {
 		t.Errorf("parsed type = %q, want message_start", parsed["type"])
 	}
 }
+
+// finish_reason 必须如实透出：被 max_tokens 截断的一轮如果对外说 end_turn，
+// Claude Code 会以为回答已经完整，不再续写。
+func TestTranslateResponse_FinishReasonMapsStopReason(t *testing.T) {
+	cases := []struct {
+		finish string
+		want   string
+	}{
+		{"", "end_turn"},
+		{"stop", "end_turn"},
+		{"length", "max_tokens"},
+		{"content_filter", "refusal"},
+	}
+	for _, c := range cases {
+		t.Run("finish_reason="+c.finish, func(t *testing.T) {
+			resp := TranslateResponse(map[string]interface{}{
+				"choices": []interface{}{map[string]interface{}{
+					"finish_reason": c.finish,
+					"message":       map[string]interface{}{"content": "半句话"},
+				}},
+			}, "GLM-5.3")
+			if resp.StopReason == nil || *resp.StopReason != c.want {
+				t.Fatalf("stop_reason = %v，期望 %s", resp.StopReason, c.want)
+			}
+		})
+	}
+}

@@ -12,4 +12,6 @@ type ModelInfo struct {
 	VerificationStatus string   `json:"verificationStatus"`
 	ModelID            string   `json:"modelId"`
 	CreateTime         int64    `json:"createTime"`
+	// Provider 标记这条记录来自哪个上游，不来自上游 JSON。
+	Provider string `json:"-"`
 }

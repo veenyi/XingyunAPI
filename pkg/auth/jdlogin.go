@@ -26,8 +26,10 @@ func minInt(a, b int) int {
 const (
 	qrShowURL         = "https://qr.m.jd.com/show?appid=133&size=147&t=%d"
 	qrCheckURL        = "https://qr.m.jd.com/check?appid=133&token=%s&callback=jsonpCallback&_=%d"
-	// qrValidURL 对齐 joycode 网页端参数（appId/ssoDomains/ReturnUrl），否则不返回 pt_key cookie
-	qrValidURL        = "https://passport.jd.com/uc/qrCodeTicketValidation?ReturnUrl=https%3A%2F%2Fjoycode.jd.com%2F&appId=133&t=%s&ssoDomains=sso.jdcloud.com"
+	// qrValidURL 对齐 joycode 网页端参数（appId/ssoDomains/ReturnUrl），否则不返回 pt_key cookie。
+	// 注意：这个常量会被当作 Sprintf 的格式串使用，ReturnUrl 里的百分号必须写成 %%，
+	// 否则 %3A/%2F 会被当成格式化动词，扫码登录请求的地址在运行时是坏的。
+	qrValidURL        = "https://passport.jd.com/uc/qrCodeTicketValidation?ReturnUrl=https%%3A%%2F%%2Fjoycode.jd.com%%2F&appId=133&t=%s&ssoDomains=sso.jdcloud.com"
 	jdUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 	qrSessionTTL      = 3 * time.Minute
 	qrCleanupInterval = 1 * time.Minute

@@ -1114,6 +1114,52 @@ func (s *Store) SetSetting(key, value string) error {
 	return err
 }
 
+// SecretSettingKeys 是加密存放、且绝不能原样出现在 HTTP 响应里的设置键。
+// 新增上游凭据类设置只要往这里加一行，读写两侧就都自动受保护。
+var SecretSettingKeys = map[string]bool{
+	"keyed_api_key": true,
+}
+
+// IsSecretSetting 表示这个设置键属于凭据。
+func IsSecretSetting(key string) bool { return SecretSettingKeys[key] }
+
+// SecretMask 是敏感设置在 GET 响应里的占位值。前端表单会原样回填并再次提交，
+// 收到它就当作"用户没改这一项"，不能覆盖真值。
+const SecretMask = "********"
+
+// SetSecretSetting 用与账号 token 相同的 AES-GCM 密钥加密后存入 settings，
+// 避免上游 API Key 以明文躺在表里、再被 /api/settings 整表带出。空值表示删除。
+func (s *Store) SetSecretSetting(key, value string) error {
+	if strings.TrimSpace(value) == "" {
+		_, err := s.db.Exec("DELETE FROM settings WHERE key = ?", key)
+		if err != nil {
+			slog.Error("store: delete secret setting failed", "key", key, "error", err)
+		}
+		return err
+	}
+	sealed, err := s.encrypt(value)
+	if err != nil {
+		slog.Error("store: encrypt secret setting failed", "key", key, "error", err)
+		return err
+	}
+	return s.SetSetting(key, sealed)
+}
+
+// GetSecretSetting 解密敏感设置。解不开就当不存在——绝不回落到原样返回，
+// 否则误存的明文会被当成密钥发到上游。
+func (s *Store) GetSecretSetting(key string) string {
+	raw := s.GetSetting(key)
+	if raw == "" {
+		return ""
+	}
+	plain, err := s.decrypt(raw)
+	if err != nil {
+		slog.Error("store: decrypt secret setting failed", "key", key, "error", err)
+		return ""
+	}
+	return plain
+}
+
 func (s *Store) SetSettings(settings map[string]string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1604,4 +1650,14 @@ func (s *Store) SaveChatHistory(userID, data string) error {
 		slog.Error("store: save chat history failed", "user_id", userID, "error", err)
 	}
 	return err
+}
+
+// Encrypt 对外暴露 AES-GCM 加密，供上层包（如 custom）对 JSON 内个别字段加密用。
+func (s *Store) Encrypt(plaintext string) (string, error) {
+	return s.encrypt(plaintext)
+}
+
+// Decrypt 对外暴露 AES-GCM 解密，供上层包（如 custom）对 JSON 内个别字段解密用。
+func (s *Store) Decrypt(ciphertext string) (string, error) {
+	return s.decrypt(ciphertext)
 }

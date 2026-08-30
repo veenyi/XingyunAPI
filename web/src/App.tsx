@@ -16,6 +16,7 @@ const Chat = lazy(() => import('./pages/Chat'));
 const Accounts = lazy(() => import('./pages/Accounts'));
 const AccountDetail = lazy(() => import('./pages/AccountDetail'));
 const Settings = lazy(() => import('./pages/Settings'));
+const Models = lazy(() => import('./pages/Models'));
 
 const pageLoading = <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
 
@@ -336,6 +337,7 @@ const App: React.FC = () => {
               <Route path="/chat" element={<Suspense fallback={pageLoading}><Chat /></Suspense>} />
               <Route path="/accounts" element={<Suspense fallback={pageLoading}><Accounts /></Suspense>} />
               <Route path="/accounts/:userId" element={<Suspense fallback={pageLoading}><AccountDetail /></Suspense>} />
+              <Route path="/models" element={<Suspense fallback={pageLoading}><Models /></Suspense>} />
               <Route path="/settings" element={<Suspense fallback={pageLoading}><Settings /></Suspense>} />
             </Route>
             <Route path="/" element={<OAuthCallback />} />
