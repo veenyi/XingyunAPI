@@ -81,7 +81,7 @@ func visible(modelID string) bool {
 	if _, excluded := excludedModels[modelID]; excluded {
 		return false
 	}
-	return isVerified(modelID)
+	return true
 }
 
 func isVerified(id string) bool {

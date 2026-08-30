@@ -178,7 +178,7 @@ var serveCmd = &cobra.Command{
 			// 免得三处各自过滤"哪个渠道开着"得出不同答案。
 			sources = func() []route.Source {
 				return append([]route.Source{route.JoyCodeSource(client)},
-					route.KeylessSources([]provider.Keyless{kf, kd})...)
+					route.KeylessSources(append([]provider.Keyless{kf, kd}, cust.KeylessList()...))...)
 			}
 
 			// 主动嗅探：默认关闭（探针会真实消耗额度），打开后按间隔敲一遍候选，
@@ -187,7 +187,7 @@ var serveCmd = &cobra.Command{
 			// 它的存活由账号保活负责，不该由探针白烧。
 			prober = probe.New(s, reg, func() []probe.Candidate {
 				var out []probe.Candidate
-				for _, src := range route.KeylessSources([]provider.Keyless{kf, kd}) {
+				for _, src := range route.KeylessSources(append([]provider.Keyless{kf, kd}, cust.KeylessList()...)) {
 					// 冷却中的模型已经被可见名单剔除，探针必须看得见它们才能确认复活。
 					list := src.ModelsAll
 					if list == nil {

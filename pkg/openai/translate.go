@@ -10,8 +10,15 @@ import (
 
 // TranslateRequest converts an OpenAI ChatRequest to JoyCode API body.
 func TranslateRequest(req *ChatRequest) map[string]interface{} {
+	return TranslateRequestModel(req, req.Model)
+}
+
+// TranslateRequestModel 用指定模型生成上游请求体。
+// 自动切换时消息内容不变、只换模型，所以这里必须能覆盖模型名；
+// thinking 之类的开关也跟着实际发送的模型判断。
+func TranslateRequestModel(req *ChatRequest, model string) map[string]interface{} {
 	body := map[string]interface{}{
-		"model":  req.Model,
+		"model":  model,
 		"stream": req.Stream,
 	}
 	if len(req.Messages) > 0 {
@@ -39,7 +46,7 @@ func TranslateRequest(req *ChatRequest) map[string]interface{} {
 	if len(req.Stop) > 0 {
 		body["stop"] = json.RawMessage(req.Stop)
 	}
-	if len(req.Thinking) > 0 && ReasoningModels[req.Model] {
+	if len(req.Thinking) > 0 && ReasoningModels[model] {
 		body["thinking"] = json.RawMessage(req.Thinking)
 	}
 	return body
@@ -68,7 +75,10 @@ func TranslateModels(jcModels []joycode.ModelInfo) map[string]interface{} {
 		}
 		entry := map[string]interface{}{
 			"id": mid, "object": "model",
-			"created": 1700000000, "owned_by": "joycode",
+			"created": 1700000000, "owned_by": modelOwner(m),
+		}
+		if m.Provider != "" {
+			entry["provider"] = m.Provider
 		}
 		if caps, ok := ModelCapabilities[mid]; ok {
 			entry["capabilities"] = caps
@@ -76,6 +86,13 @@ func TranslateModels(jcModels []joycode.ModelInfo) map[string]interface{} {
 		data = append(data, entry)
 	}
 	return map[string]interface{}{"object": "list", "data": data}
+}
+
+func modelOwner(m joycode.ModelInfo) string {
+	if m.Provider != "" {
+		return m.Provider
+	}
+	return "joycode"
 }
 
 // TranslateStreamChunk converts a JoyCode SSE data line to OpenAI format.

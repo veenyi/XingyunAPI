@@ -6,15 +6,22 @@ import (
 	"net/http"
 
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
 // ClientResolver returns the appropriate joycode.Client for a request.
 type ClientResolver func(r *http.Request) *joycode.Client
 
+var _ provider.Chat = (*joycode.Client)(nil)
+
 // Server implements the OpenAI-compatible HTTP API.
 type Server struct {
-	Client   *joycode.Client
+	Client  *joycode.Client
+	Keyfree provider.Keyless
+	Keyed   provider.Keyless
+	Route   *route.Router
 	Resolver ClientResolver
 	store    *store.Store
 }
@@ -22,6 +29,17 @@ type Server struct {
 // NewServer creates a new OpenAI-compatible proxy server.
 func NewServer(c *joycode.Client, s *store.Store) *Server {
 	return &Server{Client: c, store: s}
+}
+
+// extras 返回当前已启用的免登录 / 自带 Key 渠道；开关每次请求重读，改设置不必重启。
+func (s *Server) extras() []provider.Keyless {
+	var out []provider.Keyless
+	for _, p := range []provider.Keyless{s.Keyfree, s.Keyed} {
+		if p != nil && p.Enabled() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (s *Server) getClient(r *http.Request) *joycode.Client {
@@ -111,6 +129,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		slog.Error("list models upstream error", "error", err)
 		writeError(w, 500, err.Error())
 		return
+	}
+	// 额外渠道只有在开关打开后才出现在目录里，未安装/未开启时目录与原来一致。
+	for _, p := range s.extras() {
+		if free, kerr := p.ListModels(); kerr == nil {
+			models = append(models, free...)
+		}
 	}
 	writeJSON(w, 200, TranslateModels(models))
 }

@@ -31,6 +31,17 @@ const (
 	baseRestartDelay  = 1 * time.Second
 )
 
+// logLevel 让 -v 真的把 slog 的 Debug 打开。在此之前三处 handler 都写死了
+// LevelInfo，而 -v 只挂了一层 HTTP 日志中间件：全项目的 slog.Debug 分支
+// ——探针逐个模型报的"模型可用"、健康度变更等——一条都写不出来，
+// 结果是冷却与复活只能靠猜，没法从日志归因。
+func logLevel() slog.Level {
+	if verbose || os.Getenv(daemonVerboseEnv) == "1" {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
+}
+
 var (
 	daemonPIDFile string
 	daemonLogFile string
@@ -263,7 +274,7 @@ func runAsDaemonChild() {
 		log.Fatalf("[daemon] cannot open log file: %v", err)
 	}
 	log.SetOutput(rw)
-	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: logLevel()})))
 	log.Printf("[daemon-child] serve process started (PID %d)", os.Getpid())
 }
 
@@ -278,7 +289,7 @@ func RunSupervisor(port int) {
 	}
 	defer rw.Close()
 	log.SetOutput(rw)
-	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: logLevel()})))
 
 	log.Printf("[supervisor] starting (PID %d, port %d)", os.Getpid(), port)
 
