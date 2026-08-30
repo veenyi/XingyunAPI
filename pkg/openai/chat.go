@@ -33,6 +33,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	client := s.getClient(r)
 	home, bodyFor := s.planFor(client, r, &req)
+	// 前缀模型未命中渠道：直接 404，绝不进 plan/自动切换——否则 Plan 会按
+	// tierOf(joycode)=TierAccount 补进付费候选，把不存在的模型静默落到账号计费。
+	if home.Provider == providerMissing {
+		writeError(w, 404, fmt.Sprintf("模型不存在：%s。请检查渠道/模型名，或确认该渠道已启用", req.Model))
+		return
+	}
 	// 先按用户点名的模型登记，自动切换成功后再改成实际使用的模型。
 	store.SetModel(r, home.Model)
 	cands := s.plan(client, home)
@@ -42,6 +48,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.handleNonStreamChat(w, r, cands, bodyFor)
 	}
 }
+
+// providerMissing 是"前缀模型没命中任何渠道"的哨兵 Provider，
+// handleChat 据此在派单前直接报错，不进自动切换。
+const providerMissing = "\x00missing"
 
 // planFor 决定用户点名的模型该派给谁。
 // 免登录 / 自带 Key 渠道按原模型名走，不参与默认模型兜底：
@@ -64,9 +74,9 @@ func (s *Server) planFor(client *joycode.Client, r *http.Request, req *ChatReque
 			return route.Candidate{Upstream: p, Provider: p.Name(), Model: req.Model}, bodyFor
 		}
 	}
-	// 带前缀却没命中任何渠道：宁可明确报错，也不能把 "渠道/模型" 整串发给付费上游。
+	// 带前缀却没命中任何渠道：标记哨兵，由 handleChat 直接 404，绝不落到付费上游。
 	if _, _, ok := route.SplitPrefixedModel(req.Model); ok {
-		return route.Candidate{Upstream: errUpstream{}, Provider: route.JoyCodeProvider, Model: req.Model}, bodyFor
+		return route.Candidate{Upstream: errUpstream{}, Provider: providerMissing, Model: req.Model}, bodyFor
 	}
 	model := ResolveModel(req.Model, store.GetAccountDefaultModel(r), s.systemDefault())
 	return route.Candidate{Upstream: client, Provider: route.JoyCodeProvider, Model: model}, bodyFor

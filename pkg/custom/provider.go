@@ -183,7 +183,8 @@ func (m *Manager) buildProvider(ej ProviderJSON) (*Provider, error) {
 		Enabled:        func() bool { return p.enabled },
 		BaseURL:        func() string { return baseURL },
 		APIKey:         func() string { return p.apiKey },
-		Allow:          p.allowModel,
+		Allow:          p.blocked,       // 手动屏蔽：完整目录与可见名单都消失
+		Visible:        p.visibleFilter, // free_only 付费墙：只从可见名单收缩，探针仍可复活
 		Health:         m.reg,
 		DefaultBaseURL: baseURL,
 	})
@@ -316,11 +317,15 @@ func (m *Manager) RefreshAll() map[string]error {
 	return out
 }
 
-// allowModel 是 compat.Config.Allow：手动屏蔽 + freeOnly 付费墙过滤的总入口。
-func (p *Provider) allowModel(id string) bool {
-	if p.isBlocked(id) {
-		return false
-	}
+// blocked 是 compat.Config.Allow：手动屏蔽名单，作用于完整目录与可见名单。
+// 被屏蔽的模型从目录、路由、看板、探针同时消失（用户主动永久排除的语义）。
+func (p *Provider) blocked(id string) bool {
+	return !p.isBlocked(id)
+}
+
+// visibleFilter 是 compat.Config.Visible：free_only 模式下把踩在付费墙上的模型
+// 从"对外可见名单"里收缩掉，但完整目录（ModelsAll）仍保留，探针能回采复活。
+func (p *Provider) visibleFilter(id string) bool {
 	if p.freeOnly && p.isPaidModel(id) {
 		return false
 	}

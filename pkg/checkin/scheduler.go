@@ -65,27 +65,33 @@ func (m *Manager) run(a *Account) Result {
 			refreshErr = twRefresh(a)
 		}
 		if refreshErr != nil {
-			res.OK = false
-			res.Message = refreshErr.Error()
 			m.updateState(a.ID, func(st *Account) {
 				st.LastRefreshAt = nowStr()
 				st.LastRefreshOK = false
 			})
 			// 凭据可能已轮换，即使刷新失败也要把现有值存回去（refresh token 可能变化）
 			m.persistCredentials(a)
+			// 刷新失败但旧 access token 仍在：继续尝试签到（token 可能还没过期）。
+			// 只有连可用 token 都没有时才放弃，避免"刷新抖动 = 整轮白跑"。
+			if a.AccessToken == "" {
+				res.OK = false
+				res.Message = refreshErr.Error()
+				m.updateState(a.ID, func(st *Account) {
+					st.LastCheckinAt = nowStr()
+					st.LastCheckinOK = false
+					st.LastResult = res.Message
+				})
+				slog.Warn("checkin: token 刷新失败且无可用 access token", "platform", a.Platform, "name", a.Name, "error", refreshErr)
+				return res
+			}
+			slog.Warn("checkin: token 刷新失败，改用现有 access token 继续签到", "platform", a.Platform, "name", a.Name, "error", refreshErr)
+		} else {
+			m.persistCredentials(a)
 			m.updateState(a.ID, func(st *Account) {
-				st.LastCheckinAt = nowStr()
-				st.LastCheckinOK = false
-				st.LastResult = res.Message
+				st.LastRefreshAt = nowStr()
+				st.LastRefreshOK = true
 			})
-			slog.Warn("checkin: token 刷新失败", "platform", a.Platform, "name", a.Name, "error", refreshErr)
-			return res
 		}
-		m.persistCredentials(a)
-		m.updateState(a.ID, func(st *Account) {
-			st.LastRefreshAt = nowStr()
-			st.LastRefreshOK = true
-		})
 	}
 
 	// 2. 签到
@@ -148,20 +154,33 @@ func (m *Manager) stateCredits(id string) int64 {
 	return 0
 }
 
-// persistCredentials 把（可能轮换过的）凭据写回存储。
-// 持 m.mu 防止与 Save 全量覆写竞争导致丢账号。
+// persistCredentials 把（可能轮换过的）凭据以密文写回存储。
+// 持 m.mu 防止与 Save 全量覆写竞争导致丢账号；加密失败则保留原密文，不落明文。
 func (m *Manager) persistCredentials(a *Account) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	accounts := m.loadAccounts()
-	for i := range accounts {
-		if accounts[i].ID == a.ID {
-			accounts[i].AccessToken = a.AccessToken
-			accounts[i].RefreshToken = a.RefreshToken
-			accounts[i].Domain = a.Domain
-			_ = m.saveAccounts(accounts)
-			return
+	stored := m.loadStored()
+	for i := range stored {
+		if stored[i].Account.ID != a.ID {
+			continue
 		}
+		if a.AccessToken != "" {
+			if enc, err := m.store.Encrypt(a.AccessToken); err == nil {
+				stored[i].EncAccess = enc
+			}
+		}
+		if a.RefreshToken != "" {
+			if enc, err := m.store.Encrypt(a.RefreshToken); err == nil {
+				stored[i].EncRefresh = enc
+			}
+		}
+		if a.Domain != "" {
+			stored[i].Account.Domain = a.Domain
+		}
+		stored[i].Account.AccessToken = ""
+		stored[i].Account.RefreshToken = ""
+		_ = m.saveStored(stored)
+		return
 	}
 }
 
@@ -228,32 +247,44 @@ func (m *Manager) Stop() {
 	m.running = false
 }
 
-// tick 检查当前 HH:MM 是否在签到时刻表里；是且今天没签过就跑一轮。
+// tick 检查当前 HH:MM 是否在签到时刻表里；是且今天没成功跑过就跑一轮。
+// 只有批次里至少有一个账号真正触达上游（成功或"已签到"）才标记该时刻完成，
+// 整批因断网等失败则不标记，下一分钟自动重试，避免"一次抖动 = 当天该时刻白跑"。
 func (m *Manager) tick() {
 	m.mu.Lock()
 	now := time.Now()
 	hm := now.Format("15:04")
 	today := now.Format("2006-01-02")
 	due := false
+	var dueTime string
 	for _, t := range m.Times() {
 		if t != hm {
 			continue
 		}
 		if m.today[t] == today {
-			continue // 这个时刻今天已跑过
+			continue // 这个时刻今天已成功跑过
 		}
-		m.today[t] = today
 		due = true
+		dueTime = t
 	}
 	m.mu.Unlock()
 	if !due {
 		return
 	}
 	slog.Info("checkin: 到达定时时刻，开始自动签到", "time", hm)
+	reached := false
 	for _, res := range m.RunAll() {
+		if res.OK || strings.Contains(res.Message, "已签到") {
+			reached = true
+		}
 		if !res.OK && !strings.Contains(res.Message, "已签到") {
 			slog.Warn("checkin: 自动签到失败", "name", res.Name, "reason", res.Message)
 		}
+	}
+	if reached {
+		m.mu.Lock()
+		m.today[dueTime] = today
+		m.mu.Unlock()
 	}
 }
 

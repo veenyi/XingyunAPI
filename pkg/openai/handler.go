@@ -145,6 +145,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	for _, p := range s.extras() {
 		if free, kerr := p.ListModels(); kerr == nil {
 			for _, m := range free {
+				base := m.ModelID
+				if base == "" {
+					base = m.ChatAPIModel
+				}
+				if base == "" {
+					base = m.Label
+				}
+				if base == "" {
+					continue // 空模型名不拼前缀，避免产出 "渠道/" 脏条目
+				}
 				m.ModelID = p.Name() + "/" + m.ModelID
 				m.ChatAPIModel = p.Name() + "/" + m.ChatAPIModel
 				m.Label = p.Name() + "/" + m.Label

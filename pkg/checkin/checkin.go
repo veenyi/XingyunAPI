@@ -135,84 +135,93 @@ type AccountInput struct {
 }
 
 // Save 全量覆写账号列表（与 custom_providers 同一套交互模式）。
+// 密文保持式：未改动的凭据原样保留旧密文（哪怕此刻解不开也不丢账号），
+// 新给的凭据加密失败立即报错——绝不把明文 token 落库。
 func (m *Manager) Save(inputs []AccountInput) error {
 	if m.store == nil {
 		return fmt.Errorf("store unavailable")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	old := map[string]Account{}
-	for _, a := range m.loadAccounts() {
-		old[a.ID] = a
+	old := map[string]storedAccount{}
+	for _, sa := range m.loadStored() {
+		old[sa.Account.ID] = sa
 	}
-	out := make([]Account, 0, len(inputs))
+
+	out := make([]storedAccount, 0, len(inputs))
 	for _, in := range inputs {
 		platform := strings.TrimSpace(strings.ToLower(in.Platform))
 		if platform != PlatformWorkBuddy && platform != PlatformTraeWork {
 			continue
 		}
-		a := Account{
-			ID:           in.ID,
-			Platform:     platform,
-			Name:         strings.TrimSpace(in.Name),
-			UID:          strings.TrimSpace(in.UID),
-			EnterpriseID: strings.TrimSpace(in.EnterpriseID),
-			Domain:       strings.TrimSpace(in.Domain),
-			DeviceID:     strings.TrimSpace(in.DeviceID),
-			MachineID:    strings.TrimSpace(in.MachineID),
-			ApiHost:      strings.TrimSpace(in.ApiHost),
-			Enabled:      in.Enabled,
+		base := old[in.ID]
+		a := base.Account
+		a.Platform = platform
+		a.Enabled = in.Enabled
+		if v := strings.TrimSpace(in.Name); v != "" {
+			a.Name = v
 		}
-		if a.ID == "" {
+		if v := strings.TrimSpace(in.UID); v != "" {
+			a.UID = v
+		}
+		if in.EnterpriseID != "" {
+			a.EnterpriseID = strings.TrimSpace(in.EnterpriseID)
+		}
+		if in.Domain != "" {
+			a.Domain = strings.TrimSpace(in.Domain)
+		}
+		if in.DeviceID != "" {
+			a.DeviceID = strings.TrimSpace(in.DeviceID)
+		}
+		if in.MachineID != "" {
+			a.MachineID = strings.TrimSpace(in.MachineID)
+		}
+		if in.ApiHost != "" {
+			a.ApiHost = strings.TrimSpace(in.ApiHost)
+		}
+		if in.ID == "" {
 			a.ID = fmt.Sprintf("ci_%d", time.Now().UnixNano())
-		}
-		if o, ok := old[a.ID]; ok {
-			if in.AccessToken == "" || in.AccessToken == store.SecretMask {
-				a.AccessToken = o.AccessToken
-			} else {
-				a.AccessToken = in.AccessToken
-			}
-			if in.RefreshToken == "" || in.RefreshToken == store.SecretMask {
-				a.RefreshToken = o.RefreshToken
-			} else {
-				a.RefreshToken = in.RefreshToken
-			}
-			// 这些字段前端可能不回传，空值保留旧值
-			if in.EnterpriseID == "" {
-				a.EnterpriseID = o.EnterpriseID
-			}
-			if in.Domain == "" {
-				a.Domain = o.Domain
-			}
-			if in.DeviceID == "" {
-				a.DeviceID = o.DeviceID
-			}
-			if in.MachineID == "" {
-				a.MachineID = o.MachineID
-			}
-			if in.ApiHost == "" {
-				a.ApiHost = o.ApiHost
-			}
 		} else {
-			a.AccessToken = in.AccessToken
-			a.RefreshToken = in.RefreshToken
+			a.ID = in.ID
 		}
 		if a.Name == "" {
 			a.Name = a.UID
 		}
-		if a.AccessToken == "" && a.RefreshToken == "" {
+
+		sa := storedAccount{Account: a}
+		if tok := in.AccessToken; tok != "" && tok != store.SecretMask {
+			enc, err := m.store.Encrypt(tok)
+			if err != nil {
+				return fmt.Errorf("加密 access token 失败: %w", err)
+			}
+			sa.EncAccess = enc
+		} else {
+			sa.EncAccess = base.EncAccess
+		}
+		if tok := in.RefreshToken; tok != "" && tok != store.SecretMask {
+			enc, err := m.store.Encrypt(tok)
+			if err != nil {
+				return fmt.Errorf("加密 refresh token 失败: %w", err)
+			}
+			sa.EncRefresh = enc
+		} else {
+			sa.EncRefresh = base.EncRefresh
+		}
+		sa.Account.AccessToken = ""
+		sa.Account.RefreshToken = ""
+		if sa.EncAccess == "" && sa.EncRefresh == "" {
 			continue // 没有任何凭据的账号没有意义
 		}
-		out = append(out, a)
+		out = append(out, sa)
 	}
-	if err := m.saveAccounts(out); err != nil {
+	if err := m.saveStored(out); err != nil {
 		return err
 	}
 	// 裁剪已删除账号的孤儿状态，防止 List 越积越多。
 	state := m.loadState()
 	alive := map[string]bool{}
-	for _, a := range out {
-		alive[a.ID] = true
+	for _, sa := range out {
+		alive[sa.Account.ID] = true
 	}
 	pruned := false
 	for id := range state {
@@ -231,14 +240,14 @@ func (m *Manager) Save(inputs []AccountInput) error {
 func (m *Manager) Remove(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	accounts := m.loadAccounts()
-	out := accounts[:0]
-	for _, a := range accounts {
-		if a.ID != id {
-			out = append(out, a)
+	stored := m.loadStored()
+	out := make([]storedAccount, 0, len(stored))
+	for _, sa := range stored {
+		if sa.Account.ID != id {
+			out = append(out, sa)
 		}
 	}
-	if err := m.saveAccounts(out); err != nil {
+	if err := m.saveStored(out); err != nil {
 		return err
 	}
 	state := m.loadState()
@@ -288,7 +297,8 @@ type storedAccount struct {
 	EncRefresh string `json:"enc_refresh,omitempty"`
 }
 
-func (m *Manager) loadAccounts() []Account {
+// loadStored 读取原始存储形态（含密文，不解密）。
+func (m *Manager) loadStored() []storedAccount {
 	if m.store == nil {
 		return nil
 	}
@@ -301,8 +311,15 @@ func (m *Manager) loadAccounts() []Account {
 		slog.Error("checkin: 解析账号失败", "error", err)
 		return nil
 	}
-	out := make([]Account, 0, len(stored.Accounts))
-	for _, sa := range stored.Accounts {
+	return stored.Accounts
+}
+
+// loadAccounts 返回解密后的运行态账号。解密失败的账号仍保留（凭据置空），
+// 下次 Save 会原样保留其密文——绝不因一次解密失败而丢账号。
+func (m *Manager) loadAccounts() []Account {
+	stored := m.loadStored()
+	out := make([]Account, 0, len(stored))
+	for _, sa := range stored {
 		a := sa.Account
 		if sa.EncAccess != "" {
 			if dec, err := m.store.Decrypt(sa.EncAccess); err == nil {
@@ -319,25 +336,9 @@ func (m *Manager) loadAccounts() []Account {
 	return out
 }
 
-func (m *Manager) saveAccounts(accounts []Account) error {
-	stored := storedAccounts{Accounts: make([]storedAccount, 0, len(accounts))}
-	for _, a := range accounts {
-		sa := storedAccount{Account: a}
-		if a.AccessToken != "" {
-			if enc, err := m.store.Encrypt(a.AccessToken); err == nil {
-				sa.EncAccess = enc
-				sa.Account.AccessToken = ""
-			}
-		}
-		if a.RefreshToken != "" {
-			if enc, err := m.store.Encrypt(a.RefreshToken); err == nil {
-				sa.EncRefresh = enc
-				sa.Account.RefreshToken = ""
-			}
-		}
-		stored.Accounts = append(stored.Accounts, sa)
-	}
-	data, err := json.Marshal(stored)
+// saveStored 序列化并写入。调用方保证 token 已是密文（Enc*）且明文已清空。
+func (m *Manager) saveStored(accounts []storedAccount) error {
+	data, err := json.Marshal(storedAccounts{Accounts: accounts})
 	if err != nil {
 		return err
 	}

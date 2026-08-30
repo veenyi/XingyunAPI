@@ -48,7 +48,14 @@ type Config struct {
 	// APIKey 返回上游密钥；返回空串则不带 Authorization。
 	APIKey func() string
 	// Allow 判定目录里的模型是否对外可见；nil 表示全部可见。
+	// 作用于完整目录（CatalogIDs / ModelsAll）与可见名单，用于"永久不该出现"的
+	// 模型（如手动屏蔽名单）——这些模型探针也看不到。
 	Allow func(modelID string) bool
+	// Visible 只收缩"对外可见名单"（ListModels / ModelIDs / Supports），
+	// 不影响 CatalogIDs / ModelsAll。用于"暂时不可用但仍需被探针回采复活"的
+	// 过滤维度（如 free_only 按健康度隐藏付费墙模型）：这类模型从派单名单消失，
+	// 但完整目录里仍在，探针能确认它复活后自动回到可见名单。
+	Visible func(modelID string) bool
 	// Floor 在目录拉不到且无缓存时兜底，避免上游目录端点抖动导致渠道整体消失。
 	Floor func() []string
 
@@ -318,7 +325,9 @@ func (r *replayReader) Read(p []byte) (int, error) {
 
 func (r *replayReader) Close() error { return r.closer.Close() }
 
-// visibleCatalog = 上游实时目录经 Allow 过滤，再扣掉冷却中的模型。
+// visibleCatalog = 上游实时目录经 Allow + Visible 过滤，再扣掉冷却中的模型。
+// Visible 只影响这里（对外可见），不影响 CatalogIDs / ModelsAll——后者保留
+// free_only 暂时隐藏的模型，供探针回采复活。
 func (c *Client) visibleCatalog() []joycode.ModelInfo {
 	ids, err := c.cachedIDs()
 	if err != nil {
@@ -326,6 +335,9 @@ func (c *Client) visibleCatalog() []joycode.ModelInfo {
 	}
 	out := make([]joycode.ModelInfo, 0, len(ids))
 	for _, id := range ids {
+		if c.cfg.Visible != nil && !c.cfg.Visible(id) {
+			continue
+		}
 		if !c.available(id) {
 			continue
 		}

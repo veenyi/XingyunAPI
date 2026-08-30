@@ -1116,8 +1116,12 @@ func (s *Store) SetSetting(key, value string) error {
 
 // SecretSettingKeys 是加密存放、且绝不能原样出现在 HTTP 响应里的设置键。
 // 新增上游凭据类设置只要往这里加一行，读写两侧就都自动受保护。
+// checkin_accounts / custom_providers 是整包凭据 JSON（内含加密 token），
+// 加进来防止 /api/settings 整表输出把凭据 blob 带进浏览器。
 var SecretSettingKeys = map[string]bool{
-	"keyed_api_key": true,
+	"keyed_api_key":    true,
+	"checkin_accounts": true,
+	"custom_providers": true,
 }
 
 // IsSecretSetting 表示这个设置键属于凭据。
