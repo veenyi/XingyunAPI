@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/compat"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/health"
@@ -17,7 +18,12 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
-const settingKey = "custom_providers"
+const (
+	settingKey = "custom_providers"
+	// SettingBlocklist 是手动屏蔽的模型清单：JSON 数组 ["provider|model", ...]。
+	// 看板"隐藏"按钮写这里，被屏蔽的模型从目录与路由里同时消失。
+	SettingBlocklist = "model_blocklist"
+)
 
 // ProviderJSON 是 settings 里的序列化形式：api_key 以 hex 编码的 AES-GCM 密文存放。
 type ProviderJSON struct {
@@ -26,6 +32,10 @@ type ProviderJSON struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key,omitempty"` // 密文（存库）或明文（运行时）
 	Enabled bool   `json:"enabled"`
+	// FreeOnly 只保留免费模型：探针判定为欠费/登录失效（Deposit required、
+	// premium 付费墙）的模型从目录里隐去。官方免费策略随时会变，配合
+	// 定期目录刷新自动跟进，不需要手动维护名单。
+	FreeOnly bool `json:"free_only,omitempty"`
 }
 
 // Provider 是运行时的自定义渠道实例，包装一个 compat.Client 并实现 provider.Keyless。
@@ -35,9 +45,22 @@ type Provider struct {
 	baseURL   string
 	apiKey    string // 已解密
 	enabled   bool
+	freeOnly  bool
 	client    *compat.Client
 	tier      string
 	healthReg *health.Registry
+	mgr       *Manager
+
+	// hidden 缓存 freeOnly 模式下被隐藏的模型集合，30s 刷新一次，
+	// 避免每个请求都去拷贝整张健康表。
+	hiddenMu sync.Mutex
+	hiddenAt time.Time
+	hidden   map[string]bool
+
+	// blockMu/blockList 缓存手动屏蔽名单，10s 刷新一次。
+	blockMu   sync.Mutex
+	blockAt   time.Time
+	blockList map[string]bool
 }
 
 // Manager 持有所有自定义渠道的运行时状态，从 store 加载、向 store 写入。
@@ -65,8 +88,9 @@ type ProviderEntry struct {
 	Name    string `json:"name"`
 	BaseURL string `json:"base_url"`
 	// APIKey 为空或 SecretMask 时不修改；否则视为新凭据。
-	APIKey  string `json:"api_key,omitempty"`
-	Enabled bool   `json:"enabled"`
+	APIKey   string `json:"api_key,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	FreeOnly bool   `json:"free_only,omitempty"`
 }
 
 // ListEntries 返回前端所需的全部渠道条目（含占位密钥）。
@@ -76,11 +100,12 @@ func (m *Manager) ListEntries() []ProviderEntry {
 	out := make([]ProviderEntry, len(m.providers))
 	for i, p := range m.providers {
 		out[i] = ProviderEntry{
-			ID:      p.id,
-			Name:    p.name,
-			BaseURL: p.baseURL,
-			APIKey:  store.SecretMask,
-			Enabled: p.enabled,
+			ID:       p.id,
+			Name:     p.name,
+			BaseURL:  p.baseURL,
+			APIKey:   store.SecretMask,
+			Enabled:  p.enabled,
+			FreeOnly: p.freeOnly,
 		}
 	}
 	return out
@@ -140,7 +165,9 @@ func (m *Manager) buildProvider(ej ProviderJSON) (*Provider, error) {
 		name:    name,
 		baseURL: baseURL,
 		enabled: ej.Enabled,
+		freeOnly: ej.FreeOnly,
 		tier:    provider.TierKeyed,
+		mgr:     m,
 	}
 	if ej.APIKey != "" {
 		dec, err := m.store.Decrypt(ej.APIKey)
@@ -156,6 +183,7 @@ func (m *Manager) buildProvider(ej ProviderJSON) (*Provider, error) {
 		Enabled:        func() bool { return p.enabled },
 		BaseURL:        func() string { return baseURL },
 		APIKey:         func() string { return p.apiKey },
+		Allow:          p.allowModel,
 		Health:         m.reg,
 		DefaultBaseURL: baseURL,
 	})
@@ -184,10 +212,11 @@ func (m *Manager) Save(incoming []ProviderEntry) error {
 			continue
 		}
 		ej := ProviderJSON{
-			ID:      entry.ID,
-			Name:    strings.TrimSpace(entry.Name),
-			BaseURL: strings.TrimSpace(entry.BaseURL),
-			Enabled: entry.Enabled,
+			ID:       entry.ID,
+			Name:     strings.TrimSpace(entry.Name),
+			BaseURL:  strings.TrimSpace(entry.BaseURL),
+			Enabled:  entry.Enabled,
+			FreeOnly: entry.FreeOnly,
 		}
 		switch {
 		case entry.APIKey == "" || entry.APIKey == store.SecretMask:
@@ -257,4 +286,80 @@ func (p *Provider) ChatStream(body map[string]interface{}) (*http.Response, erro
 // CatalogIDs 供 route.KeylessSource 包装为 Source 时使用（通过 catalogLister 接口）。
 func (p *Provider) CatalogIDs() []string {
 	return p.client.CatalogIDs()
+}
+
+// RefreshNow 强制重拉该渠道的模型目录。
+func (p *Provider) RefreshNow() ([]string, error) {
+	return p.client.RefreshNow()
+}
+
+// RefreshAll 强制重拉所有已启用自定义渠道的目录，返回每个渠道的结果。
+func (m *Manager) RefreshAll() map[string]error {
+	out := map[string]error{}
+	for _, p := range m.Providers() {
+		if !p.enabled {
+			continue
+		}
+		if _, err := p.RefreshNow(); err != nil {
+			out[p.name] = err
+		} else {
+			out[p.name] = nil
+		}
+	}
+	return out
+}
+
+// allowModel 是 compat.Config.Allow：手动屏蔽 + freeOnly 付费墙过滤的总入口。
+func (p *Provider) allowModel(id string) bool {
+	if p.isBlocked(id) {
+		return false
+	}
+	if p.freeOnly && p.isPaidModel(id) {
+		return false
+	}
+	return true
+}
+
+// isBlocked 查手动屏蔽名单（settings.model_blocklist，10s 缓存）。
+func (p *Provider) isBlocked(id string) bool {
+	p.blockMu.Lock()
+	defer p.blockMu.Unlock()
+	if p.blockList == nil || time.Since(p.blockAt) > 10*time.Second {
+		p.blockList = map[string]bool{}
+		if p.mgr != nil && p.mgr.store != nil {
+			raw := strings.TrimSpace(p.mgr.store.GetSetting(SettingBlocklist))
+			if raw != "" {
+				var keys []string
+				if json.Unmarshal([]byte(raw), &keys) == nil {
+					for _, k := range keys {
+						p.blockList[strings.TrimSpace(k)] = true
+					}
+				}
+			}
+		}
+		p.blockAt = time.Now()
+	}
+	return p.blockList[strings.ToLower(p.name+"|"+id)] ||
+		p.blockList[strings.ToLower(health.Key(p.name, id))]
+}
+
+// isPaidModel 判定模型当前是否踩在付费墙上：探针/真实流量把该模型标记为
+// 欠费（no_credit）或登录失效（auth_failed，B.AI 的 "Deposit required to
+// unlock premium models" 归这类）时视为付费。30s 缓存健康表快照。
+func (p *Provider) isPaidModel(id string) bool {
+	if p.healthReg == nil {
+		return false
+	}
+	p.hiddenMu.Lock()
+	defer p.hiddenMu.Unlock()
+	if p.hidden == nil || time.Since(p.hiddenAt) > 30*time.Second {
+		p.hidden = map[string]bool{}
+		for key, st := range p.healthReg.Snapshot() {
+			if st.Class == health.ClassNoCredit || st.Class == health.ClassAuth {
+				p.hidden[strings.ToLower(key)] = true
+			}
+		}
+		p.hiddenAt = time.Now()
+	}
+	return p.hidden[strings.ToLower(health.Key(p.name, id))]
 }

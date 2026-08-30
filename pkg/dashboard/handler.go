@@ -28,7 +28,10 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/proxy"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/checkin"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/custom"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyfree"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyed"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
@@ -45,6 +48,11 @@ type Handler struct {
 	Keyless []provider.Keyless
 	// CustomProviders 是用户自定义渠道管理器，为 nil 时不暴露。
 	CustomProviders *custom.Manager
+	// KeyfreeClient / KeyedClient 用于"刷新渠道"按钮强制重拉目录。
+	KeyfreeClient *keyfree.Client
+	KeyedClient   *keyed.Client
+	// CheckinManager 是签到中心管理器，为 nil 时签到接口返回 503。
+	CheckinManager *checkin.Manager
 	// Route 负责候选排序与冷却记账；为 nil 时看板聊天只按用户点名的模型走一次。
 	Route *route.Router
 	// Version is the proxy version reported by /api/health; set by the server
@@ -87,6 +95,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stats", h.handleStats)
 	mux.HandleFunc("/api/settings", h.handleSettings)
 	mux.HandleFunc("/api/custom_providers", h.handleCustomProviders)
+	mux.HandleFunc("/api/channels/refresh", h.handleChannelsRefresh)
+	mux.HandleFunc("/api/model-blocklist", h.handleModelBlocklist)
+	h.registerCheckinRoutes(mux)
 	mux.HandleFunc("/api/health", h.handleHealth)
 	mux.HandleFunc("/api/errors", h.handleErrors)
 	mux.HandleFunc("/api/github-stars", h.handleGitHubStars)
@@ -1727,8 +1738,7 @@ func (h *Handler) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleCustomProviders 提供自定义渠道的 GET（列出）和 PUT（保存）接口。
-// GET  返回 []ProviderEntry，api_key 一律为 SecretMask 占位。
+// handleCustomProviders GET 列出 / PUT 保存自定义渠道。
 // PUT  接收 []ProviderEntry，将 api_key 加密后写入 settings.custom_providers。
 func (h *Handler) handleCustomProviders(w http.ResponseWriter, r *http.Request) {
 	setCors(w)
@@ -1757,6 +1767,131 @@ func (h *Handler) handleCustomProviders(w http.ResponseWriter, r *http.Request) 
 		// 重新加载以刷新内存中的客户端实例（无需重启）。
 		if err := h.CustomProviders.Load(); err != nil {
 			slog.Error("custom: reload after save failed", "error", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleChannelsRefresh POST /api/channels/refresh — 强制重拉所有免登录渠道
+// 的模型目录。免费名单随官方策略变动，看板"刷新"按钮走这里立即生效，
+// 不必等 6h 目录缓存过期。
+func (h *Handler) handleChannelsRefresh(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	results := map[string]interface{}{}
+	if h.KeyfreeClient != nil {
+		ids, err := h.KeyfreeClient.Client.RefreshNow()
+		entry := map[string]interface{}{"count": len(ids)}
+		if err != nil {
+			entry["error"] = err.Error()
+		}
+		results["opencode-free"] = entry
+	}
+	if h.KeyedClient != nil {
+		ids, err := h.KeyedClient.Client.RefreshNow()
+		entry := map[string]interface{}{"count": len(ids)}
+		if err != nil {
+			entry["error"] = err.Error()
+		}
+		results["keyed"] = entry
+	}
+	if h.CustomProviders != nil {
+		for name, err := range h.CustomProviders.RefreshAll() {
+			entry := map[string]interface{}{}
+			if err != nil {
+				entry["error"] = err.Error()
+			}
+			results[name] = entry
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "results": results})
+}
+
+// handleModelBlocklist GET 列出 / PUT 覆写 / POST 增删单条 — 手动屏蔽模型。
+// 被屏蔽的模型从目录、路由与模型与渠道页面同时消失。
+func (h *Handler) handleModelBlocklist(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if h.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	raw := strings.TrimSpace(h.store.GetSetting(custom.SettingBlocklist))
+	readList := func() []string {
+		if raw == "" {
+			return []string{}
+		}
+		var keys []string
+		if json.Unmarshal([]byte(raw), &keys) != nil {
+			return []string{}
+		}
+		return keys
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]interface{}{"blocked": readList()})
+	case http.MethodPut:
+		var body struct {
+			Blocked []string `json:"blocked"`
+		}
+		if !readJSONBody(w, r, &body) {
+			return
+		}
+		cleaned := make([]string, 0, len(body.Blocked))
+		for _, k := range body.Blocked {
+			if k = strings.TrimSpace(k); k != "" {
+				cleaned = append(cleaned, strings.ToLower(k))
+			}
+		}
+		data, _ := json.Marshal(cleaned)
+		if err := h.store.SetSetting(custom.SettingBlocklist, string(data)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "count": len(cleaned)})
+	case http.MethodPost:
+		var body struct {
+			Key    string `json:"key"`    // "provider|model"
+			Hidden bool   `json:"hidden"` // true=屏蔽 false=恢复
+		}
+		if !readJSONBody(w, r, &body) {
+			return
+		}
+		key := strings.ToLower(strings.TrimSpace(body.Key))
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "key is required")
+			return
+		}
+		set := map[string]bool{}
+		for _, k := range readList() {
+			set[k] = true
+		}
+		if body.Hidden {
+			set[key] = true
+		} else {
+			delete(set, key)
+		}
+		out := make([]string, 0, len(set))
+		for k := range set {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		data, _ := json.Marshal(out)
+		if err := h.store.SetSetting(custom.SettingBlocklist, string(data)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 	default:

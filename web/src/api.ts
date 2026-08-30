@@ -61,6 +61,40 @@ export interface CustomProvider {
   base_url: string;
   api_key?: string;
   enabled: boolean;
+  free_only?: boolean;
+}
+
+// --- 签到中心 ---
+
+export interface CheckinAccount {
+  id: string;
+  platform: 'workbuddy' | 'traework';
+  name: string;
+  uid: string;
+  access_token?: string;
+  refresh_token?: string;
+  enterprise_id?: string;
+  domain?: string;
+  device_id?: string;
+  machine_id?: string;
+  api_host?: string;
+  enabled: boolean;
+  last_checkin_at?: string;
+  last_checkin_ok?: boolean;
+  last_result?: string;
+  credits?: number;
+  credits_total?: number;
+  last_refresh_at?: string;
+  last_refresh_ok?: boolean;
+}
+
+export interface CheckinResult {
+  id: string;
+  name: string;
+  platform: string;
+  ok: boolean;
+  message: string;
+  credits?: number;
 }
 
 export interface Settings {
@@ -270,6 +304,25 @@ export const api = {
     request<{ providers: CustomProvider[] }>('/api/custom_providers').then(r => r.providers ?? []),
   saveCustomProviders: (providers: CustomProvider[]) =>
     request<{ ok: boolean }>('/api/custom_providers', { method: 'PUT', body: JSON.stringify(providers) }),
+  refreshChannels: () =>
+    request<{ ok: boolean; results: Record<string, unknown> }>('/api/channels/refresh', { method: 'POST' }),
+  getModelBlocklist: () =>
+    request<{ blocked: string[] }>('/api/model-blocklist').then(r => r.blocked ?? []),
+  setModelHidden: (key: string, hidden: boolean) =>
+    request<{ ok: boolean }>('/api/model-blocklist', { method: 'POST', body: JSON.stringify({ key, hidden }) }),
+  // --- 签到中心 ---
+  listCheckin: () =>
+    request<{ accounts: CheckinAccount[]; times: string[] }>('/api/checkin/accounts'),
+  saveCheckinAccounts: (accounts: CheckinAccount[]) =>
+    request<{ ok: boolean }>('/api/checkin/accounts', { method: 'PUT', body: JSON.stringify({ accounts }) }),
+  removeCheckinAccount: (id: string) =>
+    request<{ ok: boolean }>(`/api/checkin/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  runCheckin: (opts: { id?: string; all?: boolean }) =>
+    request<{ results: CheckinResult[] }>('/api/checkin/run', { method: 'POST', body: JSON.stringify(opts) }),
+  getCheckinConfig: () =>
+    request<{ times: string[] }>('/api/checkin/config').then(r => r.times),
+  saveCheckinConfig: (times: string[]) =>
+    request<{ ok: boolean; times: string[] }>('/api/checkin/config', { method: 'PUT', body: JSON.stringify({ times }) }),
   getHealth: () => request<{ status: string; accounts: number }>('/api/health'),
   updateAccountModel: (userId: string, defaultModel: string) =>
     request<{ ok: boolean }>(`/api/accounts/${encodeURIComponent(userId)}/model`, {

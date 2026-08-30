@@ -30,6 +30,9 @@ var (
 const (
 	catalogTTL     = 6 * time.Hour
 	catalogFailTTL = 5 * time.Minute
+	// catalogTimeout 只管目录拉取。聊天流可能持续数分钟，共享 client 的
+	// 10min 超时没问题；但目录请求要是也挂 10 分钟，看板刷新就会一直转圈。
+	catalogTimeout = 30 * time.Second
 )
 
 // Config 描述一个 OpenAI 兼容上游。除 Name 外必须给出 Enabled：
@@ -391,18 +394,48 @@ func (c *Client) floorIDs() []string {
 }
 
 func (c *Client) fetchCatalog() ([]string, error) {
-	req, err := c.newRequest(http.MethodGet, c.baseURL()+"/models", nil)
+	ids, err := c.fetchCatalogAt(c.baseURL() + "/models")
+	if err == nil {
+		return ids, nil
+	}
+	// base_url 忘写 /v1 是最常见配错：仅在主路径明确 404（路径不存在）时
+	// 才补试 {base}/v1/models；5xx/网络错误不重试，避免把抖动的上游打得更死。
+	var nf *notFoundError
+	if !errors.As(err, &nf) {
+		return nil, err
+	}
+	alt := strings.TrimRight(c.baseURL(), "/") + "/v1/models"
+	if ids2, err2 := c.fetchCatalogAt(alt); err2 == nil {
+		slog.Info("compat: 目录在 /v1/models 上取得，建议直接把 /v1 写进 base_url", "provider", c.cfg.Name)
+		return ids2, nil
+	}
+	return nil, err
+}
+
+// notFoundError 标记"主路径 404"，供 /v1 兜底判断。
+type notFoundError struct{ detail string }
+
+func (e *notFoundError) Error() string { return e.detail }
+
+func (c *Client) fetchCatalogAt(url string) ([]string, error) {
+	req, err := c.newRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.httpClient.Do(req)
+	client := *c.httpClient
+	client.Timeout = catalogTimeout
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, Snippet(raw))
+		msg := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, Snippet(raw))
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, &notFoundError{detail: msg}
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var payload struct {
 		Data []struct {
@@ -422,6 +455,17 @@ func (c *Client) fetchCatalog() ([]string, error) {
 		return nil, fmt.Errorf("目录为空")
 	}
 	return ids, nil
+}
+
+// RefreshNow 强制作废目录缓存并重拉一次。看板的"刷新渠道"按钮与
+// 后台定期刷新都走这里：免费渠道的名单随官方策略变动，不能等满 6h TTL。
+func (c *Client) RefreshNow() ([]string, error) {
+	c.mu.Lock()
+	c.catalog = nil
+	c.catalogAt = time.Time{}
+	c.catalogFail = time.Time{}
+	c.mu.Unlock()
+	return c.cachedIDs()
 }
 
 

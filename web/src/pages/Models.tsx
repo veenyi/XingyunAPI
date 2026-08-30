@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import {
-  Alert, Button, Card, Space, Table, Tag, Tooltip, message,
+  Alert, Button, Card, Space, Switch, Table, Tag, Tooltip, message,
 } from 'antd';
 import {
   HolderOutlined, ReloadOutlined, SaveOutlined, QuestionCircleOutlined,
+  EyeInvisibleOutlined,
 } from '@ant-design/icons';
 import {
   DndContext, closestCenter, KeyboardSensor, PointerSensor,
@@ -68,6 +69,7 @@ const ModelsPage: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [onlyAvailable, setOnlyAvailable] = useState(false);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor),
@@ -86,7 +88,30 @@ const ModelsPage: React.FC = () => {
     }
   };
 
+  // 刷新：先强制重拉各渠道目录（免费名单随官方策略变动，可能已有新模型），
+  // 再重新加载状态表。目录刷新失败不阻塞状态展示。
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      await api.refreshChannels().catch(() => undefined);
+      await load();
+      message.success('已刷新渠道目录与模型状态');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => { load(); }, []);
+
+  const hideModel = async (record: ModelStatus) => {
+    try {
+      await api.setModelHidden(`${record.provider}|${record.model}`, true);
+      message.success(`已隐藏 ${record.provider} / ${record.model}，可从系统设置的屏蔽名单恢复`);
+      load();
+    } catch (e: unknown) {
+      message.error(e instanceof Error ? e.message : '隐藏失败');
+    }
+  };
 
   const handleDragEnd = ({ active, over }: DragEndEvent) => {
     if (!over || active.id === over.id) return;
@@ -129,6 +154,7 @@ const ModelsPage: React.FC = () => {
 
   const coolingCount = rows.filter((m) => m.status === 'cooling').length;
   const providers = Array.from(new Set(rows.map((m) => m.provider)));
+  const visibleRows = onlyAvailable ? rows.filter((m) => m.status !== 'cooling') : rows;
 
   const columns = [
     {
@@ -163,6 +189,21 @@ const ModelsPage: React.FC = () => {
       },
     },
     {
+      title: '操作',
+      key: 'actions',
+      width: 60,
+      render: (_: unknown, record: ModelStatus) => (
+        <Tooltip title="从模型列表与自动切换中隐藏（付费/不可用模型可在此屏蔽）">
+          <Button
+            size="small"
+            type="text"
+            icon={<EyeInvisibleOutlined />}
+            onClick={() => hideModel(record)}
+          />
+        </Tooltip>
+      ),
+    },
+    {
       title: (
         <Space size={4}>
           说明
@@ -191,7 +232,13 @@ const ModelsPage: React.FC = () => {
             <div className="jc-banner-title">模型与渠道</div>
           </div>
           <Space>
-            <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新</Button>
+            <Tooltip title="强制重拉各渠道模型目录（免费名单随官方策略变动），再加载状态">
+              <Button icon={<ReloadOutlined />} onClick={refresh} loading={loading}>刷新</Button>
+            </Tooltip>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+              <Switch size="small" checked={onlyAvailable} onChange={setOnlyAvailable} />
+              只看可用
+            </span>
             <Button onClick={reset} disabled={saving || rows.length === 0}>恢复默认顺序</Button>
             <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={!dirty}>
               保存顺序
@@ -219,7 +266,7 @@ const ModelsPage: React.FC = () => {
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
           <SortableContext items={rows.map(keyOf)} strategy={verticalListSortingStrategy}>
             <Table
-              dataSource={rows}
+              dataSource={visibleRows}
               columns={columns}
               rowKey={keyOf}
               loading={loading}

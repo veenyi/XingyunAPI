@@ -7,6 +7,7 @@ import {
   SettingOutlined,
   MessageOutlined,
   CheckCircleOutlined,
+  GiftOutlined,
   GithubOutlined,
   StarFilled,
   LogoutOutlined,
@@ -27,6 +28,7 @@ const menuItems = [
   { key: '/chat', icon: <MessageOutlined />, label: '聊天' },
   { key: '/accounts', icon: <TeamOutlined />, label: '账号管理' },
   { key: '/models', icon: <AppstoreOutlined />, label: '模型与渠道' },
+  { key: '/checkin', icon: <GiftOutlined />, label: '签到中心' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
 ];
 
@@ -57,6 +59,8 @@ const MainLayout: React.FC = () => {
   const selectedKey = location.pathname.startsWith('/accounts') ? '/accounts'
     : location.pathname.startsWith('/settings') ? '/settings'
     : location.pathname.startsWith('/chat') ? '/chat'
+    : location.pathname.startsWith('/models') ? '/models'
+    : location.pathname.startsWith('/checkin') ? '/checkin'
     : '/dashboard';
 
   return (

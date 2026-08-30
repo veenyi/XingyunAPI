@@ -22,3 +22,15 @@ xingyun-api/app/bin/
 xingyun-api/
 *.db
 *.log
+
+# 本地构建产物与调试残留（不入库）
+/JoyCode2Api.exe
+/JoyCode2Api-new/
+/JoyCode2Api_x64_v*/
+/JoyCode2Api_arm64_v*/
+/.scratch/
+/astream.txt
+/stream-out.txt
+/out-off.json
+/out-on.json
+/out-on2.json

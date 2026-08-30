@@ -33,6 +33,7 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyed"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyfree"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/logrot"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/checkin"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/openai"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/probe"
@@ -149,6 +150,7 @@ var serveCmd = &cobra.Command{
 			keyless []provider.Keyless
 			cust        *custom.Manager
 			sources func() []route.Source
+			ck          *checkin.Manager
 		)
 		if s != nil {
 			// 一张健康表管所有渠道：路由与 /v1/models 必须对"这个模型现在能不能用"
@@ -200,6 +202,11 @@ var serveCmd = &cobra.Command{
 				return out
 			})
 			prober.Start()
+
+			// 签到中心：多平台（WorkBuddy/TraeWork）每日自动签到 + token 保活。
+			// 凭据加密存库，调度时刻由签到中心页面配置（默认每天 09:00）。
+			ck = checkin.New(s, Version)
+			ck.Start()
 		}
 
 		// Start credential keepalive: check every 1min, refresh accounts older than 1h
@@ -367,8 +374,43 @@ var serveCmd = &cobra.Command{
 			dash.Route = rt
 			dash.Keyless = keyless
 			dash.CustomProviders = cust
+			dash.KeyfreeClient = kf
+			dash.KeyedClient = kd
+			dash.CheckinManager = ck
 			dash.RegisterRoutes(mux)
 			mux.HandleFunc("/", dash.ServeStatic)
+
+			// 免费渠道目录定期刷新：免费名单随官方策略变动（新上/下架/转付费），
+			// 不能等满 6h 缓存。间隔由 catalog_refresh_minutes 控制，默认 30 分钟。
+			go func() {
+				minutes := s.GetIntSetting("catalog_refresh_minutes", 30)
+				if minutes < 5 {
+					minutes = 5
+				}
+				ticker := time.NewTicker(time.Duration(minutes) * time.Minute)
+				defer ticker.Stop()
+				refreshAll := func() {
+					if kf != nil {
+						_, _ = kf.Client.RefreshNow()
+					}
+					if kd != nil {
+						_, _ = kd.Client.RefreshNow()
+					}
+					if cust != nil {
+						cust.RefreshAll()
+					}
+					slog.Info("catalog: 免费渠道目录定期刷新完成")
+				}
+				refreshAll()
+				for {
+					select {
+					case <-ticker.C:
+						refreshAll()
+					case <-stopCh:
+						return
+					}
+				}
+			}()
 		}
 
 		var handler http.Handler = mux
@@ -460,6 +502,10 @@ var serveCmd = &cobra.Command{
 			log.Printf("Server shutdown error: %v", err)
 		}
 		keeper.Stop()
+		if ck != nil {
+			// 签到调度会往 store 写状态，必须在关库之前停。
+			ck.Stop()
+		}
 		if prober != nil {
 			// 探针会往 store 写健康状态，必须在关库之前停。
 			prober.Stop()

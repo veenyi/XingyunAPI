@@ -533,6 +533,7 @@ const SettingsPage: React.FC = () => {
         >
           <div style={{ fontSize: 13, color: 'var(--jc-fg-muted)', lineHeight: 1.8, marginBottom: 12 }}>
             添加任意 OpenAI 兼容的上游地址和 Key，模型会直接出现在渠道列表中，与免费模型 / API Key 渠道并列。每个渠道独立计费边界，不会串用额度。
+            填根地址即可（会自动尝试 /v1/models）；开启「仅免费模型」后，探针判定为付费墙（欠费/登录失效）的模型自动隐藏，并随目录定期刷新自动跟进官方策略。
           </div>
           {customProviders.map((cp, idx) => (
             <div key={cp.id} style={{ borderBottom: idx < customProviders.length - 1 ? '1px solid var(--jc-border)' : 'none', paddingBottom: 16, marginBottom: 16 }}>
@@ -542,19 +543,24 @@ const SettingsPage: React.FC = () => {
                     <Input placeholder="例如：OpenRouter" value={cp.name} onChange={e => updateCustomProvider(cp.id, 'name', e.target.value)} />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={10}>
+                <Col xs={24} md={9}>
                   <Form.Item label="Base URL" style={{ marginBottom: 0 }}>
                     <Input placeholder="https://api.openai.com/v1" value={cp.base_url} onChange={e => updateCustomProvider(cp.id, 'base_url', e.target.value)} />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={6}>
+                <Col xs={24} md={5}>
                   <Form.Item label="API Key" style={{ marginBottom: 0 }}>
                     <Input.Password placeholder="sk-..." value={cp.api_key} onChange={e => updateCustomProvider(cp.id, 'api_key', e.target.value)} visibilityToggle={false} />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={2}>
+                <Col xs={12} md={2}>
                   <Form.Item label="启用" style={{ marginBottom: 0 }}>
                     <Switch checked={cp.enabled} onChange={v => updateCustomProvider(cp.id, 'enabled', v)} />
+                  </Form.Item>
+                </Col>
+                <Col xs={12} md={2}>
+                  <Form.Item label="仅免费" style={{ marginBottom: 0 }}>
+                    <Switch checked={!!cp.free_only} onChange={v => updateCustomProvider(cp.id, 'free_only', v)} />
                   </Form.Item>
                 </Col>
               </Row>
