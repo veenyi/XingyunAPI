@@ -332,6 +332,12 @@ export const api = {
     request<{ times: string[] }>('/api/checkin/config').then(r => r.times),
   saveCheckinConfig: (times: string[]) =>
     request<{ ok: boolean; times: string[] }>('/api/checkin/config', { method: 'PUT', body: JSON.stringify({ times }) }),
+  wbLoginInit: () =>
+    request<{ ok: boolean; session_id: string; auth_url: string }>('/api/checkin/wb_login/init', { method: 'POST' }),
+  wbLoginStatus: (session: string) =>
+    request<{ status: string; account?: { uid: string; nickname: string; enterprise_id: string; domain: string }; message?: string }>(
+      `/api/checkin/wb_login/status?session=${encodeURIComponent(session)}`,
+    ),
   getHealth: () => request<{ status: string; accounts: number }>('/api/health'),
   updateAccountModel: (userId: string, defaultModel: string) =>
     request<{ ok: boolean }>(`/api/accounts/${encodeURIComponent(userId)}/model`, {

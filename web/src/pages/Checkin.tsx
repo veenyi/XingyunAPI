@@ -1,12 +1,14 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import {
   Alert, Button, Card, Empty, Form, Input, Modal, Popconfirm, Select,
-  Space, Spin, Switch, Tag, TimePicker, Tooltip, message,
+  Space, Spin, Switch, Tag, TimePicker, Tooltip, Typography, message,
 } from 'antd';
 import {
   PlusOutlined, ReloadOutlined, CheckCircleOutlined, DeleteOutlined,
   GiftOutlined, ClockCircleOutlined, QuestionCircleOutlined, EditOutlined,
+  QrcodeOutlined,
 } from '@ant-design/icons';
+import { QRCodeCanvas } from 'qrcode.react';
 import dayjs from 'dayjs';
 import { api } from '../api';
 import type { CheckinAccount } from '../api';
@@ -41,6 +43,15 @@ const CheckinPage: React.FC = () => {
   const [editing, setEditing] = useState<CheckinAccount | null>(null);
   const [form] = Form.useForm();
 
+  // WorkBuddy 扫码登录
+  const [wbOpen, setWbOpen] = useState(false);
+  const [wbStatus, setWbStatus] = useState<'loading' | 'waiting' | 'ok' | 'expired' | 'error'>('loading');
+  const [wbAuthURL, setWbAuthURL] = useState('');
+  const [wbMsg, setWbMsg] = useState('');
+  const wbSessionRef = useRef('');
+  const wbTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const wbStop = () => { if (wbTimerRef.current) { clearTimeout(wbTimerRef.current); wbTimerRef.current = undefined; } };
+
   const load = async () => {
     setLoading(true);
     try {
@@ -54,7 +65,46 @@ const CheckinPage: React.FC = () => {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => wbStop(), []);
+
+  const wbPoll = useCallback(async () => {
+    if (!wbSessionRef.current) return;
+    try {
+      const r = await api.wbLoginStatus(wbSessionRef.current);
+      if (r.status === 'ok') {
+        setWbStatus('ok');
+        setWbMsg(`已登录：${r.account?.nickname || r.account?.uid || ''}`);
+        wbStop();
+        load();
+        return;
+      }
+      if (r.status === 'expired') { setWbStatus('expired'); setWbMsg(r.message || '二维码已过期'); wbStop(); return; }
+      if (r.status === 'error') { setWbStatus('error'); setWbMsg(r.message || '登录失败'); wbStop(); return; }
+      setWbStatus('waiting');
+      if (r.message) setWbMsg(r.message);
+      wbTimerRef.current = setTimeout(wbPoll, 2000);
+    } catch (e: unknown) {
+      setWbStatus('error'); setWbMsg(e instanceof Error ? e.message : '轮询失败'); wbStop();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const wbStart = useCallback(async () => {
+    wbStop();
+    setWbStatus('loading'); setWbMsg(''); setWbAuthURL('');
+    try {
+      const r = await api.wbLoginInit();
+      wbSessionRef.current = r.session_id;
+      setWbAuthURL(r.auth_url);
+      setWbStatus('waiting');
+      wbTimerRef.current = setTimeout(wbPoll, 1500);
+    } catch (e: unknown) {
+      setWbStatus('error'); setWbMsg(e instanceof Error ? e.message : '发起登录失败');
+    }
+  }, [wbPoll]);
+
+  const openWBLogin = () => { setWbOpen(true); wbStart(); };
+  const closeWBLogin = () => { wbStop(); setWbOpen(false); };
 
   const openAdd = () => {
     setEditing(null);
@@ -154,7 +204,8 @@ const CheckinPage: React.FC = () => {
             <Button type="primary" icon={<CheckCircleOutlined />} onClick={() => run({ all: true })} loading={running} disabled={accounts.length === 0}>
               全部签到
             </Button>
-            <Button type="primary" ghost icon={<PlusOutlined />} onClick={openAdd}>添加账号</Button>
+            <Button icon={<QrcodeOutlined />} onClick={openWBLogin}>扫码登录 WorkBuddy</Button>
+            <Button type="primary" ghost icon={<PlusOutlined />} onClick={openAdd}>手动添加</Button>
           </Space>
         </div>
       </div>
@@ -244,6 +295,41 @@ const CheckinPage: React.FC = () => {
           </div>
         )}
       </Card>
+
+      <Modal
+        title="扫码登录 WorkBuddy"
+        open={wbOpen}
+        onCancel={closeWBLogin}
+        footer={[
+          <Button key="refresh" icon={<ReloadOutlined />} onClick={wbStart}>重新获取二维码</Button>,
+          <Button key="close" type="primary" onClick={closeWBLogin}>{wbStatus === 'ok' ? '完成' : '关闭'}</Button>,
+        ]}
+        width={420}
+        destroyOnClose
+      >
+        <div style={{ textAlign: 'center', padding: '8px 0 4px' }}>
+          {wbStatus === 'loading' && <Spin style={{ margin: '40px auto' }} tip="正在生成二维码…" ><div style={{ height: 120 }} /></Spin>}
+          {(wbStatus === 'waiting' || wbStatus === 'ok') && wbAuthURL && (
+            <>
+              <QRCodeCanvas value={wbAuthURL} size={200} style={{ margin: '0 auto', display: wbStatus === 'ok' ? 'none' : 'block' }} />
+              <div style={{ marginTop: 12, color: 'var(--jc-fg-muted)', fontSize: 13 }}>
+                {wbStatus === 'ok'
+                  ? <Space direction="vertical"><CheckCircleOutlined style={{ color: '#52c41a', fontSize: 28 }} />{wbMsg || '登录成功，账号已添加'}</Space>
+                  : '用手机微信扫码，或在已登录 WorkBuddy 的浏览器中打开下方链接完成授权'}
+              </div>
+              {wbStatus === 'waiting' && (
+                <Typography.Link href={wbAuthURL} target="_blank" style={{ fontSize: 12, wordBreak: 'break-all', display: 'inline-block', marginTop: 8 }}>
+                  点此打开授权页 →
+                </Typography.Link>
+              )}
+            </>
+          )}
+          {(wbStatus === 'expired' || wbStatus === 'error') && (
+            <Alert type="warning" showIcon message={wbMsg || (wbStatus === 'expired' ? '二维码已过期' : '登录失败')} style={{ textAlign: 'left' }}
+              description="点「重新获取二维码」再试一次。" />
+          )}
+        </div>
+      </Modal>
 
       <Modal
         title={editing ? '编辑签到账号' : '添加签到账号'}

@@ -90,10 +90,12 @@ type Manager struct {
 	runMu  sync.Mutex
 	// today 记录调度器已签到的日期（本地时区），防止同一天重复。
 	today map[string]string
+	// wbSessions 暂存进行中的 WorkBuddy 扫码登录会话（sessionID → state），带 TTL。
+	wbSessions map[string]*wbLoginSession
 }
 
 func New(s *store.Store, version string) *Manager {
-	return &Manager{store: s, version: version, today: map[string]string{}}
+	return &Manager{store: s, version: version, today: map[string]string{}, wbSessions: map[string]*wbLoginSession{}}
 }
 
 // --- 账号 CRUD ---
