@@ -62,6 +62,10 @@ type Config struct {
 	// Health 只用于"读"：可见名单会过滤掉冷却中的模型。
 	// 失败与恢复由 pkg/route 统一记录，避免一次请求被计两次而把冷却越拉越长。
 	Health *health.Registry
+
+	// AllowLocal 放行 http 与 loopback/内网地址：freepool 这类渠道目的就是
+	// 连管理员主动配置的本地聚合代理（9Router/FreeLLMAPI），公网 SSRF 闸门不适用。
+	AllowLocal bool
 }
 
 // Client 实现 provider.Chat 与 provider.Keyless 所需的方法面。
@@ -76,11 +80,15 @@ type Client struct {
 }
 
 func New(cfg Config) *Client {
+	redirectGuard := func(req *http.Request, _ []*http.Request) error { return common.GuardPublicHTTPS(req.URL) }
+	if cfg.AllowLocal {
+		redirectGuard = func(*http.Request, []*http.Request) error { return nil }
+	}
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout:       10 * time.Minute,
-			CheckRedirect: func(req *http.Request, _ []*http.Request) error { return common.GuardPublicHTTPS(req.URL) },
+			CheckRedirect: redirectGuard,
 		},
 	}
 }
@@ -98,7 +106,11 @@ func (c *Client) Enabled() bool {
 func (c *Client) baseURL() string {
 	if c.cfg.BaseURL != nil {
 		if v := strings.TrimSpace(c.cfg.BaseURL()); v != "" {
-			normalized, err := common.NormalizeBaseURL(v)
+			norm := common.NormalizeBaseURL
+			if c.cfg.AllowLocal {
+				norm = common.NormalizeBaseURLLocal
+			}
+			normalized, err := norm(v)
 			if err != nil {
 				slog.Warn("compat: base_url 无效，使用内置地址", "provider", c.cfg.Name, "error", err)
 				return c.cfg.DefaultBaseURL

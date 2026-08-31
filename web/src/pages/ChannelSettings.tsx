@@ -28,8 +28,10 @@ const CHANNEL_FIELDS: FieldConfig[] = [
   { key: 'keyfree_base_url', label: 'OpenCode 池地址', tooltip: '留空使用内置 https://opencode.ai/zen/v1；仅上游域名变更时填写。', placeholder: 'https://opencode.ai/zen/v1', type: 'input', tag: '可选' },
   { key: 'router9_enabled', label: '9Router 免费池', tooltip: '接入本地运行的 9Router（开源免费模型聚合代理）。它把几十上百个免费上游聚合到一个 OpenAI 兼容端点，行云挂上后即可用其整个免费目录并加入免费池轮询。需你自行部署 9Router。', placeholder: 'false', type: 'switch', defaultOff: true, tag: '已生效' },
   { key: 'router9_base_url', label: '9Router 地址', tooltip: '9Router 的 OpenAI 兼容基地址，默认 http://localhost:20128/v1（与行云同机部署时）。填根地址会自动尝试 /v1/models。', placeholder: 'http://localhost:20128/v1', type: 'input', tag: '已生效' },
+  { key: 'router9_api_key', label: '9Router 访问 Key', tooltip: '9Router 自身有访问 Key 门禁（在其 Dashboard 生成）。填这里，行云服务端加密存放、调用 9Router 时自动带上。', placeholder: '粘贴 9Router 的 API Key', type: 'password', tag: '已生效' },
   { key: 'freellm_enabled', label: 'FreeLLMAPI 免费池', tooltip: '接入本地运行的 FreeLLMAPI（开源免费模型聚合代理，34 家上游 / 数百免费模型）。同 9Router，需你自行部署后填地址。', placeholder: 'false', type: 'switch', defaultOff: true, tag: '已生效' },
   { key: 'freellm_base_url', label: 'FreeLLMAPI 地址', tooltip: 'FreeLLMAPI 的 OpenAI 兼容基地址，默认 http://localhost:8787/v1。', placeholder: 'http://localhost:8787/v1', type: 'input', tag: '已生效' },
+  { key: 'freellm_api_key', label: 'FreeLLMAPI 访问 Key', tooltip: '若 FreeLLMAPI 配了访问 Key 则填这里，服务端加密存放。', placeholder: '粘贴访问 Key（无则留空）', type: 'password', tag: '可选' },
   { key: 'keyed_enabled', label: '自有 API Key 渠道', tooltip: '填入你自己的上游 API Key，把该账号下全部模型并入统一入口。Key 加密存放，保存后不再明文回显。', placeholder: 'false', type: 'switch', defaultOff: true, tag: '已生效' },
   { key: 'keyed_preset', label: 'API Key 预设', tooltip: '没手填地址时打哪儿。也可在「自定义渠道」里添加更多官方免费层渠道（Groq/Cerebras/魔搭/硅基流动等）。', placeholder: '智谱开放平台', type: 'select', options: [
     { label: '智谱开放平台', value: 'bigmodel' },

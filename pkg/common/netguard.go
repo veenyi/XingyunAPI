@@ -52,3 +52,25 @@ func NormalizeBaseURL(raw string) (string, error) {
 	}
 	return v, nil
 }
+
+// NormalizeBaseURLLocal 是 freepool 这类"故意连本地聚合代理"的宽松版：
+// 允许 http 与 loopback / 内网主机（9Router、FreeLLMAPI 常跑在 localhost），
+// 但仍要求是能解析的绝对 http(s) URL。公网 SSRF 闸门在这里不适用，因为
+// 地址由管理员在渠道设置里主动填写、目的就是连本地服务。
+func NormalizeBaseURLLocal(raw string) (string, error) {
+	v := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if v == "" {
+		return "", fmt.Errorf("地址为空")
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("仅支持 http/https，当前 %q", u.Scheme)
+	}
+	if strings.TrimSpace(u.Hostname()) == "" {
+		return "", fmt.Errorf("地址缺少主机名")
+	}
+	return v, nil
+}

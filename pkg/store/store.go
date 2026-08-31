@@ -1119,9 +1119,11 @@ func (s *Store) SetSetting(key, value string) error {
 // checkin_accounts / custom_providers 是整包凭据 JSON（内含加密 token），
 // 加进来防止 /api/settings 整表输出把凭据 blob 带进浏览器。
 var SecretSettingKeys = map[string]bool{
-	"keyed_api_key":    true,
+	"keyed_api_key":   true,
 	"checkin_accounts": true,
 	"custom_providers": true,
+	"router9_api_key": true,
+	"freellm_api_key": true,
 }
 
 // IsSecretSetting 表示这个设置键属于凭据。

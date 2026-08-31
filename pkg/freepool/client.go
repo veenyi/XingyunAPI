@@ -22,24 +22,28 @@ var (
 	_ provider.Tiered  = (*Client)(nil)
 )
 
-// Settings 只读取普通设置（这些渠道免 Key，不涉及密文设置）。
+// Settings 读取普通设置 + 可选访问密钥（部分本地聚合代理自身带鉴权门禁）。
 type Settings interface {
 	GetSetting(key string) string
+	GetSecretSetting(key string) string
 }
 
 // Client 是一个免 Key 聚合代理渠道。
 type Client struct{ *compat.Client }
 
-// New 构造一个免费池代理渠道。enabledKey/baseKey 是各自的设置开关，
+// New 构造一个免费池代理渠道。enabledKey/baseKey/apiKeyKey 是各自的设置键，
 // defaultURL 是留空时使用的地址（本地代理默认 http，GuardPublicHTTPS 只拦重定向）。
-func New(name, enabledKey, baseKey, defaultURL, version string, s Settings, reg *health.Registry) *Client {
+// apiKeyKey 可选：9Router 这类代理自身有访问 Key 门禁，需要 行云 带上它的 Key。
+func New(name, enabledKey, baseKey, apiKeyKey, defaultURL, version string, s Settings, reg *health.Registry) *Client {
 	return &Client{compat.New(compat.Config{
 		Name:           name,
 		Version:        version,
 		DefaultBaseURL: defaultURL,
 		Enabled:        func() bool { return common.SettingEnabled(s, enabledKey) },
 		BaseURL:        func() string { return strings.TrimSpace(s.GetSetting(baseKey)) },
+		APIKey:         func() string { return strings.TrimSpace(s.GetSecretSetting(apiKeyKey)) },
 		Health:         reg,
+		AllowLocal:     true, // 本地聚合代理常是 http://localhost，放行 http/loopback
 	})}
 }
 
@@ -47,25 +51,27 @@ func New(name, enabledKey, baseKey, defaultURL, version string, s Settings, reg 
 // 绝不漂到用户的行云订阅账号或自带 Key 上。
 func (c *Client) Tier() string { return provider.TierFree }
 
-// 内置两个常见免 Key 聚合代理的默认地址与设置键。
+// 内置两个常见聚合代理的默认地址与设置键。
 const (
 	Router9Name       = "9router"
 	Router9EnabledKey = "router9_enabled"
 	Router9BaseKey    = "router9_base_url"
+	Router9APIKey     = "router9_api_key"
 	Router9DefaultURL = "http://localhost:20128/v1"
 
 	FreeLLMName       = "freellmapi"
 	FreeLLMEnabledKey = "freellm_enabled"
 	FreeLLMBaseKey    = "freellm_base_url"
+	FreeLLMAPIKey     = "freellm_api_key"
 	FreeLLMDefaultURL = "http://localhost:8787/v1"
 )
 
 // NewRouter9 接入本地 9Router（默认 http://localhost:20128/v1）。
 func NewRouter9(version string, s Settings, reg *health.Registry) *Client {
-	return New(Router9Name, Router9EnabledKey, Router9BaseKey, Router9DefaultURL, version, s, reg)
+	return New(Router9Name, Router9EnabledKey, Router9BaseKey, Router9APIKey, Router9DefaultURL, version, s, reg)
 }
 
 // NewFreeLLM 接入本地 FreeLLMAPI（默认 http://localhost:8787/v1）。
 func NewFreeLLM(version string, s Settings, reg *health.Registry) *Client {
-	return New(FreeLLMName, FreeLLMEnabledKey, FreeLLMBaseKey, FreeLLMDefaultURL, version, s, reg)
+	return New(FreeLLMName, FreeLLMEnabledKey, FreeLLMBaseKey, FreeLLMAPIKey, FreeLLMDefaultURL, version, s, reg)
 }
