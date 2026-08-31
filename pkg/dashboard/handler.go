@@ -30,6 +30,7 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/checkin"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/custom"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/freepool"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyfree"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyed"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
@@ -51,6 +52,9 @@ type Handler struct {
 	// KeyfreeClient / KeyedClient 用于"刷新渠道"按钮强制重拉目录。
 	KeyfreeClient *keyfree.Client
 	KeyedClient   *keyed.Client
+	// Router9Client / FreeLLMClient 是免 Key 聚合代理渠道，同样纳入强制刷新。
+	Router9Client *freepool.Client
+	FreeLLMClient *freepool.Client
 	// CheckinManager 是签到中心管理器，为 nil 时签到接口返回 503。
 	CheckinManager *checkin.Manager
 	// Route 负责候选排序与冷却记账；为 nil 时看板聊天只按用户点名的模型走一次。
@@ -1818,6 +1822,22 @@ func (h *Handler) handleChannelsRefresh(w http.ResponseWriter, r *http.Request) 
 			entry["error"] = err.Error()
 		}
 		results["keyed"] = entry
+	}
+	if h.Router9Client != nil {
+		ids, err := h.Router9Client.Client.RefreshNow()
+		entry := map[string]interface{}{"count": len(ids)}
+		if err != nil {
+			entry["error"] = err.Error()
+		}
+		results["9router"] = entry
+	}
+	if h.FreeLLMClient != nil {
+		ids, err := h.FreeLLMClient.Client.RefreshNow()
+		entry := map[string]interface{}{"count": len(ids)}
+		if err != nil {
+			entry["error"] = err.Error()
+		}
+		results["freellmapi"] = entry
 	}
 	if h.CustomProviders != nil {
 		for name, err := range h.CustomProviders.RefreshAll() {

@@ -31,6 +31,7 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keepalive"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyed"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/freepool"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyfree"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/logrot"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/checkin"
@@ -146,6 +147,8 @@ var serveCmd = &cobra.Command{
 			reg     *health.Registry
 			kf      *keyfree.Client
 			kd      *keyed.Client
+			r9      *freepool.Client
+			fl      *freepool.Client
 			rt      *route.Router
 			keyless []provider.Keyless
 			cust        *custom.Manager
@@ -162,27 +165,38 @@ var serveCmd = &cobra.Command{
 
 			kf = keyfree.New(s, Version, reg)
 			kd = keyed.New(s, Version, reg)
+			r9 = freepool.NewRouter9(Version, s, reg)
+			fl = freepool.NewFreeLLM(Version, s, reg)
 			rt = route.New(s, reg)
-			srv.Keyfree = kf
-			srv.Keyed = kd
-			srv.Extras = func() []provider.Keyless { return cust.KeylessList() }
-			srv.Route = rt
-			anth.Keyfree = kf
-			anth.Keyed = kd
-			anth.Extras = func() []provider.Keyless { return cust.KeylessList() }
-			anth.Route = rt
 			cust = custom.New(s, Version)
 			cust.SetRegistry(reg)
 			if err := cust.Load(); err != nil {
 				slog.Warn("custom: 加载自定义渠道失败", "error", err)
 			}
-			keyless = append([]provider.Keyless{kf, kd}, cust.KeylessList()...)
+			// keylessAll 汇总所有免 Key / 自带 Key / 免费池代理 / 自定义渠道，
+			// 探针、看板、路由、聊天都读这一份，避免各处过滤口径不一致。
+			keylessAll := func() []provider.Keyless {
+				return append([]provider.Keyless{kf, kd, r9, fl}, cust.KeylessList()...)
+			}
+			// 聊天路径：Keyfree/Keyed 是固定槽，其余（免费池代理 + 自定义）走 Extras。
+			extrasAll := func() []provider.Keyless {
+				return append([]provider.Keyless{r9, fl}, cust.KeylessList()...)
+			}
+			srv.Keyfree = kf
+			srv.Keyed = kd
+			srv.Extras = extrasAll
+			srv.Route = rt
+			anth.Keyfree = kf
+			anth.Keyed = kd
+			anth.Extras = extrasAll
+			anth.Route = rt
+			keyless = keylessAll()
 
 			// 当前参与路由的渠道名单：探针、看板、路由都读这一份，
 			// 免得三处各自过滤"哪个渠道开着"得出不同答案。
 			sources = func() []route.Source {
 				return append([]route.Source{route.JoyCodeSource(client)},
-					route.KeylessSources(append([]provider.Keyless{kf, kd}, cust.KeylessList()...))...)
+					route.KeylessSources(keylessAll())...)
 			}
 
 			// 主动嗅探：默认关闭（探针会真实消耗额度），打开后按间隔敲一遍候选，
@@ -191,7 +205,7 @@ var serveCmd = &cobra.Command{
 			// 它的存活由账号保活负责，不该由探针白烧。
 			prober = probe.New(s, reg, func() []probe.Candidate {
 				var out []probe.Candidate
-				for _, src := range route.KeylessSources(append([]provider.Keyless{kf, kd}, cust.KeylessList()...)) {
+				for _, src := range route.KeylessSources(keylessAll()) {
 					// 冷却中的模型已经被可见名单剔除，探针必须看得见它们才能确认复活。
 					list := src.ModelsAll
 					if list == nil {
@@ -378,6 +392,8 @@ var serveCmd = &cobra.Command{
 			dash.CustomProviders = cust
 			dash.KeyfreeClient = kf
 			dash.KeyedClient = kd
+			dash.Router9Client = r9
+			dash.FreeLLMClient = fl
 			dash.CheckinManager = ck
 			dash.RegisterRoutes(mux)
 			mux.HandleFunc("/", dash.ServeStatic)
@@ -397,6 +413,12 @@ var serveCmd = &cobra.Command{
 					}
 					if kd != nil {
 						_, _ = kd.Client.RefreshNow()
+					}
+					if r9 != nil {
+						_, _ = r9.Client.RefreshNow()
+					}
+					if fl != nil {
+						_, _ = fl.Client.RefreshNow()
 					}
 					if cust != nil {
 						cust.RefreshAll()

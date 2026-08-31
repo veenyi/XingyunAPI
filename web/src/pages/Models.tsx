@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
-  Alert, Button, Card, Space, Switch, Table, Tag, Tooltip, message,
+  Alert, Button, Card, Space, Switch, Table, Tabs, Tag, Tooltip, message,
 } from 'antd';
 import {
   HolderOutlined, ReloadOutlined, SaveOutlined, QuestionCircleOutlined,
@@ -16,6 +16,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { api } from '../api';
 import type { ModelStatus } from '../api';
+import ChannelSettings from './ChannelSettings';
 
 // 与后端 route.defaultMaxRotate 一致：排得再长，一次请求也只会试前 N 个候选。
 const MAX_ROTATE = 3;
@@ -223,45 +224,35 @@ const ModelsPage: React.FC = () => {
     },
   ];
 
-  return (
-    <div className="jc-page">
-      <div className="jc-banner">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-          <div>
-            <div className="jc-banner-sub">多渠道聚合 · 模型可用性</div>
-            <div className="jc-banner-title">模型与渠道</div>
-          </div>
-          <Space>
-            <Tooltip title="强制重拉各渠道模型目录（免费名单随官方策略变动），再加载状态">
-              <Button icon={<ReloadOutlined />} onClick={refresh} loading={loading}>刷新</Button>
-            </Tooltip>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
-              <Switch size="small" checked={onlyAvailable} onChange={setOnlyAvailable} />
-              只看可用
+  const listTab = (
+    <>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginBottom: 12 }}>
+        <Alert
+          type="info"
+          showIcon
+          style={{ flex: 1, minWidth: 280 }}
+          message="这张名单就是自动切换的派单顺序"
+          description={
+            <span>
+              拖动行左侧手柄调整顺序，保存后即生效（无需重启）。在「渠道设置」开启限流自动切换后，
+              某模型被限流、欠费或掉线时会自动往下一个可用候选派单；一次请求最多尝试前 {MAX_ROTATE} 个候选。
+              当前渠道：{providers.join('、') || '仅 JoyCode'}
+              {coolingCount > 0 ? `，其中 ${coolingCount} 个模型正在冷却` : ''}。
             </span>
-            <Button onClick={reset} disabled={saving || rows.length === 0}>恢复默认顺序</Button>
-            <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={!dirty}>
-              保存顺序
-            </Button>
-          </Space>
-        </div>
-      </div>
-
-      <Alert
-        type="info"
-        showIcon
-        style={{ marginBottom: 16 }}
-        message="这张名单就是自动切换的派单顺序"
-        description={
-          <span>
-            拖动行左侧手柄调整顺序，保存后即生效（无需重启）。开启「系统设置 → 限流自动切换」后，
-            某模型被限流、欠费或掉线时会自动往下一个可用候选派单；一次请求最多尝试前 {MAX_ROTATE} 个候选。
-            当前渠道：{providers.join('、') || '仅 JoyCode'}
-            {coolingCount > 0 ? `，其中 ${coolingCount} 个模型正在冷却` : ''}。
+          }
+        />
+        <Space>
+          <Tooltip title="强制重拉各渠道模型目录（免费名单随官方策略变动），再加载状态">
+            <Button icon={<ReloadOutlined />} onClick={refresh} loading={loading}>刷新</Button>
+          </Tooltip>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+            <Switch size="small" checked={onlyAvailable} onChange={setOnlyAvailable} />
+            只看可用
           </span>
-        }
-      />
-
+          <Button onClick={reset} disabled={saving || rows.length === 0}>恢复默认顺序</Button>
+          <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={!dirty}>保存顺序</Button>
+        </Space>
+      </div>
       <Card size="small">
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
           <SortableContext items={rows.map(keyOf)} strategy={verticalListSortingStrategy}>
@@ -277,7 +268,7 @@ const ModelsPage: React.FC = () => {
               locale={{
                 emptyText: (
                   <div style={{ padding: '24px 16px', color: '#64748b', lineHeight: 1.8, maxWidth: 520, margin: '0 auto' }}>
-                    暂无可选渠道。在「系统设置 → 多渠道与自动切换」里打开免登录渠道或填入自带 Key 渠道的 API Key 后刷新本页。
+                    暂无可选渠道。在「渠道设置」里打开免费池（9Router / FreeLLMAPI / OpenCode）或填入自带 Key 渠道后刷新本页。
                   </div>
                 ),
               }}
@@ -285,6 +276,24 @@ const ModelsPage: React.FC = () => {
           </SortableContext>
         </DndContext>
       </Card>
+    </>
+  );
+
+  return (
+    <div className="jc-page">
+      <div className="jc-banner">
+        <div>
+          <div className="jc-banner-sub">多渠道聚合 · 免费池 · 模型可用性</div>
+          <div className="jc-banner-title">模型与渠道</div>
+        </div>
+      </div>
+      <Tabs
+        defaultActiveKey="list"
+        items={[
+          { key: 'list', label: '模型列表', children: listTab },
+          { key: 'channels', label: '渠道设置', children: <ChannelSettings /> },
+        ]}
+      />
     </div>
   );
 };

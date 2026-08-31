@@ -6,10 +6,10 @@ import {
 import {
   SaveOutlined, ReloadOutlined, QuestionCircleOutlined,
   SettingOutlined, CheckCircleOutlined, InfoCircleOutlined, LockOutlined,
-  ApiOutlined, CopyOutlined, EyeInvisibleOutlined,
+  ApiOutlined, CopyOutlined,
 } from '@ant-design/icons';
 import { api, authApi, clearToken } from '../api';
-import type { Settings, CustomProvider, ChannelPreset } from '../api';
+import type { Settings } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 
 
@@ -56,101 +56,6 @@ const FIELD_GROUPS: { title: string; fields: FieldConfig[] }[] = [
         tooltip: '客户端未指定 max_tokens 时的默认值。更大值允许更长回复，但消耗更多配额',
         placeholder: '8192',
         type: 'number' as const,
-        tag: '已生效',
-      },
-    ],
-  },
-  {
-    title: '渠道与自动切换',
-    fields: [
-      {
-        key: 'keyfree_enabled',
-        label: '免费模型渠道',
-        tooltip: '无需任何凭据的公共模型池（不占账号、不参与保活）。开启后这些模型会出现在 /v1/models 里，可直接按模型名调用',
-        placeholder: 'false',
-        type: 'switch' as const,
-        defaultOff: true,
-        tag: '已生效',
-      },
-      {
-        key: 'keyfree_base_url',
-        label: '免费模型渠道地址',
-        tooltip: '留空使用内置默认地址；仅在上游域名变更时填写',
-        placeholder: 'https://opencode.ai/zen/v1',
-        type: 'input' as const,
-        tag: '可选',
-      },
-      {
-        key: 'keyed_enabled',
-        label: '自有 API Key 渠道',
-        tooltip: '填入你自己的上游 API Key，即可把该账号下的全部模型并入统一入口。Key 加密存放，保存后不再明文回显',
-        placeholder: 'false',
-        type: 'switch' as const,
-        defaultOff: true,
-        tag: '已生效',
-      },
-      {
-        key: 'keyed_preset',
-        label: 'API Key 预设',
-        tooltip: '决定没手填地址时打哪儿。NVIDIA 免费端点：在 build.nvidia.com 注册后生成 nvapi- 开头的 Key，一把 Key 即可调用该账号可见的全部免费模型（实测目录接口免鉴权可列 83 个）。要接别的站点不用改这里，直接在下栏填地址即可覆盖',
-        placeholder: '智谱开放平台',
-        type: 'select' as const,
-        options: [
-          { label: '智谱开放平台', value: 'bigmodel' },
-          { label: 'NVIDIA 免费端点（build.nvidia.com）', value: 'nvidia' },
-          { label: 'B.AI（meta.ai 开放平台）', value: 'bai' },
-        ],
-        tag: '已生效',
-      },
-      {
-        key: 'keyed_base_url',
-        label: 'API Key 渠道地址',
-        tooltip: 'OpenAI 兼容的 /v1 基地址，填在这里会覆盖上面的预设；留空即按预设走（默认智谱 https://open.bigmodel.cn/api/paas/v4）',
-        placeholder: '留空则使用所选预设的地址',
-        type: 'input' as const,
-        tag: '已生效',
-      },
-      {
-        key: 'keyed_api_key',
-        label: 'API Key 渠道密钥',
-        tooltip: '上游账号密钥，加密存放。框内显示的是占位符，不是密钥本身；空白表示尚未配置，清空并保存即删除',
-        placeholder: '粘贴上游 API Key',
-        type: 'password' as const,
-        tag: '已生效',
-      },
-      {
-        key: 'keyed_extra_models',
-        label: 'API Key 渠道补录模型',
-        tooltip: '上游 /models 不展示但仍能调用的模型，用逗号或空格分隔填在这里。目录拉不到时也以这份名单为准，留空表示完全跟随上游目录',
-        placeholder: 'glm-4.7, glm-4-flash',
-        type: 'input' as const,
-        tag: '已生效',
-      },
-      {
-        key: 'route_failover_enabled',
-        label: '限流自动切换',
-        tooltip: '当前模型被限流、欠费或掉线时，按「模型与渠道」页排好的顺序自动换到下一个可用模型，而不是直接报错。只在同一计费边界内切换：免费模型渠道、自有 API Key 渠道、行云账号三者互不串；同边界内没有可用候选就照常报错，不会把你的请求偷偷换成别人买单的模型',
-        placeholder: 'false',
-        type: 'switch' as const,
-        defaultOff: true,
-        tag: '已生效',
-      },
-      {
-        key: 'health_probe_enabled',
-        label: '主动探测模型可用性',
-        tooltip: '定期用一条最短对话敲一遍免费模型 / 自有 API Key 渠道的模型，提前发现 429 与掉线，不用等用户撞墙。注意：探针会消耗真实额度',
-        placeholder: 'false',
-        type: 'switch' as const,
-        defaultOff: true,
-        tag: '已生效',
-      },
-      {
-        key: 'health_probe_interval_seconds',
-        label: '探测间隔（秒）',
-        tooltip: '两轮探测之间的等待时间，最小 30 秒。改完下一轮自动生效',
-        placeholder: '300',
-        type: 'number' as const,
-        suffix: '秒',
         tag: '已生效',
       },
     ],
@@ -245,32 +150,12 @@ const FIELD_GROUPS: { title: string; fields: FieldConfig[] }[] = [
 const SettingsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]);
-  const [savingCustom, setSavingCustom] = useState(false);
-  const [presets, setPresets] = useState<ChannelPreset[]>([]);
-  const [blocklist, setBlocklist] = useState<string[]>([]);
   const [changePwLoading, setChangePwLoading] = useState(false);
   const [aggKey, setAggKey] = useState('sk-joy-aggregate');
   const [rotating, setRotating] = useState(false);
   const [modelOptions, setModelOptions] = useState<{ label: string; value: string }[]>([]);
   const [form] = Form.useForm();
   const [pwForm] = Form.useForm();
-
-  // 加载内置免费渠道预设 + 屏蔽名单
-  useEffect(() => {
-    api.getChannelPresets().then(setPresets).catch(() => {});
-    api.getModelBlocklist().then(setBlocklist).catch(() => {});
-  }, []);
-
-  const unblockModel = async (key: string) => {
-    try {
-      await api.setModelHidden(key, false);
-      setBlocklist((prev) => prev.filter((k) => k !== key));
-      message.success('已恢复显示');
-    } catch (e: unknown) {
-      message.error(e instanceof Error ? e.message : '恢复失败');
-    }
-  };
 
   // 加载上游实时模型列表（default_model 下拉）
   useEffect(() => {
@@ -309,7 +194,7 @@ const SettingsPage: React.FC = () => {
     }
   };
 
-  useEffect(() => { fetchSettings(); api.getCustomProviders().then(setCustomProviders).catch(() => {}); }, [form]);
+  useEffect(() => { fetchSettings(); }, [form]);
 
   const handleSave = async (values: Settings) => {
     setSaving(true);
@@ -324,36 +209,6 @@ const SettingsPage: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  };
-
-  const handleSaveCustomProviders = async () => {
-    setSavingCustom(true);
-    try {
-      await api.saveCustomProviders(customProviders);
-      message.success('自定义渠道已保存');
-    } catch (e: unknown) {
-      message.error(e instanceof Error ? e.message : '保存失败');
-    } finally {
-      setSavingCustom(false);
-    }
-  };
-
-  const addCustomProvider = () => {
-    setCustomProviders(prev => [...prev, {
-      id: 'cp_' + Date.now(),
-      name: '',
-      base_url: '',
-      api_key: '',
-      enabled: true,
-    }]);
-  };
-
-  const removeCustomProvider = (id: string) => {
-    setCustomProviders(prev => prev.filter(p => p.id !== id));
-  };
-
-  const updateCustomProvider = (id: string, field: string, value: string | boolean) => {
-    setCustomProviders(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p));
   };
 
   const handleChangePassword = async (values: { old_password: string; new_password: string }) => {
@@ -542,110 +397,9 @@ const SettingsPage: React.FC = () => {
             </Row>
           </Card>
         ))}
-        
 
-        <Card
-          size="small"
-          style={{ marginBottom: 16 }}
-          title={<span className="jc-section-title"><ApiOutlined />自定义渠道</span>}
-        >
-          <div style={{ fontSize: 13, color: 'var(--jc-fg-muted)', lineHeight: 1.8, marginBottom: 12 }}>
-            添加任意 OpenAI 兼容的上游地址和 Key，模型会直接出现在渠道列表中，与免费模型 / API Key 渠道并列。每个渠道独立计费边界，不会串用额度。
-            填根地址即可（会自动尝试 /v1/models）；开启「仅免费」后该渠道加入免费池轮询，探针判定为付费墙（欠费/登录失效）的模型自动隐藏。
-          </div>
-          {presets.length > 0 && (
-            <div style={{ marginBottom: 12 }}>
-              <span style={{ fontSize: 13, color: 'var(--jc-fg-muted)', marginRight: 8 }}>快速添加官方免费渠道：</span>
-              <Select
-                style={{ minWidth: 320 }}
-                placeholder="选择预设（B.AI / NVIDIA / Groq / 魔搭 / 硅基流动…）"
-                value={null}
-                options={presets.map((p) => ({ label: `${p.name} — ${p.note}`, value: p.id }))}
-                onChange={(id) => {
-                  const p = presets.find((x) => x.id === id);
-                  if (!p) return;
-                  setCustomProviders((prev) => [...prev, {
-                    id: 'cp_' + Date.now(),
-                    name: p.name,
-                    base_url: p.base_url,
-                    api_key: '',
-                    enabled: true,
-                    free_only: true,
-                  }]);
-                  message.info(`已添加 ${p.name} 预设，填入你的官方 Key 后保存即可`);
-                }}
-              />
-            </div>
-          )}
-          {customProviders.map((cp, idx) => (
-            <div key={cp.id} style={{ borderBottom: idx < customProviders.length - 1 ? '1px solid var(--jc-border)' : 'none', paddingBottom: 16, marginBottom: 16 }}>
-              <Row gutter={[16, 8]} align="middle">
-                <Col xs={24} md={6}>
-                  <Form.Item label="渠道名称" style={{ marginBottom: 0 }}>
-                    <Input placeholder="例如：OpenRouter" value={cp.name} onChange={e => updateCustomProvider(cp.id, 'name', e.target.value)} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} md={9}>
-                  <Form.Item label="Base URL" style={{ marginBottom: 0 }}>
-                    <Input placeholder="https://api.openai.com/v1" value={cp.base_url} onChange={e => updateCustomProvider(cp.id, 'base_url', e.target.value)} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} md={5}>
-                  <Form.Item label="API Key" style={{ marginBottom: 0 }}>
-                    <Input.Password placeholder="sk-..." value={cp.api_key} onChange={e => updateCustomProvider(cp.id, 'api_key', e.target.value)} visibilityToggle={false} />
-                  </Form.Item>
-                </Col>
-                <Col xs={12} md={2}>
-                  <Form.Item label="启用" style={{ marginBottom: 0 }}>
-                    <Switch checked={cp.enabled} onChange={v => updateCustomProvider(cp.id, 'enabled', v)} />
-                  </Form.Item>
-                </Col>
-                <Col xs={12} md={2}>
-                  <Form.Item label="仅免费" style={{ marginBottom: 0 }}>
-                    <Switch checked={!!cp.free_only} onChange={v => updateCustomProvider(cp.id, 'free_only', v)} />
-                  </Form.Item>
-                </Col>
-              </Row>
-              <div style={{ textAlign: 'right' }}>
-                <Button size="small" danger onClick={() => removeCustomProvider(cp.id)}>删除</Button>
-              </div>
-            </div>
-          ))}
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <Button size="small" icon={<SaveOutlined />} onClick={handleSaveCustomProviders} loading={savingCustom}>保存渠道</Button>
-            <Button size="small" icon={<ReloadOutlined />} onClick={() => { api.getCustomProviders().then(setCustomProviders).catch(() => {}); }}>刷新</Button>
-          </div>
-          <div style={{ marginTop: 12 }}>
-            <Button size="small" type="dashed" onClick={addCustomProvider}>+ 添加渠道</Button>
-          </div>
-        </Card>
 
-        <Card
-          size="small"
-          style={{ marginBottom: 16 }}
-          title={<span className="jc-section-title"><EyeInvisibleOutlined />隐藏的模型（{blocklist.length}）</span>}
-          extra={(
-            <Tooltip title="在「模型与渠道」页点隐藏按钮加入这里；被隐藏的模型不出现在模型列表与自动切换中。">
-              <QuestionCircleOutlined style={{ color: '#bbb' }} />
-            </Tooltip>
-          )}
-        >
-          {blocklist.length === 0 ? (
-            <div style={{ fontSize: 13, color: 'var(--jc-fg-muted)' }}>
-              暂无隐藏的模型。付费/不可用模型可在「模型与渠道」页一键隐藏。
-            </div>
-          ) : (
-            <Space size={[8, 8]} wrap>
-              {blocklist.map((k) => (
-                <Tag key={k} closable onClose={() => unblockModel(k)} style={{ fontSize: 13 }}>
-                  {k}
-                </Tag>
-              ))}
-            </Space>
-          )}
-        </Card>
-
-                {FIELD_GROUPS.slice(1).map((group) => (
+        {FIELD_GROUPS.slice(1).map((group) => (
           <Card
             key={group.title}
             size="small"
