@@ -3,6 +3,7 @@ package checkin
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -104,23 +105,33 @@ func (m *Manager) run(a *Account) Result {
 	}
 
 	// 3. 积分查询（签到成功或已签到都查）
-	if checkinErr == nil || strings.Contains(checkinErr.Error(), "已签到") {
-		if remain, total, err := m.credits(a); err == nil {
+	already := errors.Is(checkinErr, errAlreadyCheckedIn)
+	if checkinErr == nil || already || strings.Contains(fmt.Sprint(checkinErr), "已签到") {
+		remain, total, cerr := m.credits(a)
+		if cerr == nil {
 			res.Credits = remain
 			m.updateState(a.ID, func(st *Account) {
 				st.Credits = remain
 				st.CreditsTotal = total
 			})
+		} else {
+			// 积分查询失败不能静默：UI 会显示"—"，必须留痕。
+			slog.Warn("checkin: 查询积分失败", "platform", a.Platform, "name", a.Name, "error", cerr)
 		}
 	}
 
-	if checkinErr != nil {
-		res.OK = false
-		res.Message = checkinErr.Error()
-	} else {
+	switch {
+	case checkinErr == nil:
 		res.OK = true
 		res.Message = "签到成功"
 		res.Credits = m.stateCredits(a.ID)
+	case already:
+		res.OK = true
+		res.Message = "今日已签到"
+		res.Credits = m.stateCredits(a.ID)
+	default:
+		res.OK = false
+		res.Message = checkinErr.Error()
 	}
 	m.updateState(a.ID, func(st *Account) {
 		st.LastCheckinAt = nowStr()

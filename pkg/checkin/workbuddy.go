@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -119,35 +120,62 @@ func wbRefresh(a *Account) error {
 	return nil
 }
 
-// wbCheckin 执行 WorkBuddy 每日签到。已签到的业务错误原样返回给调用方展示。
+// errAlreadyCheckedIn 表示"今天已经签过到"——这是成功状态而非失败。
+var errAlreadyCheckedIn = fmt.Errorf("今日已签到")
+
+// wbBillingDo 发计费请求并返回原始响应体；HTTP >=400 也把 body 带回来，
+// 因为"今天已签到"这类业务状态包在 400 里。
+func wbBillingDo(req *http.Request) (int, []byte, error) {
+	resp, err := checkinHTTP.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, raw, nil
+}
+
+// wbEnvelope 业务信封。
+type wbEnvelope struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Msg     string `json:"msg"`
+}
+
+func (e wbEnvelope) text() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Msg
+}
+
+// wbCheckin 执行 WorkBuddy 每日签到。"今天已签到"（HTTP 400 + code 10001）
+// 是成功状态，返回 errAlreadyCheckedIn 而非错误。
 func wbCheckin(a *Account) error {
 	req, err := http.NewRequest(http.MethodPost, wbBillingBaseCN+"/v2/billing/meter/daily-checkin", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return err
 	}
 	wbBillingHeaders(req, a)
-	data, err := doJSON(req)
+	status, raw, err := wbBillingDo(req)
 	if err != nil {
 		return err
 	}
-	// 业务 code 非 0 也算失败（如"今日已签到"），把消息透出。
-	var resp struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Msg     string `json:"msg"`
-		Success *bool  `json:"success"`
+	var env wbEnvelope
+	_ = json.Unmarshal(raw, &env)
+	msg := env.text()
+	if status >= 400 {
+		// 400 + "已签到" 语义 = 已成功；其余 400+ 才是失败。
+		if env.Code == 10001 || strings.Contains(msg, "已签到") {
+			return errAlreadyCheckedIn
+		}
+		return fmt.Errorf("HTTP %d: %s", status, truncate(string(raw), 160))
 	}
-	if json.Unmarshal(data, &resp) == nil {
-		msg := resp.Message
-		if msg == "" {
-			msg = resp.Msg
+	if env.Code != 0 {
+		if env.Code == 10001 || strings.Contains(msg, "已签到") {
+			return errAlreadyCheckedIn
 		}
-		if resp.Code != 0 {
-			return fmt.Errorf("code=%d %s", resp.Code, msg)
-		}
-		if resp.Success != nil && !*resp.Success {
-			return fmt.Errorf("%s", msg)
-		}
+		return fmt.Errorf("code=%d %s", env.Code, msg)
 	}
 	return nil
 }
@@ -169,9 +197,21 @@ func wbCredits(a *Account) (remain, total int64, err error) {
 		return 0, 0, err
 	}
 	wbBillingHeaders(req, a)
-	data, err := doJSON(req)
+	status, rawResp, err := wbBillingDo(req)
 	if err != nil {
 		return 0, 0, err
+	}
+	// 完整信封 {code,msg,data}：业务数据在 data 里，先解出来。
+	var env struct {
+		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rawResp, &env); err != nil {
+		return 0, 0, fmt.Errorf("积分响应解析失败: %w", err)
+	}
+	if status >= 400 || env.Code != 0 {
+		return 0, 0, fmt.Errorf("HTTP %d code=%d %s", status, env.Code, truncate(string(rawResp), 200))
 	}
 	var resp struct {
 		Response struct {
@@ -187,7 +227,7 @@ func wbCredits(a *Account) (remain, total int64, err error) {
 			} `json:"Data"`
 		} `json:"Response"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := json.Unmarshal(env.Data, &resp); err != nil {
 		return 0, 0, fmt.Errorf("积分响应解析失败: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {

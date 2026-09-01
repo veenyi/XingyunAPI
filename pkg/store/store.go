@@ -932,13 +932,24 @@ func (s *Store) UpdateCredentialRefreshedAt(userID string) {
 	)
 }
 
-// SetCredentialValid updates the credential_valid status for an account.
+// SetCredentialValid 更新账号凭证校验结果，并推进 credential_refreshed_at。
+//
+// 必须同时推进时间戳：ListStaleAccounts 以 credential_refreshed_at 作为退避锚点
+// （失败账号按 4x 阈值拉长间隔）。此前只写 valid 不写时间，失败账号永远落在退避
+// 窗口之外，每分钟被重试一次 userInfo + 遥测 + 保活——对已失效会话持续打点，
+// 正是容易触发京东风控的行为。失败也要记一次时间，退避才真正生效。
 func (s *Store) SetCredentialValid(userID string, valid bool) {
 	v := 0
 	if valid {
 		v = 1
 	}
-	s.db.Exec("UPDATE accounts SET credential_valid = ? WHERE user_id = ?", v, userID)
+	now := time.Now().Format("2006-01-02 15:04:05")
+	if _, err := s.db.Exec(
+		"UPDATE accounts SET credential_valid = ?, credential_refreshed_at = ? WHERE user_id = ?",
+		v, now, userID,
+	); err != nil {
+		slog.Error("store: set credential valid failed", "user_id", userID, "error", err)
+	}
 }
 
 // ListStaleAccounts returns accounts that need credential checking.
