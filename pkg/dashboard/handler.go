@@ -1250,6 +1250,9 @@ func (h *Handler) validateAccount(w http.ResponseWriter, r *http.Request, apiKey
 	}
 
 	client := joycode.NewClient(account.PtKey, account.UserID)
+	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
+		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
+	}
 	valid := true
 	if err := client.Validate(); err != nil {
 		valid = false

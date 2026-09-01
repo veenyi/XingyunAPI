@@ -146,7 +146,7 @@ func (k *Keeper) checkStale() {
 			"user_id", acc.UserID,
 		)
 
-		result := k.checkOne(acc.UserID, acc.PtKey, acc.UserID)
+		result := k.checkOne(&acc)
 
 		switch result {
 		case "valid":
@@ -212,7 +212,10 @@ func (k *Keeper) maybeKeepalive(acc *store.Account) {
 
 // checkOne validates a single account and refreshes pt_key if possible.
 // Returns "valid", "refreshed", or "failed".
-func (k *Keeper) checkOne(apiKey, ptKey, userID string) string {
+func (k *Keeper) checkOne(acc *store.Account) string {
+	apiKey := acc.UserID
+	userID := acc.UserID
+	ptKey := acc.PtKey
 	if userID == "" {
 		slog.Error("keepalive: checkOne called with empty userID")
 		return "failed"
@@ -221,6 +224,12 @@ func (k *Keeper) checkOne(apiKey, ptKey, userID string) string {
 	checkStart := time.Now()
 
 	client := joycode.NewClient(ptKey, userID)
+	// 校验与发消息必须用同一份网关上下文：企业账号(PIN_JD_CLOUD)用默认
+	// N_PIN_PC 登录态问 userInfo，上游会以"账号未登录"(401)拒绝——
+	// 凭证本未过期却被误判为已过期（2026-09-01 三账号全灭的根因）。
+	if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
+		client.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
+	}
 	client.SetTimeout(30 * time.Second)
 
 	refreshedPtKey, err := client.UserInfoWithRefresh()
@@ -271,6 +280,9 @@ func (k *Keeper) checkOne(apiKey, ptKey, userID string) string {
 
 			verifyClient := joycode.NewClient(refreshedPtKey, userID)
 			verifyClient.SetTimeout(15 * time.Second)
+			if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
+				verifyClient.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
+			}
 			if verifyErr := verifyClient.Validate(); verifyErr != nil {
 				slog.Error("keepalive: refreshed pt_key verification FAILED",
 					"user_id", apiKey,
