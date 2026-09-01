@@ -254,7 +254,6 @@ const Chat: React.FC = () => {
               options={accounts}
               suffixIcon={<UserOutlined />}
               style={{ width: 160 }}
-              popupMatchSelectWidth={false}
             />
             <Segmented
               value={mode}
@@ -270,7 +269,6 @@ const Chat: React.FC = () => {
               onChange={setModel}
               options={models.map((m) => ({ label: m, value: m }))}
               style={{ width: 170 }}
-              popupMatchSelectWidth={false}
             />
             <Tooltip title="联网搜索：模型需要实时信息时自动搜索网页">
               <span style={{ fontSize: 12, color: 'var(--jc-fg-muted)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
