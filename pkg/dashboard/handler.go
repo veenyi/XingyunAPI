@@ -1290,6 +1290,9 @@ func (h *Handler) listAccountModels(w http.ResponseWriter, r *http.Request, apiK
 	}
 
 	client := joycode.NewClient(account.PtKey, account.UserID)
+	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
+		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
+	}
 	models, err := client.ListModels()
 	if err != nil {
 		slog.Error("list account models", "api_key", apiKey, "error", err)
@@ -1380,6 +1383,9 @@ func (h *Handler) getAccountPoint(w http.ResponseWriter, r *http.Request, apiKey
 	}
 
 	client := joycode.NewClient(account.PtKey, account.UserID)
+	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
+		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
+	}
 	resp, err := client.GetPoint()
 	if err != nil {
 		slog.Error("get account point", "api_key", apiKey, "error", err)
@@ -1493,6 +1499,9 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		full, err := h.store.GetAccount(account.UserID)
 		if err == nil && full != nil {
 			client := joycode.NewClient(full.PtKey, full.UserID)
+			if full.Tenant != "" || full.LoginType != "" || full.ColorBaseURL != "" || full.MasterBaseURL != "" || full.OrgFullName != "" {
+				client.SetColorContext(full.ColorBaseURL, full.MasterBaseURL, full.Tenant, full.LoginType, full.OrgFullName)
+			}
 			if upstream, uerr := client.ListModels(); uerr == nil && len(upstream) > 0 {
 				names := make([]string, 0, len(upstream))
 				for _, m := range upstream {

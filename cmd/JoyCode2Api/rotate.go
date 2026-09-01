@@ -72,6 +72,9 @@ func getAccountRemain(s *store.Store, userID string) int {
 		return -1
 	}
 	client := joycode.NewClient(account.PtKey, account.UserID)
+	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
+		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
+	}
 	client.SetTimeout(pointQueryTimeout) // 短超时：慢响应直接视为查询失败，不等 30min 默认超时
 	resp, err := client.GetPoint()
 	if err != nil {
