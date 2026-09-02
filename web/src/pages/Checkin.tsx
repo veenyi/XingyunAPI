@@ -310,9 +310,9 @@ const CheckinPage: React.FC = () => {
                     UID：{a.uid || '—'}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, margin: '6px 0' }}>
-                    <span style={{ fontSize: 26, fontWeight: 700, lineHeight: 1 }}>{a.credits ?? '—'}</span>
+                    <span style={{ fontSize: 26, fontWeight: 700, lineHeight: 1 }}>{typeof a.credits === 'number' ? a.credits.toFixed(2) : (a.credits ?? '—')}</span>
                     <span style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
-                      积分{a.credits_total != null ? ` / ${a.credits_total}` : ''}
+                      积分{a.credits_total != null ? ` / ${typeof a.credits_total === 'number' ? a.credits_total.toFixed(2) : a.credits_total}` : ''}
                     </span>
                   </div>
                   <div style={{ fontSize: 12, margin: '4px 0 10px' }}>
