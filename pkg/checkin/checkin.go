@@ -22,6 +22,7 @@ const (
 
 	PlatformWorkBuddy = "workbuddy"
 	PlatformTraeWork  = "traework"
+	PlatformQoder     = "qoder"
 
 	defaultRefreshAfter = 12 * time.Hour
 )
@@ -43,6 +44,11 @@ type Account struct {
 	MachineID    string `json:"machine_id,omitempty"`    // traework 机器号
 	ApiHost      string `json:"api_host,omitempty"`      // traework OAuth host，留空用官方
 
+	// Qoder 平台专用字段（加密存储）
+	MachineToken string `json:"machine_token,omitempty"` // qoder 机器令牌
+	MachineType  string `json:"machine_type,omitempty"`  // qoder 机器类型标识
+	Nickname     string `json:"nickname,omitempty"`      // qoder 用户昵称
+
 	Enabled bool `json:"enabled"`
 
 	// 运行状态（存 settings.checkin_state，明文无敏感信息）
@@ -63,6 +69,9 @@ func (a Account) Masked() Account {
 	}
 	if out.RefreshToken != "" {
 		out.RefreshToken = store.SecretMask
+	}
+	if out.MachineToken != "" {
+		out.MachineToken = store.SecretMask
 	}
 	return out
 }
@@ -92,10 +101,12 @@ type Manager struct {
 	today map[string]string
 	// wbSessions 暂存进行中的 WorkBuddy 扫码登录会话（sessionID → state），带 TTL。
 	wbSessions map[string]*wbLoginSession
+	// qoderSessions 暂存进行中的 Qoder 设备流登录会话。
+	qoderSessions map[string]*qoderLoginSession
 }
 
 func New(s *store.Store, version string) *Manager {
-	return &Manager{store: s, version: version, today: map[string]string{}, wbSessions: map[string]*wbLoginSession{}}
+	return &Manager{store: s, version: version, today: map[string]string{}, wbSessions: map[string]*wbLoginSession{}, qoderSessions: map[string]*qoderLoginSession{}}
 }
 
 // --- 账号 CRUD ---
@@ -133,6 +144,9 @@ type AccountInput struct {
 	DeviceID     string `json:"device_id"`
 	MachineID    string `json:"machine_id"`
 	ApiHost      string `json:"api_host"`
+	MachineToken string `json:"machine_token"`
+	MachineType  string `json:"machine_type"`
+	Nickname     string `json:"nickname"`
 	Enabled      bool   `json:"enabled"`
 }
 
@@ -153,7 +167,7 @@ func (m *Manager) Save(inputs []AccountInput) error {
 	out := make([]storedAccount, 0, len(inputs))
 	for _, in := range inputs {
 		platform := strings.TrimSpace(strings.ToLower(in.Platform))
-		if platform != PlatformWorkBuddy && platform != PlatformTraeWork {
+		if platform != PlatformWorkBuddy && platform != PlatformTraeWork && platform != PlatformQoder {
 			continue
 		}
 		base := old[in.ID]
@@ -180,6 +194,15 @@ func (m *Manager) Save(inputs []AccountInput) error {
 		}
 		if in.ApiHost != "" {
 			a.ApiHost = strings.TrimSpace(in.ApiHost)
+		}
+		if in.MachineToken != "" && in.MachineToken != store.SecretMask {
+			a.MachineToken = strings.TrimSpace(in.MachineToken)
+		}
+		if in.MachineType != "" {
+			a.MachineType = strings.TrimSpace(in.MachineType)
+		}
+		if in.Nickname != "" {
+			a.Nickname = strings.TrimSpace(in.Nickname)
 		}
 		if in.ID == "" {
 			a.ID = fmt.Sprintf("ci_%d", time.Now().UnixNano())
@@ -209,9 +232,19 @@ func (m *Manager) Save(inputs []AccountInput) error {
 		} else {
 			sa.EncRefresh = base.EncRefresh
 		}
+		if tok := in.MachineToken; tok != "" && tok != store.SecretMask {
+			enc, err := m.store.Encrypt(tok)
+			if err != nil {
+				return fmt.Errorf("加密 machine token 失败: %w", err)
+			}
+			sa.EncMachineToken = enc
+		} else {
+			sa.EncMachineToken = base.EncMachineToken
+		}
 		sa.Account.AccessToken = ""
 		sa.Account.RefreshToken = ""
-		if sa.EncAccess == "" && sa.EncRefresh == "" {
+		sa.Account.MachineToken = ""
+		if sa.EncAccess == "" && sa.EncRefresh == "" && sa.EncMachineToken == "" {
 			continue // 没有任何凭据的账号没有意义
 		}
 		out = append(out, sa)
@@ -295,8 +328,9 @@ type storedAccounts struct {
 // storedAccount 是加密存储形态：AccessToken/RefreshToken 各自整体加密。
 type storedAccount struct {
 	Account
-	EncAccess  string `json:"enc_access,omitempty"`
-	EncRefresh string `json:"enc_refresh,omitempty"`
+	EncAccess      string `json:"enc_access,omitempty"`
+	EncRefresh     string `json:"enc_refresh,omitempty"`
+	EncMachineToken string `json:"enc_machine_token,omitempty"`
 }
 
 // loadStored 读取原始存储形态（含密文，不解密）。
@@ -331,6 +365,11 @@ func (m *Manager) loadAccounts() []Account {
 		if sa.EncRefresh != "" {
 			if dec, err := m.store.Decrypt(sa.EncRefresh); err == nil {
 				a.RefreshToken = dec
+			}
+		}
+		if sa.EncMachineToken != "" {
+			if dec, err := m.store.Decrypt(sa.EncMachineToken); err == nil {
+				a.MachineToken = dec
 			}
 		}
 		out = append(out, a)

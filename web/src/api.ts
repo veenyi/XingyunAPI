@@ -75,7 +75,7 @@ export interface ChannelPreset {
 
 export interface CheckinAccount {
   id: string;
-  platform: 'workbuddy' | 'traework';
+  platform: 'workbuddy' | 'traework' | 'qoder';
   name: string;
   uid: string;
   access_token?: string;
@@ -361,6 +361,12 @@ export const api = {
   jdHptLoginStatus: (session: string) =>
     request<{ status: string; ok?: boolean; user_id?: string; nickname?: string; erp?: string; message?: string }>(
       `/api/jdhgpt-login/status?session=${encodeURIComponent(session)}`,
+    ),
+  qoderLoginInit: () =>
+    request<{ ok: boolean; session_id: string; auth_url: string }>('/api/checkin/qoder_login/init', { method: 'POST' }),
+  qoderLoginStatus: (session: string) =>
+    request<{ status: string; account?: { uid: string; nickname: string }; message?: string }>(
+      `/api/checkin/qoder_login/status?session=${encodeURIComponent(session)}`,
     ),
   qrLoginStatus: (sessionId: string) =>
     request<{ status: string; ok?: boolean; user_id?: string; nickname?: string; real_name?: string; message?: string; verify_url?: string; risk_code?: number }>(`/api/qr-login/status?session=${encodeURIComponent(sessionId)}`),

@@ -18,6 +18,8 @@ func (h *Handler) registerCheckinRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/checkin/config", h.handleCheckinConfig)
 	mux.HandleFunc("/api/checkin/wb_login/init", h.handleWBLoginInit)
 	mux.HandleFunc("/api/checkin/wb_login/status", h.handleWBLoginStatus)
+	mux.HandleFunc("/api/checkin/qoder_login/init", h.handleQoderLoginInit)
+	mux.HandleFunc("/api/checkin/qoder_login/status", h.handleQoderLoginStatus)
 }
 
 // handleWBLoginInit 发起 WorkBuddy 扫码登录，返回会话 ID 与授权 URL（前端渲染二维码）。
@@ -202,4 +204,60 @@ func (h *Handler) handleCheckinConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handleQoderLoginInit 发起 Qoder 设备流登录，返回会话 ID 与授权 URL。
+func (h *Handler) handleQoderLoginInit(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	m := h.checkin()
+	if m == nil {
+		writeError(w, http.StatusServiceUnavailable, "签到功能未启用")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	sessionID, authURL, err := m.QoderLoginStart()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "session_id": sessionID, "auth_url": authURL})
+}
+
+// handleQoderLoginStatus 轮询 Qoder 设备流登录状态。
+func (h *Handler) handleQoderLoginStatus(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	m := h.checkin()
+	if m == nil {
+		writeError(w, http.StatusServiceUnavailable, "签到功能未启用")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	session := strings.TrimSpace(r.URL.Query().Get("session"))
+	if session == "" {
+		writeError(w, http.StatusBadRequest, "缺少 session")
+		return
+	}
+	status, acct, msg := m.QoderLoginPoll(session)
+	resp := map[string]interface{}{"status": status}
+	if acct != nil {
+		resp["account"] = acct
+	}
+	if msg != "" {
+		resp["message"] = msg
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

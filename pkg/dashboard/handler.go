@@ -45,8 +45,9 @@ type Handler struct {
 	Health *health.Registry
 	// Channels 返回当前参与路由的上游渠道及其此刻可见的模型名，供排序页使用。
 	Channels func() []route.Source
-	// Keyless 是免登录 / 自带 Key 渠道，供看板聊天框直接按模型名测试。
-	Keyless []provider.Keyless
+	// Keyless 返回当前免登录 / 自带 Key 渠道，供看板聊天框直接按模型名测试。
+	// 用函数而非切片，因为账号可能在启动后通过签到中心添加/刷新。
+	Keyless func() []provider.Keyless
 	// CustomProviders 是用户自定义渠道管理器，为 nil 时不暴露。
 	CustomProviders *custom.Manager
 	// KeyfreeClient / KeyedClient 用于"刷新渠道"按钮强制重拉目录。

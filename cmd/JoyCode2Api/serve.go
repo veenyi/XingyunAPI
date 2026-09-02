@@ -39,8 +39,10 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/probe"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/proxy"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/qoder"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/workbuddy"
 )
 
 var (
@@ -150,10 +152,12 @@ var serveCmd = &cobra.Command{
 			r9      *freepool.Client
 			fl      *freepool.Client
 			rt      *route.Router
-			keyless []provider.Keyless
 			cust        *custom.Manager
-			sources func() []route.Source
+			sources     func() []route.Source
+			keylessFn   func() []provider.Keyless
 			ck          *checkin.Manager
+			qPool       *qoder.Pool
+			wbPool      *workbuddy.Pool
 		)
 		if s != nil {
 			// 一张健康表管所有渠道：路由与 /v1/models 必须对"这个模型现在能不能用"
@@ -176,11 +180,26 @@ var serveCmd = &cobra.Command{
 			// keylessAll 汇总所有免 Key / 自带 Key / 免费池代理 / 自定义渠道，
 			// 探针、看板、路由、聊天都读这一份，避免各处过滤口径不一致。
 			keylessAll := func() []provider.Keyless {
-				return append([]provider.Keyless{kf, kd, r9, fl}, cust.KeylessList()...)
+				base := []provider.Keyless{kf, kd, r9, fl}
+				if qPool != nil {
+					base = append(base, qPool)
+				}
+				if wbPool != nil {
+					base = append(base, wbPool)
+				}
+				return append(base, cust.KeylessList()...)
 			}
+			keylessFn = keylessAll
 			// 聊天路径：Keyfree/Keyed 是固定槽，其余（免费池代理 + 自定义）走 Extras。
 			extrasAll := func() []provider.Keyless {
-				return append([]provider.Keyless{r9, fl}, cust.KeylessList()...)
+				base := []provider.Keyless{r9, fl}
+				if qPool != nil {
+					base = append(base, qPool)
+				}
+				if wbPool != nil {
+					base = append(base, wbPool)
+				}
+				return append(base, cust.KeylessList()...)
 			}
 			srv.Keyfree = kf
 			srv.Keyed = kd
@@ -190,7 +209,6 @@ var serveCmd = &cobra.Command{
 			anth.Keyed = kd
 			anth.Extras = extrasAll
 			anth.Route = rt
-			keyless = keylessAll()
 
 			// 当前参与路由的渠道名单：探针、看板、路由都读这一份，
 			// 免得三处各自过滤"哪个渠道开着"得出不同答案。
@@ -223,6 +241,16 @@ var serveCmd = &cobra.Command{
 			// 凭据加密存库，调度时刻由签到中心页面配置（默认每天 09:00）。
 			ck = checkin.New(s, Version)
 			ck.Start()
+
+			// Qoder CN 渠道：多账号粘性路由 + token 保活（通过签到中心管理）。
+			qClient := qoder.New()
+			qPool = qoder.NewPool(qClient)
+			qoderSyncAccounts(qPool, ck)
+
+			// WorkBuddy 渠道：多账号粘性路由 + token 保活（通过签到中心管理）。
+			wbClient := workbuddy.New()
+			wbPool = workbuddy.NewPool(wbClient)
+			wbSyncAccounts(wbPool, ck)
 		}
 
 		// Start credential keepalive: check every 1min, refresh accounts older than 1h
@@ -388,7 +416,7 @@ var serveCmd = &cobra.Command{
 			dash.Health = reg
 			dash.Channels = sources
 			dash.Route = rt
-			dash.Keyless = keyless
+			dash.Keyless = keylessFn
 			dash.CustomProviders = cust
 			dash.KeyfreeClient = kf
 			dash.KeyedClient = kd
@@ -741,4 +769,20 @@ func setupLogRotation() {
 	// Truncate stdout.log if launchd has let it grow too large
 	stdoutPath := filepath.Join(logDir, "stdout.log")
 	logrot.TruncateFileIfNeeded(stdoutPath, cfg.MaxFileSize)
+}
+
+// qoderSyncAccounts 从签到中心同步 Qoder 账号到 qoder.Pool。
+func qoderSyncAccounts(pool *qoder.Pool, ck *checkin.Manager) {
+	if pool == nil || ck == nil {
+		return
+	}
+	pool.SyncAccounts(ck.QoderAccounts())
+}
+
+// wbSyncAccounts 从签到中心同步 WorkBuddy 账号到 workbuddy.Pool。
+func wbSyncAccounts(pool *workbuddy.Pool, ck *checkin.Manager) {
+	if pool == nil || ck == nil {
+		return
+	}
+	pool.SyncAccounts(ck.WBAccounts())
 }

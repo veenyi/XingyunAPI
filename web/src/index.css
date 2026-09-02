@@ -89,6 +89,10 @@
   }
 }
 
+html {
+  scrollbar-gutter: stable;
+}
+
 body {
   margin: 0;
   font-family: 'Fira Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;

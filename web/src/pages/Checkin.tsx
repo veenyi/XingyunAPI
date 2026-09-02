@@ -16,6 +16,7 @@ import type { CheckinAccount } from '../api';
 const PLATFORM_META: Record<string, { label: string; color: string; desc: string }> = {
   workbuddy: { label: 'WorkBuddy', color: 'blue', desc: '腾讯 CodeBuddy 每日签到领积分' },
   traework: { label: 'TraeWork', color: 'cyan', desc: 'Trae SOLO 每日签到领积分' },
+  qoder: { label: 'Qoder', color: 'purple', desc: 'Qoder CN 账号（设备流登录，自动保活）' },
 };
 
 const emptyDraft = (): CheckinAccount => ({
@@ -52,6 +53,15 @@ const CheckinPage: React.FC = () => {
   const wbTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const wbStop = () => { if (wbTimerRef.current) { clearTimeout(wbTimerRef.current); wbTimerRef.current = undefined; } };
 
+  // Qoder 设备流登录
+  const [qoderOpen, setQoderOpen] = useState(false);
+  const [qoderStatus, setQoderStatus] = useState<'loading' | 'waiting' | 'ok' | 'expired' | 'error'>('loading');
+  const [qoderAuthURL, setQoderAuthURL] = useState('');
+  const [qoderMsg, setQoderMsg] = useState('');
+  const qoderSessionRef = useRef('');
+  const qoderTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const qoderStop = () => { if (qoderTimerRef.current) { clearTimeout(qoderTimerRef.current); qoderTimerRef.current = undefined; } };
+
   const load = async () => {
     setLoading(true);
     try {
@@ -66,7 +76,7 @@ const CheckinPage: React.FC = () => {
   };
 
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => () => wbStop(), []);
+  useEffect(() => () => { wbStop(); qoderStop(); }, []);
 
   const wbPoll = useCallback(async () => {
     if (!wbSessionRef.current) return;
@@ -105,6 +115,44 @@ const CheckinPage: React.FC = () => {
 
   const openWBLogin = () => { setWbOpen(true); wbStart(); };
   const closeWBLogin = () => { wbStop(); setWbOpen(false); };
+
+  const qoderPoll = useCallback(async () => {
+    if (!qoderSessionRef.current) return;
+    try {
+      const r = await api.qoderLoginStatus(qoderSessionRef.current);
+      if (r.status === 'ok') {
+        setQoderStatus('ok');
+        setQoderMsg(`已登录：${r.account?.nickname || r.account?.uid || ''}`);
+        qoderStop();
+        load();
+        return;
+      }
+      if (r.status === 'expired') { setQoderStatus('expired'); setQoderMsg(r.message || '登录已过期'); qoderStop(); return; }
+      if (r.status === 'error') { setQoderStatus('error'); setQoderMsg(r.message || '登录失败'); qoderStop(); return; }
+      setQoderStatus('waiting');
+      if (r.message) setQoderMsg(r.message);
+      qoderTimerRef.current = setTimeout(qoderPoll, 2000);
+    } catch (e: unknown) {
+      setQoderStatus('error'); setQoderMsg(e instanceof Error ? e.message : '轮询失败'); qoderStop();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const qoderStart = useCallback(async () => {
+    qoderStop();
+    setQoderStatus('loading'); setQoderMsg(''); setQoderAuthURL('');
+    try {
+      const r = await api.qoderLoginInit();
+      qoderSessionRef.current = r.session_id;
+      setQoderAuthURL(r.auth_url);
+      setQoderStatus('waiting');
+      qoderTimerRef.current = setTimeout(qoderPoll, 1500);
+    } catch (e: unknown) {
+      setQoderStatus('error'); setQoderMsg(e instanceof Error ? e.message : '发起登录失败');
+    }
+  }, [qoderPoll]);
+
+  const openQoderLogin = () => { setQoderOpen(true); qoderStart(); };
+  const closeQoderLogin = () => { qoderStop(); setQoderOpen(false); };
 
   const openAdd = () => {
     setEditing(null);
@@ -205,6 +253,7 @@ const CheckinPage: React.FC = () => {
               全部签到
             </Button>
             <Button icon={<QrcodeOutlined />} onClick={openWBLogin}>扫码登录 WorkBuddy</Button>
+            <Button style={{ color: '#722ed1', borderColor: '#722ed1' }} icon={<QrcodeOutlined />} onClick={openQoderLogin}>登录 Qoder</Button>
             <Button type="primary" ghost icon={<PlusOutlined />} onClick={openAdd}>手动添加</Button>
           </Space>
         </div>
@@ -215,7 +264,7 @@ const CheckinPage: React.FC = () => {
         showIcon
         style={{ marginBottom: 16 }}
         message="每天自动签到领积分"
-        description="添加 WorkBuddy / TraeWork 账号的 access token 与 refresh token 后，行云会在设定时刻自动签到并刷新 token（凭据加密存储）。Qoder 无签到活动。"
+        description="添加 WorkBuddy / TraeWork 账号的 access token 与 refresh token 后，行云会在设定时刻自动签到并刷新 token（凭据加密存储）。Qoder 账号通过设备流登录，自动保活无需签到。"
       />
 
       <Card size="small" style={{ marginBottom: 16 }} title={<span className="jc-section-title"><ClockCircleOutlined />签到时刻</span>}
@@ -282,7 +331,7 @@ const CheckinPage: React.FC = () => {
                   </div>
                   <Space>
                     <Button size="small" type="primary" ghost loading={runId === a.id} disabled={!a.enabled} onClick={() => run({ id: a.id })}>
-                      立即签到
+                      {a.platform === 'qoder' ? '刷新积分' : '立即签到'}
                     </Button>
                     <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(a)}>编辑</Button>
                     <Popconfirm title="确认删除该签到账号？" onConfirm={() => remove(a.id)}>
@@ -332,6 +381,44 @@ const CheckinPage: React.FC = () => {
       </Modal>
 
       <Modal
+        title="登录 Qoder"
+        open={qoderOpen}
+        onCancel={closeQoderLogin}
+        footer={[
+          <Button key="refresh" icon={<ReloadOutlined />} onClick={qoderStart}>重新获取链接</Button>,
+          <Button key="close" type="primary" onClick={closeQoderLogin}>{qoderStatus === 'ok' ? '完成' : '关闭'}</Button>,
+        ]}
+        width={460}
+        destroyOnClose
+      >
+        <div style={{ textAlign: 'center', padding: '8px 0 4px' }}>
+          {qoderStatus === 'loading' && <Spin style={{ margin: '40px auto' }} tip="正在生成登录链接…"><div style={{ height: 80 }} /></Spin>}
+          {(qoderStatus === 'waiting' || qoderStatus === 'ok') && qoderAuthURL && (
+            <>
+              {qoderStatus === 'ok' ? (
+                <Space direction="vertical"><CheckCircleOutlined style={{ color: '#52c41a', fontSize: 28 }} />{qoderMsg || '登录成功，账号已添加'}</Space>
+              ) : (
+                <>
+                  <div style={{ margin: '12px 0', fontSize: 14 }}>请在浏览器中打开下方链接完成 Qoder 账号授权：</div>
+                  <Typography.Link href={qoderAuthURL} target="_blank" style={{ fontSize: 13, wordBreak: 'break-all', display: 'inline-block', margin: '8px 0' }}>
+                    {qoderAuthURL}
+                  </Typography.Link>
+                  <div style={{ color: 'var(--jc-fg-muted)', fontSize: 12, marginTop: 8 }}>
+                    授权完成后将自动添加账号；行云会定期刷新 token 保持在线
+                  </div>
+                  {qoderMsg && <div style={{ color: 'var(--jc-fg-muted)', fontSize: 12, marginTop: 4 }}>{qoderMsg}</div>}
+                </>
+              )}
+            </>
+          )}
+          {(qoderStatus === 'expired' || qoderStatus === 'error') && (
+            <Alert type="warning" showIcon message={qoderMsg || (qoderStatus === 'expired' ? '登录已过期' : '登录失败')} style={{ textAlign: 'left' }}
+              description="点「重新获取链接」再试一次。" />
+          )}
+        </div>
+      </Modal>
+
+      <Modal
         title={editing ? '编辑签到账号' : '添加签到账号'}
         open={modalOpen}
         onOk={submit}
@@ -347,6 +434,7 @@ const CheckinPage: React.FC = () => {
               options={[
                 { label: 'WorkBuddy（腾讯 CodeBuddy）', value: 'workbuddy' },
                 { label: 'TraeWork（Trae SOLO）', value: 'traework' },
+                { label: 'Qoder（设备流登录）', value: 'qoder' },
               ]}
             />
           </Form.Item>
@@ -358,20 +446,33 @@ const CheckinPage: React.FC = () => {
               <Input placeholder="user id" />
             </Form.Item>
           </Space>
-          <Form.Item
-            name="access_token"
-            label={editing ? 'Access Token（留空保持不变）' : 'Access Token'}
-            extra={editing ? undefined : '登录后从客户端/网页抓包获取'}
-          >
-            <Input.TextArea rows={2} placeholder={editing ? '●●●●●●●●' : '粘贴 access token'} autoSize />
-          </Form.Item>
-          <Form.Item
-            name="refresh_token"
-            label={editing ? 'Refresh Token（留空保持不变）' : 'Refresh Token'}
-            extra="用于自动续期，强烈建议填写；只填 access token 过期后需手动更新"
-          >
-            <Input.TextArea rows={2} placeholder={editing ? '●●●●●●●●' : '粘贴 refresh token'} autoSize />
-          </Form.Item>
+          {platform !== 'qoder' && (
+            <>
+              <Form.Item
+                name="access_token"
+                label={editing ? 'Access Token（留空保持不变）' : 'Access Token'}
+                extra={editing ? undefined : '登录后从客户端/网页抓包获取'}
+              >
+                <Input.TextArea rows={2} placeholder={editing ? '●●●●●●●●' : '粘贴 access token'} autoSize />
+              </Form.Item>
+              <Form.Item
+                name="refresh_token"
+                label={editing ? 'Refresh Token（留空保持不变）' : 'Refresh Token'}
+                extra="用于自动续期，强烈建议填写；只填 access token 过期后需手动更新"
+              >
+                <Input.TextArea rows={2} placeholder={editing ? '●●●●●●●●' : '粘贴 refresh token'} autoSize />
+              </Form.Item>
+            </>
+          )}
+          {platform === 'qoder' && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="Qoder 账号通过设备流登录添加"
+              description="关闭此弹窗后，点页面顶部「登录 Qoder」按钮发起授权，无需手动填写凭据。"
+            />
+          )}
           {platform === 'workbuddy' && (
             <Space size={12} style={{ display: 'flex' }}>
               <Form.Item name="enterprise_id" label="Enterprise ID（可选）" style={{ flex: 1 }}>

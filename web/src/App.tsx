@@ -326,7 +326,22 @@ const App: React.FC = () => {
 
   return (
     <ThemeContext.Provider value={{ theme, setTheme: setThemeSafe }}>
-      <ConfigProvider locale={zhCN} theme={isDark ? darkTheme : lightTheme}>
+      <ConfigProvider
+        locale={zhCN}
+        theme={isDark ? darkTheme : lightTheme}
+        getPopupContainer={(trigger) => {
+          // Find the nearest scrollable ancestor (the actual content scroller)
+          let el: HTMLElement | null = trigger?.parentElement || null;
+          while (el) {
+            const overflow = getComputedStyle(el).overflowY;
+            if (overflow === 'auto' || overflow === 'scroll') {
+              return el;
+            }
+            el = el.parentElement;
+          }
+          return document.body;
+        }}
+      >
         <BrowserRouter>
           <Routes>
             <Route path="/setup" element={<Setup />} />

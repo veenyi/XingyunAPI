@@ -64,6 +64,8 @@ func (m *Manager) run(a *Account) Result {
 			refreshErr = wbRefresh(a)
 		case PlatformTraeWork:
 			refreshErr = twRefresh(a)
+		case PlatformQoder:
+			refreshErr = qoderRefresh(a)
 		}
 		if refreshErr != nil {
 			m.updateState(a.ID, func(st *Account) {
@@ -152,6 +154,8 @@ func (m *Manager) credits(a *Account) (remain, total int64, err error) {
 		return wbCredits(a)
 	case PlatformTraeWork:
 		return twCredits(a)
+	case PlatformQoder:
+		return qoderCredits(a)
 	}
 	return 0, 0, fmt.Errorf("未知平台 %s", a.Platform)
 }
@@ -185,11 +189,17 @@ func (m *Manager) persistCredentials(a *Account) {
 				stored[i].EncRefresh = enc
 			}
 		}
+		if a.MachineToken != "" {
+			if enc, err := m.store.Encrypt(a.MachineToken); err == nil {
+				stored[i].EncMachineToken = enc
+			}
+		}
 		if a.Domain != "" {
 			stored[i].Account.Domain = a.Domain
 		}
 		stored[i].Account.AccessToken = ""
 		stored[i].Account.RefreshToken = ""
+		stored[i].Account.MachineToken = ""
 		_ = m.saveStored(stored)
 		return
 	}

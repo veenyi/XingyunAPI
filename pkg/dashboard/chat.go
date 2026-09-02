@@ -478,8 +478,9 @@ func (h *Handler) channelCandidate(model string) (route.Candidate, bool) {
 	if model == "" {
 		return route.Candidate{}, false
 	}
+	keyless := h.keyless()
 	if ch, mm, ok := route.SplitPrefixedModel(model); ok {
-		for _, p := range h.Keyless {
+		for _, p := range keyless {
 			if p == nil || !p.Enabled() || !strings.EqualFold(p.Name(), ch) {
 				continue
 			}
@@ -489,7 +490,7 @@ func (h *Handler) channelCandidate(model string) (route.Candidate, bool) {
 		}
 		return route.Candidate{}, false
 	}
-	for _, p := range h.Keyless {
+	for _, p := range keyless {
 		if p == nil || !p.Enabled() || !p.Supports(model) {
 			continue
 		}
@@ -524,7 +525,7 @@ func (h *Handler) channelChat(w http.ResponseWriter, flusher http.Flusher, home 
 	}
 	// 候选只在免凭据渠道之间切换：这条路径上可能一个账号都没加，
 	// 把"免费测试"悄悄派到付费模型比报错更糟。
-	cands := rt.Plan(home, route.KeylessSources(h.Keyless))
+	cands := rt.Plan(home, route.KeylessSources(h.keyless()))
 	out := rt.Open(cands, func(c route.Candidate) map[string]interface{} {
 		return channelChatBody(c.Model, req.Messages)
 	}, nil)

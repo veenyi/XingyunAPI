@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/health"
+	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
 )
 
@@ -168,4 +169,12 @@ func (h *Handler) channels() []route.Source {
 		return nil
 	}
 	return h.Channels()
+}
+
+// keyless 取当前免凭据渠道名单；动态获取以反映签到中心账号的添加/刷新。
+func (h *Handler) keyless() []provider.Keyless {
+	if h.Keyless == nil {
+		return nil
+	}
+	return h.Keyless()
 }
