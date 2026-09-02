@@ -179,14 +179,23 @@ func qoderRefresh(a *Account) error {
 	return nil
 }
 
-// qoderCredits 查询 Qoder 账号余额。
+// qoderCredits 查询 Qoder 账号余额（int64，用于存 state）。
 func qoderCredits(a *Account) (remain, total int64, err error) {
-	qa := accountToQoder(a)
-	remain, err = qoder.UserResource(qa)
+	r, t, err := qoderCreditsF64(a)
 	if err != nil {
 		return 0, 0, err
 	}
-	return remain, 0, nil
+	return int64(r), int64(t), nil
+}
+
+// qoderCreditsF64 查询 Qoder 账号余额，保留小数精度。
+func qoderCreditsF64(a *Account) (remain, total float64, err error) {
+	qa := accountToQoder(a)
+	remain, total, err = qoder.UserResourceF64(qa)
+	if err != nil {
+		return 0, 0, err
+	}
+	return remain, total, nil
 }
 
 // accountToQoder 把 checkin.Account 转为 qoder.QoderAccount。

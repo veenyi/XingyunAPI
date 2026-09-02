@@ -150,8 +150,17 @@ func twCheckin(a *Account) error {
 	return fmt.Errorf("签到被限流（9074），请稍后重试")
 }
 
-// twCredits 查询 TraeWork 剩余积分（网页版 ent_usage，剩余=Σ(limit-usage)）。
+// twCredits 查询 TraeWork 剩余积分（int64，用于存 state）。
 func twCredits(a *Account) (remain, total int64, err error) {
+	r, t, err := twCreditsF64(a)
+	if err != nil {
+		return 0, 0, err
+	}
+	return int64(r), int64(t), nil
+}
+
+// twCreditsF64 查询 TraeWork 剩余积分，保留小数精度。
+func twCreditsF64(a *Account) (remain, total float64, err error) {
 	req, err := http.NewRequest(http.MethodPost, twUgHost+twEpEntUsage, bytes.NewReader([]byte(`{"require_usage":true}`)))
 	if err != nil {
 		return 0, 0, err
@@ -176,15 +185,14 @@ func twCredits(a *Account) (remain, total int64, err error) {
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, fmt.Errorf("积分响应解析失败: %w", err)
 	}
-	var remainF, totalF float64
 	for _, p := range resp.UserEntitlementPackList {
-		remainF += p.EntitlementBaseInfo.Quota.CreditsLimit - p.Usage.CreditsAmount
-		totalF += p.EntitlementBaseInfo.Quota.CreditsLimit
+		remain += p.EntitlementBaseInfo.Quota.CreditsLimit - p.Usage.CreditsAmount
+		total += p.EntitlementBaseInfo.Quota.CreditsLimit
 	}
-	if remainF < 0 {
-		remainF = 0
+	if remain < 0 {
+		remain = 0
 	}
-	return int64(remainF), int64(totalF), nil
+	return remain, total, nil
 }
 
 func twMsg(message, msg string) string {

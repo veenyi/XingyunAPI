@@ -180,8 +180,17 @@ func wbCheckin(a *Account) error {
 	return nil
 }
 
-// wbCredits 查询 WorkBuddy 剩余积分。
+// wbCredits 查询 WorkBuddy 剩余积分（int64，用于存 state）。
 func wbCredits(a *Account) (remain, total int64, err error) {
+	r, t, err := wbCreditsF64(a)
+	if err != nil {
+		return 0, 0, err
+	}
+	return int64(r), int64(t), nil
+}
+
+// wbCreditsF64 查询 WorkBuddy 剩余积分，保留小数精度。
+func wbCreditsF64(a *Account) (remain, total float64, err error) {
 	now := time.Now()
 	body := map[string]interface{}{
 		"PageNumber":               1,
@@ -217,12 +226,12 @@ func wbCredits(a *Account) (remain, total int64, err error) {
 		Response struct {
 			Data struct {
 				Accounts []struct {
-					CapacitySize        int64 `json:"CapacitySize"`
-					CapacityRemain      int64 `json:"CapacityRemain"`
-					CapacityUsed        int64 `json:"CapacityUsed"`
-					CycleCapacitySize   int64 `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64 `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64 `json:"CycleCapacityUsed"`
+					CapacitySize        float64 `json:"CapacitySize"`
+					CapacityRemain      float64 `json:"CapacityRemain"`
+					CapacityUsed        float64 `json:"CapacityUsed"`
+					CycleCapacitySize   float64 `json:"CycleCapacitySize"`
+					CycleCapacityRemain float64 `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   float64 `json:"CycleCapacityUsed"`
 				} `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
@@ -231,7 +240,7 @@ func wbCredits(a *Account) (remain, total int64, err error) {
 		return 0, 0, fmt.Errorf("积分响应解析失败: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
-		var r, t int64
+		var r, t float64
 		switch {
 		case acct.CycleCapacitySize > 0:
 			r, t = acct.CycleCapacityRemain, acct.CycleCapacitySize

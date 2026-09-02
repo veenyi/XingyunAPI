@@ -332,6 +332,8 @@ export const api = {
     request<{ times: string[] }>('/api/checkin/config').then(r => r.times),
   saveCheckinConfig: (times: string[]) =>
     request<{ ok: boolean; times: string[] }>('/api/checkin/config', { method: 'PUT', body: JSON.stringify({ times }) }),
+  listCheckinPoints: () =>
+    request<{ points: { id: string; platform: string; name: string; credits: number; total: number }[] }>('/api/checkin/points'),
   wbLoginInit: () =>
     request<{ ok: boolean; session_id: string; auth_url: string }>('/api/checkin/wb_login/init', { method: 'POST' }),
   wbLoginStatus: (session: string) =>

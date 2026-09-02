@@ -53,18 +53,21 @@ const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<Stats | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [points, setPoints] = useState<Record<string, { used: number; remain: number; total: number }>>({});
+  const [checkinPoints, setCheckinPoints] = useState<Array<{ id: string; platform: string; name: string; credits: number; total: number }>>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchData = async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [statsData, accountsData] = await Promise.all([
+      const [statsData, accountsData, checkinData] = await Promise.all([
         api.getStats(),
         api.listAccounts(),
+        api.listCheckinPoints(),
       ]);
       setStats(statsData);
       setAccounts(accountsData);
-      // 汇总各账号积分（剩余/已用）
+      setCheckinPoints(checkinData.points ?? []);
+      // 汇总各账号积分（剩余/已用）— JD key 账号
       const pmap: Record<string, { used: number; remain: number; total: number }> = {};
       await Promise.all(accountsData.map(async (acc) => {
         try {
@@ -81,6 +84,11 @@ const Dashboard: React.FC = () => {
           }
         } catch { /* ignore */ }
       }));
+      // 合并签到账号积分（以 name 为 key，避免与 JD user_id 冲突）
+      for (const cp of checkinPoints) {
+        const key = `ci_${cp.id}`;
+        pmap[key] = { used: Math.max(0, cp.total - cp.credits), remain: cp.credits, total: cp.total };
+      }
       setPoints(pmap);
     } catch (e) {
       console.error(e);
@@ -128,15 +136,22 @@ const Dashboard: React.FC = () => {
   const pointEntries = Object.values(points);
   const totalRemain = pointEntries.reduce((s, p) => s + p.remain, 0);
   const totalUsed = pointEntries.reduce((s, p) => s + p.used, 0);
-  const lowPointCount = accounts.filter((a) => {
+  let lowPointCount = accounts.filter((a) => {
     const p = points[a.user_id];
     return p && p.remain >= 0 && p.remain < 10;
   }).length;
+  // 加上签到账号中低积分的
+  for (const cp of checkinPoints) {
+    if (cp.credits >= 0 && cp.credits < 10) lowPointCount++;
+  }
 
-  const pointDistData = accounts.map((a) => ({
-    name: accountDisplayName(a),
-    remain: points[a.user_id]?.remain ?? 0,
-  }));
+  const pointDistData = [
+    ...accounts.map((a) => ({
+      name: accountDisplayName(a),
+      remain: points[a.user_id]?.remain ?? 0,
+    })),
+    ...checkinPoints.map((cp) => ({ name: `${cp.name}（${cp.platform}）`, remain: cp.credits })),
+  ];
 
   const modelData = stats.by_model.map((m) => ({
     name: m.model, value: m.count,
@@ -228,11 +243,11 @@ const Dashboard: React.FC = () => {
         </div>
         <div className="jc-kpi">
           <div className="jc-kpi-label">剩余积分</div>
-          <div className="jc-kpi-value" style={{ fontSize: 20 }}>{totalRemain > 0 ? totalRemain.toLocaleString() : '-'}</div>
+          <div className="jc-kpi-value" style={{ fontSize: 20 }}>{totalRemain > 0 ? totalRemain.toFixed(2) : '-'}</div>
         </div>
         <div className="jc-kpi jc-kpi-accent">
           <div className="jc-kpi-label">已用积分</div>
-          <div className="jc-kpi-value">{totalUsed > 0 ? totalUsed.toLocaleString() : '-'}</div>
+          <div className="jc-kpi-value">{totalUsed > 0 ? totalUsed.toFixed(2) : '-'}</div>
         </div>
       </div>
 
@@ -279,7 +294,7 @@ const Dashboard: React.FC = () => {
                     contentStyle={{ background: 'var(--jc-bg-elevated)', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }}
                     itemStyle={{ color: 'var(--jc-fg)' }}
                     labelStyle={{ color: 'var(--jc-fg-muted)' }}
-                    formatter={(v: unknown) => [Number(v).toLocaleString(), '剩余积分']}
+                    formatter={(v: unknown) => [Number(v).toFixed(2), '剩余积分']}
                   />
                   <Bar dataKey="remain" name="剩余积分" fill={CHART_COLORS.secondary} radius={[0, 4, 4, 0]} barSize={18} />
                 </BarChart>
@@ -344,10 +359,10 @@ const Dashboard: React.FC = () => {
           <Card size="small" style={{ height: '100%' }} title={<span className="jc-section-title"><FireOutlined />积分概况</span>}>
             <Row gutter={[8, 12]}>
               <Col span={12}>
-                <Statistic title="剩余积分" value={totalRemain > 0 ? totalRemain.toLocaleString() : '-'} valueStyle={{ fontSize: 20, color: CHART_COLORS.secondary }} />
+                <Statistic title="剩余积分" value={totalRemain > 0 ? totalRemain.toFixed(2) : '-'} valueStyle={{ fontSize: 20, color: CHART_COLORS.secondary }} />
               </Col>
               <Col span={12}>
-                <Statistic title="已用积分" value={totalUsed > 0 ? totalUsed.toLocaleString() : '-'} valueStyle={{ fontSize: 20 }} />
+                <Statistic title="已用积分" value={totalUsed > 0 ? totalUsed.toFixed(2) : '-'} valueStyle={{ fontSize: 20 }} />
               </Col>
               <Col span={24}>
                 <Divider style={{ margin: '4px 0 8px' }} />
@@ -362,7 +377,7 @@ const Dashboard: React.FC = () => {
                 </Typography.Text>
               </Col>
               <Col span={12}>
-                <Statistic title="账号均剩余" value={pointEntries.length > 0 ? Math.round(totalRemain / pointEntries.length).toLocaleString() : '-'} valueStyle={{ fontSize: 16 }} />
+                <Statistic title="账号均剩余" value={pointEntries.length > 0 ? (totalRemain / pointEntries.length).toFixed(2) : '-'} valueStyle={{ fontSize: 16 }} />
               </Col>
               <Col span={12}>
                 <Statistic title="已配置账号" value={stats.accounts_count} prefix={<TeamOutlined />} valueStyle={{ fontSize: 16 }} />

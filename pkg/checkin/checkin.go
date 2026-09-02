@@ -55,8 +55,8 @@ type Account struct {
 	LastCheckinAt string `json:"last_checkin_at,omitempty"`
 	LastCheckinOK bool   `json:"last_checkin_ok"`
 	LastResult    string `json:"last_result,omitempty"`
-	Credits       int64  `json:"credits,omitempty"`
-	CreditsTotal  int64  `json:"credits_total,omitempty"`
+	Credits       int64  `json:"credits"`
+	CreditsTotal  int64  `json:"credits_total"`
 	LastRefreshAt string `json:"last_refresh_at,omitempty"`
 	LastRefreshOK bool   `json:"last_refresh_ok"`
 }
@@ -83,7 +83,7 @@ type Result struct {
 	Platform string `json:"platform"`
 	OK      bool   `json:"ok"`
 	Message string `json:"message"`
-	Credits int64  `json:"credits,omitempty"`
+	Credits int64  `json:"credits"`
 }
 
 // Manager 管理签到账号与后台调度。
@@ -127,6 +127,37 @@ func (m *Manager) List() []Account {
 			a.LastRefreshOK = st.LastRefreshOK
 		}
 		out = append(out, a.Masked())
+	}
+	return out
+}
+
+// CheckinPoint is a fresh-queried credit snapshot for one checkin account.
+type CheckinPoint struct {
+	ID       string  `json:"id"`
+	Platform string  `json:"platform"`
+	Name     string  `json:"name"`
+	Credits  float64 `json:"credits"`
+	Total    float64 `json:"total"`
+}
+
+// ListPoints returns a fresh credit snapshot for every checkin account,
+// querying the upstream APIs directly (no stale state).
+func (m *Manager) ListPoints() []CheckinPoint {
+	accounts := m.loadAccounts()
+	out := make([]CheckinPoint, 0, len(accounts))
+	for _, a := range accounts {
+		r, t, err := m.creditsFloat64(&a)
+		if err != nil {
+			slog.Warn("checkin: 积分查询失败", "id", a.ID, "platform", a.Platform, "error", err)
+			continue
+		}
+		out = append(out, CheckinPoint{
+			ID:       a.ID,
+			Platform: a.Platform,
+			Name:     a.Name,
+			Credits:  r,
+			Total:    t,
+		})
 	}
 	return out
 }

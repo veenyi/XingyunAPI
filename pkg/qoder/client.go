@@ -349,12 +349,12 @@ func RefreshToken(a *QoderAccount) error {
 	return nil
 }
 
-// UserResource 查询账号余额。
-func UserResource(a *QoderAccount) (int64, error) {
+// UserResource 查询账号余额。返回 (剩余积分, 总积分, error)。
+func UserResource(a *QoderAccount) (remain, total int64, err error) {
 	url := OpenAPIBase + EpQuotaUsage
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
@@ -363,29 +363,77 @@ func UserResource(a *QoderAccount) (int64, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return 0, fmt.Errorf("http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
+		return 0, 0, fmt.Errorf("http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
 	}
 
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	slog.Info("qoder: UserResource raw response", "uid", a.UID, "status", resp.StatusCode, "body", truncateStr(string(raw), 500))
+
 	var data struct {
-		Data struct {
-			UserQuota struct {
-				Remaining int64 `json:"remaining"`
-			} `json:"userQuota"`
-			AddOnQuota struct {
-				Remaining int64 `json:"remaining"`
-			} `json:"addOnQuota"`
-		} `json:"data"`
+		UserQuota struct {
+			Remaining float64 `json:"remaining"`
+			Total     float64 `json:"total"`
+		} `json:"userQuota"`
+		AddOnQuota struct {
+			Remaining float64 `json:"remaining"`
+			Total     float64 `json:"total"`
+		} `json:"addOnQuota"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return 0, err
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return 0, 0, err
 	}
-	return data.Data.UserQuota.Remaining + data.Data.AddOnQuota.Remaining, nil
+	remain = int64(data.UserQuota.Remaining) + int64(data.AddOnQuota.Remaining)
+	total = int64(data.UserQuota.Total) + int64(data.AddOnQuota.Total)
+	return remain, total, nil
+}
+
+// UserResourceF64 查询账号余额，保留小数精度。
+func UserResourceF64(a *QoderAccount) (remain, total float64, err error) {
+	url := OpenAPIBase + EpQuotaUsage
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return 0, 0, fmt.Errorf("http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
+	}
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	var data struct {
+		UserQuota struct {
+			Remaining float64 `json:"remaining"`
+			Total     float64 `json:"total"`
+		} `json:"userQuota"`
+		AddOnQuota struct {
+			Remaining float64 `json:"remaining"`
+			Total     float64 `json:"total"`
+		} `json:"addOnQuota"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return 0, 0, err
+	}
+	remain = data.UserQuota.Remaining + data.AddOnQuota.Remaining
+	total = data.UserQuota.Total + data.AddOnQuota.Total
+	return remain, total, nil
 }
 
 // EnsureFingerprint 为账号生成持久机器指纹（幂等）。

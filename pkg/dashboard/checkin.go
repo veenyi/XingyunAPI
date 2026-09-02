@@ -16,6 +16,7 @@ func (h *Handler) registerCheckinRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/checkin/accounts/", h.handleCheckinAccountAction)
 	mux.HandleFunc("/api/checkin/run", h.handleCheckinRun)
 	mux.HandleFunc("/api/checkin/config", h.handleCheckinConfig)
+	mux.HandleFunc("/api/checkin/points", h.handleCheckinPoints)
 	mux.HandleFunc("/api/checkin/wb_login/init", h.handleWBLoginInit)
 	mux.HandleFunc("/api/checkin/wb_login/status", h.handleWBLoginStatus)
 	mux.HandleFunc("/api/checkin/qoder_login/init", h.handleQoderLoginInit)
@@ -204,6 +205,25 @@ func (h *Handler) handleCheckinConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handleCheckinPoints GET /api/checkin/points — 实时查询所有签到账号积分（float64，保留小数）。
+func (h *Handler) handleCheckinPoints(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	m := h.checkin()
+	if m == nil {
+		writeError(w, http.StatusServiceUnavailable, "签到功能未启用")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"points": m.ListPoints()})
 }
 
 // handleQoderLoginInit 发起 Qoder 设备流登录，返回会话 ID 与授权 URL。

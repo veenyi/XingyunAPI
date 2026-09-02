@@ -214,7 +214,7 @@ const CheckinPage: React.FC = () => {
     try {
       const { results } = await api.runCheckin(opts);
       for (const r of results ?? []) {
-        if (r.ok) message.success(`${r.name || r.id}：${r.message}${r.credits ? `（剩余 ${r.credits} 积分）` : ''}`);
+        if (r.ok) message.success(`${r.name || r.id}：${r.message}${r.credits != null ? `（剩余 ${r.credits} 积分）` : ''}`);
         else if (r.message.includes('已签到')) message.info(`${r.name || r.id}：${r.message}`);
         else message.warning(`${r.name || r.id}：${r.message}`);
       }
@@ -312,7 +312,7 @@ const CheckinPage: React.FC = () => {
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, margin: '6px 0' }}>
                     <span style={{ fontSize: 26, fontWeight: 700, lineHeight: 1 }}>{a.credits ?? '—'}</span>
                     <span style={{ fontSize: 12, color: 'var(--jc-fg-muted)' }}>
-                      积分{a.credits_total ? ` / ${a.credits_total}` : ''}
+                      积分{a.credits_total != null ? ` / ${a.credits_total}` : ''}
                     </span>
                   </div>
                   <div style={{ fontSize: 12, margin: '4px 0 10px' }}>

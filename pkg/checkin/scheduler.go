@@ -160,6 +160,18 @@ func (m *Manager) credits(a *Account) (remain, total int64, err error) {
 	return 0, 0, fmt.Errorf("未知平台 %s", a.Platform)
 }
 
+func (m *Manager) creditsFloat64(a *Account) (remain, total float64, err error) {
+	switch a.Platform {
+	case PlatformWorkBuddy:
+		return wbCreditsF64(a)
+	case PlatformTraeWork:
+		return twCreditsF64(a)
+	case PlatformQoder:
+		return qoderCreditsF64(a)
+	}
+	return 0, 0, fmt.Errorf("未知平台 %s", a.Platform)
+}
+
 func (m *Manager) stateCredits(id string) int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
