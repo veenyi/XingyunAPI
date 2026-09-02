@@ -8,7 +8,7 @@ import (
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
 )
 
-var Version = "0.6.5"
+var Version = "0.6.6"
 
 var versionCmd = &cobra.Command{
 	Use:     "version",

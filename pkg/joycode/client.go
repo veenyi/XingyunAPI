@@ -28,7 +28,7 @@ const (
 	ClientVersion = "2.7.5"
 	UserAgent     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
 		"AppleWebKit/537.36 (KHTML, like Gecko) " +
-		"JoyCode/2.7.5 Chrome/133.0.0.0 Electron/35.2.0 Safari/537.36"
+		"Chrome/133.0.0.0 Electron/35.2.0 Safari/537.36"
 
 	// color gateway 签名（逆向自 JoyCode 2.7.5 / joycoder-editor 3.8.57）
 	colorGatewayAppID = "joycode_ide"

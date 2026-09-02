@@ -30,7 +30,6 @@ const (
 // ideFingerprint 是官方 JoyCode IDE 客户端上报的设备指纹。
 // 默认按运行主机生成：写死某台真机的身份会随安装包分发给所有实例，既能反查打包者，
 // 也让所有实例上报同一设备、易被上游关联。上游按 ptKey 归属账号，指纹只需形态合法。
-// 需要指定时用 JOYCODE_FP_OS/IDE/PLUGIN/HOST/DOMAIN/MAC/PROJECT 覆盖。
 type ideFingerprint struct {
 	OSName         string
 	IDEVersion     string
@@ -64,15 +63,15 @@ func localMAC() string {
 }
 
 func currentFingerprint() ideFingerprint {
-	host := envOr("JOYCODE_FP_HOST", hostName())
+	host := hostName()
 	return ideFingerprint{
-		OSName:         envOr("JOYCODE_FP_OS", "win32 x64 10.0.19045"),
-		IDEVersion:     envOr("JOYCODE_FP_IDE", "3.0.10"),
-		PluginVersion:  envOr("JOYCODE_FP_PLUGIN", "joycodeIDE-3.8.67"),
+		OSName:         "win32 x64 10.0.19045",
+		IDEVersion:     "3.0.10",
+		PluginVersion:  "joycodeIDE-3.8.67",
 		ComputerName:   host,
-		ComputerDomain: envOr("JOYCODE_FP_DOMAIN", strings.ToUpper(host)),
-		MAC:            envOr("JOYCODE_FP_MAC", localMAC()),
-		ProjectName:    envOr("JOYCODE_FP_PROJECT", "xingyun-keepalive"),
+		ComputerDomain: strings.ToUpper(host),
+		MAC:            localMAC(),
+		ProjectName:    "xingyun-keepalive",
 	}
 }
 
