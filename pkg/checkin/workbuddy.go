@@ -181,8 +181,10 @@ type wbLoginSession struct {
 }
 
 // wbLoginSession 向 auth/state 申请扫码会话（state + 授权链接）。
+// platform=CLI 是必填查询参数（缺失回 10001 platform is empty，参考
+// workbuddy2api/cmd/login 的实现）。
 func (m *Manager) wbLoginSession(ctx context.Context) (*wbLoginSession, error) {
-	env, err := doEnvelope(ctx, m.hc, http.MethodPost, wbAuthBase+wbAuthStatePath, wbCommonHeaders(), map[string]interface{}{})
+	env, err := doEnvelope(ctx, m.hc, http.MethodPost, wbAuthBase+wbAuthStatePath+"?platform=CLI", wbCommonHeaders(), map[string]interface{}{})
 	if err != nil {
 		return nil, err
 	}

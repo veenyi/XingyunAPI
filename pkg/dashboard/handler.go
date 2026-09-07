@@ -72,13 +72,14 @@ func (h *Handler) SetSettingsSavedHook(fn func(map[string]string)) {
 }
 
 func NewHandler(s *store.Store, staticFS fs.FS, k *keepalive.Keeper) *Handler {
-	return &Handler{
+	h := &Handler{
 		store:     s,
 		staticFS:  staticFS,
 		modelList: joycode.Models,
 		keeper:    k,
-		tm:        NewTunnelManager(),
 	}
+	h.tm = NewTunnelManager(h)
+	return h
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
