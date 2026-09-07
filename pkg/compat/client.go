@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -227,7 +228,7 @@ func (c *Client) newRequest(ctx context.Context, stream bool, body map[string]in
 func (c *Client) failResp(resp *http.Response) error {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	text := Snippet(raw)
-	err := fmt.Errorf("upstream %s: HTTP %d: %s", c.opts.Name, resp.StatusCode, text)
+	err := fmt.Errorf("upstream %s: HTTP %d: %s", c.opts.Name, resp.StatusCode, vendorHint(c.opts.BaseURL, resp.StatusCode, text))
 	if ra := health.ParseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
 		return UpstreamError{Err: err, Status: resp.StatusCode, RetryAfter: ra}
 	}
@@ -237,48 +238,108 @@ func (c *Client) failResp(resp *http.Response) error {
 	return err
 }
 
+// vendorHint 对已知厂商的常见配置错误追加可读提示（不改行为只补文案）：
+// 商汤日日新新版 API Key 直连官方端点是 token.sensenova.cn，旧域
+// api.sensenova.cn 需自签 JWT，直填 Key 必 401/403。
+func vendorHint(baseURL string, status int, body string) string {
+	host := ""
+	if u, err := url.Parse(baseURL); err == nil {
+		host = strings.ToLower(u.Hostname())
+	}
+	if strings.Contains(host, "sensenova") && host != "token.sensenova.cn" &&
+		(status == http.StatusUnauthorized || status == http.StatusForbidden) {
+		return body + "（提示：日日新新版 API Key 的官方端点是 https://token.sensenova.cn/v1，旧域名 api.sensenova.cn 需自签 JWT，直填 Key 会 401/403）"
+	}
+	return body
+}
+
 // Chat implements provider.Keyless (non-streaming).
 func (c *Client) Chat(ctx context.Context, body map[string]interface{}) (map[string]interface{}, error) {
 	body = CompressMessages(body)
-	req, err := c.newRequest(ctx, false, body)
-	if err != nil {
-		return nil, err
+	_, out, err := c.chatAttempt(ctx, body, false)
+	if err != nil && samplingLimited(err) && hasSamplingParams(body) {
+		// 部分上游模型限制采样参数（如日日新仅允许 temperature=1）：
+		// 剔除采样参数重试一次。
+		_, out, err = c.chatAttempt(ctx, stripSampling(body), false)
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.failResp(resp)
-	}
-	var out map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("upstream %s: invalid JSON: %w", c.opts.Name, err)
-	}
-	return out, nil
+	return out, err
 }
 
 // ChatStream implements provider.Keyless; returns the raw SSE body.
 func (c *Client) ChatStream(ctx context.Context, body map[string]interface{}) (io.ReadCloser, error) {
 	body = CompressMessages(body)
-	req, err := c.newRequest(ctx, true, body)
+	rc, _, err := c.chatAttempt(ctx, body, true)
+	if err != nil && samplingLimited(err) && hasSamplingParams(body) {
+		rc, _, err = c.chatAttempt(ctx, stripSampling(body), true)
+	}
+	return rc, err
+}
+
+// chatAttempt 执行一次聊天请求（stream=true 返回 SSE 流）。
+func (c *Client) chatAttempt(ctx context.Context, body map[string]interface{}, stream bool) (io.ReadCloser, map[string]interface{}, error) {
+	req, err := c.newRequest(ctx, stream, body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	if stream {
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			return nil, nil, c.failResp(resp)
+		}
+		if err := guardSSEHead(resp); err != nil {
+			resp.Body.Close()
+			return nil, nil, err
+		}
+		return resp.Body, nil, nil
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		return nil, c.failResp(resp)
+		return nil, nil, c.failResp(resp)
 	}
-	if err := guardSSEHead(resp); err != nil {
-		resp.Body.Close()
-		return nil, err
+	var out map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, nil, fmt.Errorf("upstream %s: invalid JSON: %w", c.opts.Name, err)
 	}
-	return resp.Body, nil
+	return nil, out, nil
+}
+
+// samplingLimited 判定错误是否为采样参数限制类（日日新等厂商对部分模型
+// 仅允许固定 temperature，转发原始参数会被 400 拒绝）。
+func samplingLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	t := strings.ToLower(err.Error())
+	return strings.Contains(t, "temperature invalid") ||
+		strings.Contains(t, "temperature") && strings.Contains(t, "only 1 is allowed") ||
+		strings.Contains(t, "only 1 is allowed for this model")
+}
+
+// hasSamplingParams 报告请求体是否携带采样参数。
+func hasSamplingParams(body map[string]interface{}) bool {
+	for _, k := range []string{"temperature", "top_p", "presence_penalty", "frequency_penalty"} {
+		if _, ok := body[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// stripSampling 返回剔除采样参数的请求体副本。
+func stripSampling(body map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(body))
+	for k, v := range body {
+		switch strings.ToLower(k) {
+		case "temperature", "top_p", "presence_penalty", "frequency_penalty":
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // guardSSEHead turns HTTP-200 JSON error bodies (which carry no SSE events)

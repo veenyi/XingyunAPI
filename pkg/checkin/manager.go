@@ -286,6 +286,13 @@ func (m *Manager) run(ctx context.Context, a *Account) Result {
 		} else {
 			slog.Error("checkin: 查询积分失败", "id", a.IDKey(), "error", err)
 		}
+	case platformQwenWork:
+		credits, total, err = m.qwCreditsF64(ctx, a)
+		if err == nil {
+			message = "积分已刷新"
+		} else {
+			slog.Error("checkin: 查询积分失败", "id", a.IDKey(), "error", err)
+		}
 	default:
 		err = fmt.Errorf("不支持的平台: %s", a.Platform)
 	}
@@ -533,6 +540,8 @@ func (m *Manager) ListPoints(ctx context.Context) []CheckinPoint {
 			credits, total, err = m.twCreditsF64(ctx, a)
 		case platformQoder:
 			credits, total, err = m.qoderCreditsF64(ctx, a)
+		case platformQwenWork:
+			credits, total, err = m.qwCreditsF64(ctx, a)
 		}
 		if err != nil {
 			slog.Error("checkin: 积分查询失败", "id", a.IDKey(), "error", err)
@@ -679,7 +688,7 @@ func (m *Manager) Remove(id string) error {
 // validPlatform 校验平台标识。
 func validPlatform(p string) error {
 	switch p {
-	case platformWorkBuddy, platformTraeWork, platformQoder:
+	case platformWorkBuddy, platformTraeWork, platformQoder, platformQwenWork:
 		return nil
 	case "":
 		return errors.New("缺少 platform")
@@ -821,6 +830,14 @@ func tokenStale(a *Account) bool {
 }
 
 // ---- settings 访问（nil store 容忍）----
+
+// hcOr 返回可用的 HTTP 客户端（m.hc 优先，nil 回退 fallback）。
+func (m *Manager) hcOr(fallback *http.Client) *http.Client {
+	if m.hc != nil {
+		return m.hc
+	}
+	return fallback
+}
 
 func (m *Manager) getSetting(key string) string {
 	if m.store == nil {

@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
-	"syscall"
 	"time"
 )
 
@@ -29,7 +28,7 @@ func Start(agentURL string, interval time.Duration) {
 				if failStreak >= 2 {
 					// sudo 必须写绝对路径：行云进程（应用中心启动）的 PATH 里没有 sudo（实测踩坑）
 					cmd := exec.Command("/usr/bin/sudo", "-n", keeperSh)
-					cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+					setSetsid(cmd)
 					if e := cmd.Start(); e != nil {
 						log.Printf("[watchdog] launch keeper.sh failed: %v", e)
 					} else {

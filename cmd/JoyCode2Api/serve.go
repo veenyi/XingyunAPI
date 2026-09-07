@@ -39,8 +39,10 @@ import (
 	"github.com/veenyi/XingyunAPI/pkg/probe"
 	"github.com/veenyi/XingyunAPI/pkg/proxy"
 	"github.com/veenyi/XingyunAPI/pkg/qoder"
+	"github.com/veenyi/XingyunAPI/pkg/qwenwork"
 	"github.com/veenyi/XingyunAPI/pkg/route"
 	"github.com/veenyi/XingyunAPI/pkg/store"
+	"github.com/veenyi/XingyunAPI/pkg/traework"
 	"github.com/veenyi/XingyunAPI/pkg/watchdog"
 	"github.com/veenyi/XingyunAPI/pkg/workbuddy"
 )
@@ -206,6 +208,8 @@ var serveCmd = &cobra.Command{
 		var customMgr *custom.Manager
 		var qoderPool *qoder.Pool
 		var wbPool *workbuddy.Pool
+		var qwPool *qwenwork.Pool
+		var twPool *traework.Pool
 		var cm *checkin.Manager
 		if s != nil {
 			customMgr = custom.New(s)
@@ -224,6 +228,33 @@ var serveCmd = &cobra.Command{
 			wbPool = workbuddy.New(s, nil)
 			cm = checkin.NewManager(s, nil)
 			cm.Start()
+			// QwenWork（千问办公）聊天池：凭据权威源 = 签到中心 blob，
+			// 回调实时取（签到侧被动刷新令牌后自动生效）。
+			qwPool = qwenwork.NewPool(func() []qwenwork.Credential {
+				creds := cm.QwenWorkCredentials()
+				out := make([]qwenwork.Credential, 0, len(creds))
+				for _, c := range creds {
+					out = append(out, qwenwork.Credential{
+						ID: c.ID, Nickname: c.Nickname,
+						AccessToken: c.AccessToken, RefreshToken: c.RefreshToken,
+					})
+				}
+				return out
+			}, nil)
+			// TraeWork（TRAE SOLO CN）聊天池：凭据权威源 = 签到中心 blob，
+			// 签到侧刷新令牌后自动生效。
+			twPool = traework.NewPool(func() []traework.Credential {
+				creds := cm.TraeWorkCredentials()
+				out := make([]traework.Credential, 0, len(creds))
+				for _, c := range creds {
+					out = append(out, traework.Credential{
+						ID: c.ID, Nickname: c.Nickname,
+						AccessToken: c.AccessToken, RefreshToken: c.RefreshToken,
+						UID: c.UID, DeviceID: c.DeviceID, MachineID: c.MachineID,
+					})
+				}
+				return out
+			}, nil)
 		}
 		keyless := func() []provider.Keyless {
 			list := []provider.Keyless{}
@@ -250,6 +281,12 @@ var serveCmd = &cobra.Command{
 			}
 			if wbPool != nil && wbPool.Enabled() {
 				list = append(list, wbPool)
+			}
+			if qwPool != nil && qwPool.Enabled() {
+				list = append(list, qwPool)
+			}
+			if twPool != nil && twPool.Enabled() {
+				list = append(list, twPool)
 			}
 			return list
 		}

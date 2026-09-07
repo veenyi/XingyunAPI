@@ -251,63 +251,8 @@ func (m *Manager) qoderCredits(ctx context.Context, a *Account) (map[string]inte
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	// Qoder usage 响应两种形态（客户端 HIe 实证 0.1.8）：
-	// 1) 顶层字段：{user_quota:{total,used,remaining}, add_on_quota:{...}}（无信封）
-	// 2) 错误：{code:"TOKEN_INVALID", message:...}
-	var top map[string]interface{}
-	if err := json.Unmarshal(raw, &top); err != nil {
-		return nil, fmt.Errorf("%s: %w", errCreditsParse, err)
-	}
-	if code, _ := top["code"].(string); code == "TOKEN_INVALID" || code == "UNAUTHORIZED" {
-		return nil, errors.New("Qoder 登录已过期，请重新登录（" + code + "）")
-	}
-	uq := firstMap(top, "userQuota", "user_quota")
-	if uq != nil {
-		// 顶层形态：展平 user_quota + add_on_quota 为 {remaining,total} 视图
-		rem, tot := 0.0, 0.0
-		addQ := firstMap(top, "addOnQuota", "add_on_quota")
-		// dedicated_resource_packages：活动/专属积分包（如 Qwen 专属），逐包累加
-		if packs, ok := top["dedicatedResourcePackages"].([]interface{}); ok {
-			for _, pk := range packs {
-				if pm, ok := pk.(map[string]interface{}); ok {
-					if r, ok := pm["remaining"].(float64); ok {
-						rem += r
-					}
-					if t, ok := pm["total"].(float64); ok {
-						tot += t
-					}
-				}
-			}
-		}
-		for _, q := range []map[string]interface{}{uq, addQ} {
-			if q == nil {
-				continue
-			}
-			if r, ok := q["remaining"].(float64); ok {
-				rem += r
-			}
-			if t, ok := q["total"].(float64); ok {
-				tot += t
-			}
-		}
-		return map[string]interface{}{"remaining": rem, "total": tot}, nil
-	}
-	// 旧信封形态
-	var parsed struct {
-		Code interface{}            `json:"code"`
-		Msg  string                 `json:"msg"`
-		Data map[string]interface{} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("%s: %w", errCreditsParse, err)
-	}
-	if parsed.Data == nil && parsed.Msg == "" {
-		return nil, errors.New(errCreditsParse)
-	}
-	if parsed.Msg != "" && parsed.Data == nil {
-		return nil, errors.New(parsed.Msg)
-	}
-	return parsed.Data, nil
+	// Qoder usage 响应解析与 QwenWork 共用（qwenwork.go parseQuotaUsagePayload）。
+	return parseQuotaUsagePayload(raw)
 }
 
 // qoderCreditsF64 查询 Qoder 额度并宽容换算为 (剩余, 总量)。

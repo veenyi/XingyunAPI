@@ -220,6 +220,43 @@ func (a *Account) twHost() string {
 	return twBase
 }
 
+// TWCredential 是导出给聊天渠道的账号凭据视图。
+type TWCredential struct {
+	ID           string
+	Nickname     string
+	AccessToken  string
+	RefreshToken string
+	UID          string
+	DeviceID     string
+	MachineID    string
+}
+
+// TraeWorkCredentials 返回全部启用 traework 账号的解密凭据
+// （聊天池 credsFn 回调实时取；签到侧刷新令牌后自动生效）。
+func (m *Manager) TraeWorkCredentials() []TWCredential {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]TWCredential, 0, len(m.accounts))
+	for _, a := range m.accounts {
+		if a == nil || a.Platform != platformTraeWork || !a.Enabled {
+			continue
+		}
+		if a.AccessToken == "" {
+			continue
+		}
+		out = append(out, TWCredential{
+			ID:           a.IDKey(),
+			Nickname:     a.displayName(),
+			AccessToken:  a.AccessToken,
+			RefreshToken: a.RefreshToken,
+			UID:          a.UID,
+			DeviceID:     a.DeviceID,
+			MachineID:    a.MachineID,
+		})
+	}
+	return out
+}
+
 // twEntUsage 查询 TRAE 账号实际剩余积分（对齐 wild-work UserEntUsage）。
 // POST {host}/trae/api/v2/pay/web_user_ent_usage body {"require_usage":true}
 // 剩余 = Σ(credits_limit - credits_amount)。

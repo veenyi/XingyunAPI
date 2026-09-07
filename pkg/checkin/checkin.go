@@ -33,6 +33,7 @@ const (
 	platformWorkBuddy = "workbuddy"
 	platformTraeWork  = "traework"
 	platformQoder     = "qoder"
+	platformQwenWork  = "qwenwork"
 )
 
 // Settings keys (endpoints-and-schema §3).
@@ -61,6 +62,9 @@ const (
 
 	// qoderUsagePath 只刷积分，无签到动作（qoder.OpenAPIBase 前缀）。
 	qoderUsagePath = "/api/v2/quota/usage"
+
+	// QwenWork（千问办公）同 qoder：无签到动作，只刷积分。
+	// 端点常量见 qwenwork.go。
 )
 
 // User-visible copy（strings-notes §1 checkin 段，一字不差）。
