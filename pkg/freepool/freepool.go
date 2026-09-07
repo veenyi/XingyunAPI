@@ -40,19 +40,11 @@ type source struct {
 	models  []string // static free-model seed
 }
 
-// poolSources are the aggregated keyless free catalogs (2026-09 实测仅
-// OpenCode Zen 真实可用；种子模型均为目录内实测在列的 id).
-var poolSources = []source{
-	{
-		id: "opencode", baseURL: "https://opencode.ai/zen/v1",
-		onKey: "opencode_enabled",
-		models: []string{
-			"nemotron-3.5-lightning-free", "mimo-v2.5-free",
-			"nemotron-3-ultra-free", "muse-spark-1.3-contributor-free",
-			"ling-3.0-flash-fin-free",
-		},
-	},
-}
+// poolSources are the aggregated keyless free catalogs.
+// 2026-09-07：OpenCode Zen 免费档全面收紧为「仅限 OpenCode 客户端会话」
+// （所有 -free 模型匿名请求回 MissingSessionID），源整体下线；免费档改由
+// keyfree（pollinations，非流式合成）承担。若上游放开，把源加回即可。
+var poolSources = []source{}
 
 // isFreeModel reports whether a catalog id carries the free suffix.
 func isFreeModel(id string) bool {

@@ -6,8 +6,11 @@ package keyfree
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/veenyi/XingyunAPI/pkg/common"
 	"github.com/veenyi/XingyunAPI/pkg/compat"
@@ -46,12 +49,16 @@ type endpoint struct {
 	name    string
 	baseURL string
 	models  []string
+	// noStream: 上游对 stream=true 返回错误（如 pollinations 2026-09 起对
+	// legacy API 的流式请求回 402），ChatStream 走非流式请求 + 本地合成 SSE。
+	noStream bool
 }
 
 // endpoints are the credential-free public endpoints polled by the pool.
+// opencode-zen 于 2026-09-07 移除：其免费档全面收紧为「仅限 OpenCode 客户端
+// 会话」（MissingSessionID），匿名请求全部被拒。
 var endpoints = []endpoint{
-	{name: "opencode-zen", baseURL: "https://opencode.ai/zen/v1"},
-	{name: "pollinations", baseURL: "https://text.pollinations.ai/openai", models: []string{"openai", "openai-fast", "mistral"}},
+	{name: "pollinations", baseURL: "https://text.pollinations.ai/openai", models: []string{"openai", "openai-fast", "mistral"}, noStream: true},
 }
 
 // setting reads a setting with a nil-safe receiver.
@@ -132,33 +139,100 @@ func (c *Client) ListModels() []string {
 }
 
 // Chat implements provider.Keyless: first endpoint that answers wins.
+// 402（pollinations 匿名预算波动）自动重试一次。
 func (c *Client) Chat(ctx context.Context, body map[string]interface{}) (map[string]interface{}, error) {
 	var lastErr error
 	for _, sc := range c.subs {
-		out, err := sc.Chat(ctx, body)
-		if err == nil {
-			if lookErr := compat.LooksLikeError(out); lookErr != nil {
-				lastErr = lookErr
+		for attempt := 0; attempt < 2; attempt++ {
+			out, err := sc.Chat(ctx, body)
+			if err == nil {
+				if lookErr := compat.LooksLikeError(out); lookErr != nil {
+					lastErr = lookErr
+					break
+				}
+				return out, nil
+			}
+			lastErr = err
+			if attempt == 0 && strings.Contains(err.Error(), "402") {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
 				continue
 			}
-			return out, nil
+			break
 		}
-		lastErr = err
 	}
 	return nil, lastErr
 }
 
 // ChatStream implements provider.Keyless: first endpoint that answers wins.
+// noStream 端点走非流式请求，再把完整响应合成为单帧 SSE 流（pollinations
+// 对流式请求回 402，非流式匿名可用）。
 func (c *Client) ChatStream(ctx context.Context, body map[string]interface{}) (io.ReadCloser, error) {
 	var lastErr error
-	for _, sc := range c.subs {
-		rc, err := sc.ChatStream(ctx, body)
-		if err == nil {
-			return rc, nil
+	for i, sc := range c.subs {
+		for attempt := 0; attempt < 2; attempt++ {
+			if i < len(endpoints) && endpoints[i].noStream {
+				out, err := sc.Chat(ctx, body)
+				if err != nil {
+					lastErr = err
+					if attempt == 0 && strings.Contains(err.Error(), "402") {
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(2 * time.Second):
+						}
+						continue
+					}
+					break
+				}
+				if lookErr := compat.LooksLikeError(out); lookErr != nil {
+					lastErr = lookErr
+					break
+				}
+				return synthSSE(out), nil
+			}
+			rc, err := sc.ChatStream(ctx, body)
+			if err == nil {
+				return rc, nil
+			}
+			lastErr = err
+			break
 		}
-		lastErr = err
 	}
 	return nil, lastErr
+}
+
+// synthSSE 把非流式 completion 包装成单帧 delta 形状的 SSE 流（含 usage 与
+// finish_reason:stop），下游中继按普通上游 SSE 原样转发。
+func synthSSE(out map[string]interface{}) io.ReadCloser {
+	id, _ := out["id"].(string)
+	content := ""
+	usage := map[string]interface{}{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+	if u, ok := out["usage"].(map[string]interface{}); ok {
+		usage = u
+	}
+	if choices, ok := out["choices"].([]interface{}); ok && len(choices) > 0 {
+		if ch, ok := choices[0].(map[string]interface{}); ok {
+			if msg, ok := ch["message"].(map[string]interface{}); ok {
+				content, _ = msg["content"].(string)
+			}
+		}
+	}
+	first := map[string]interface{}{
+		"id": id, "object": "chat.completion.chunk",
+		"choices": []map[string]interface{}{{"index": 0, "delta": map[string]interface{}{"role": "assistant", "content": content}, "finish_reason": nil}},
+	}
+	final := map[string]interface{}{
+		"id": id, "object": "chat.completion.chunk",
+		"choices": []map[string]interface{}{{"index": 0, "delta": map[string]interface{}{}, "finish_reason": "stop"}},
+		"usage":   usage,
+	}
+	b1, _ := json.Marshal(first)
+	b2, _ := json.Marshal(final)
+	return io.NopCloser(strings.NewReader("data: " + string(b1) + "\n\ndata: " + string(b2) + "\n\ndata: [DONE]\n\n"))
 }
 
 // Tier returns the dispatch tier of the pool.
