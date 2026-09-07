@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 // twHeaderUserAgent 未从二进制还原，取浏览器惯例值。
@@ -110,7 +111,7 @@ func (m *Manager) twCheckin(ctx context.Context, a *Account) (string, error) {
 		"machine_type": a.MachineType,
 	}
 	var out map[string]interface{}
-	if err := doJSON(ctx, m.hc, http.MethodPost, twBase+twClaimPath, twUgHeaders(a), body, &out); err != nil {
+	if err := doJSON(ctx, m.hc, http.MethodPost, a.twHost()+twClaimPath, twUgHeaders(a), body, &out); err != nil {
 		return "", err
 	}
 	code, msg, data := twEnvelope(out)
@@ -158,7 +159,7 @@ func (m *Manager) twCredits(ctx context.Context, a *Account) (map[string]interfa
 		return nil, fmt.Errorf("%s：%s", textCheckinUnfinished, errNoAccessToken)
 	}
 	var out map[string]interface{}
-	if err := doJSON(ctx, m.hc, http.MethodGet, twBase+twStatusPath, twUgHeaders(a), nil, &out); err != nil {
+	if err := doJSON(ctx, m.hc, http.MethodGet, a.twHost()+twStatusPath, twUgHeaders(a), nil, &out); err != nil {
 		return nil, fmt.Errorf("%s: %w", errStateQuery, err)
 	}
 	if out == nil {
@@ -204,4 +205,12 @@ const logRateLimited9074 = "checkin: 签到被限流（9074），请稍后重试
 // twRiskRateLimited 记录限流日志。
 func twRiskRateLimited() {
 	slog.Warn(logRateLimited9074)
+}
+
+// twHost 返回该账号的 API host（登录时按授权页回跳记录，空则 CN 默认）。
+func (a *Account) twHost() string {
+	if a != nil && strings.TrimSpace(a.APIHost) != "" {
+		return strings.TrimSpace(a.APIHost)
+	}
+	return twBase
 }

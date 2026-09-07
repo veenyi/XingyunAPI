@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -51,6 +52,7 @@ type twLoginSession struct {
 	MachineID string
 	PrivPEM   string
 	AuthURL   string
+	Host      string // 授权页回跳携带的交换 host（如 https://api.trae.com），空=CN 默认
 	CreatedAt time.Time
 	ExpiresAt time.Time
 
@@ -130,34 +132,71 @@ func (m *Manager) TraeLoginStart(_ context.Context) (*QoderLoginResult, error) {
 	}, nil
 }
 
-// TraeLoginSubmit 接收用户粘贴的登录后跳转地址（或裸 code），解析出 AuthCode 暂存。
-func (m *Manager) TraeLoginSubmit(sessionID, raw string) error {
-	code := twExtractCode(raw)
-	if code == "" {
-		return errors.New("粘贴内容里没有找到 code 参数，请复制浏览器地址栏的完整链接")
+// exchangeHost 返回本会话的交换 host（回跳携带优先，空则 CN 默认）。
+func (s *twLoginSession) exchangeHost() string {
+	if s != nil && strings.TrimSpace(s.Host) != "" {
+		return strings.TrimSpace(s.Host)
 	}
+	return twBase
+}
+
+// TraeLoginSubmit 接收用户粘贴的登录后跳转地址（或裸 code），解析出 AuthCode 暂存。
+// 回跳形态（2026-09-07 实测）：http://127.0.0.1:{port}/authorize?isRedirect=true&scope=solo
+// &authCodeInfo={"AuthCode":"…","ExpireAt":…,"ExpireDuration":600000}&loginTraceID=…
+// &host=https://api.trae.com ——— 授权码在 authCodeInfo JSON 里，交换 host 随回跳携带。
+func (m *Manager) TraeLoginSubmit(sessionID, raw string) error {
+	code, _ := twExtractCode(raw)
+	if code == "" {
+		return errors.New("粘贴内容里没有找到授权码：请复制浏览器地址栏的完整链接（应包含 authCodeInfo 或 code 参数）")
+	}
+	// 回跳 host 参数（api.trae.com）是 Vercel 空壳，交换固定走 CN 默认 api.trae.cn
 	return m.TraeLoginCallback(sessionID, code)
 }
 
-// twExtractCode 从粘贴内容提取授权码：完整 URL 取 query 的 code，否则整段当裸 code。
-func twExtractCode(raw string) string {
+// twExtractCode 从粘贴内容提取授权码与交换 host：
+//   - 新版回跳：?authCodeInfo={"AuthCode":"…",…}&host=https://api.trae.com
+//   - 规格回跳：?code=…&state=…
+//   - 兜底：裸 code。
+func twExtractCode(raw string) (code, host string) {
 	raw = strings.TrimSpace(raw)
 	raw = strings.Trim(raw, "\"'<>()")
 	if raw == "" {
-		return ""
+		return "", ""
 	}
-	if u, err := url.Parse(raw); err == nil && u.Query().Get("code") != "" {
-		return u.Query().Get("code")
+	if u, err := url.Parse(raw); err == nil {
+		q := u.Query()
+		host = strings.TrimSpace(q.Get("host"))
+		if c := q.Get("code"); c != "" {
+			return c, host
+		}
+		if info := q.Get("authCodeInfo"); info != "" {
+			var ai struct {
+				AuthCode string `json:"AuthCode"`
+			}
+			if json.Unmarshal([]byte(info), &ai) == nil && ai.AuthCode != "" {
+				return ai.AuthCode, host
+			}
+		}
+	}
+	if i := strings.Index(raw, "authCodeInfo="); i >= 0 {
+		if v, err := url.ParseQuery(raw[i:]); err == nil {
+			var ai struct {
+				AuthCode string `json:"AuthCode"`
+			}
+			if json.Unmarshal([]byte(v.Get("authCodeInfo")), &ai) == nil && ai.AuthCode != "" {
+				return ai.AuthCode, host
+			}
+		}
 	}
 	if i := strings.Index(raw, "code="); i >= 0 {
 		if v, err := url.ParseQuery(raw[i:]); err == nil {
-			return v.Get("code")
+			return v.Get("code"), host
 		}
 	}
 	if strings.ContainsAny(raw, " \t\r\n?#&=") {
-		return ""
+		return "", host
 	}
-	return raw
+	return raw, host
 }
 
 // twEphemeralPort 随机动态端口（回环回调仅用于满足 TRAE 白名单，不需要真实监听）。
@@ -226,7 +265,7 @@ func (m *Manager) TraeLoginPoll(ctx context.Context, sessionID string) (*QoderLo
 		s.err = fmt.Errorf("交换令牌失败: %w", err)
 		return &QoderLoginResult{Status: "error", Message: s.err.Error()}, nil
 	}
-	nick, uid := m.twUserInfo(ctx, tok.access)
+	nick, uid := m.twUserInfo(ctx, "", tok.access)
 	acct := &Account{
 		Platform:     platformTraeWork,
 		UID:          uid,
@@ -259,7 +298,7 @@ type twTokens struct {
 	refresh string
 }
 
-// twExchangeAuthCode 用授权码一次性交换令牌（式A）。
+// twExchangeAuthCode 用授权码一次性交换令牌（式A），host 用回跳携带的交换域。
 func (m *Manager) twExchangeAuthCode(ctx context.Context, s *twLoginSession, code string) (*twTokens, error) {
 	body := map[string]interface{}{
 		"ClientID":     twClientID,
@@ -268,7 +307,7 @@ func (m *Manager) twExchangeAuthCode(ctx context.Context, s *twLoginSession, cod
 		"DeviceInfo":   twDeviceInfo(s.DeviceID, s.MachineID, twPubFromPriv(s.PrivPEM)),
 		"IDEVersion":   twIDEVersion,
 	}
-	return m.twExchange(ctx, body)
+	return m.twExchange(ctx, s.exchangeHost(), body)
 }
 
 // twExchangeRefresh 用 RefreshToken + DeviceProof 续期（式B）。
@@ -285,12 +324,16 @@ func (m *Manager) twExchangeRefresh(ctx context.Context, a *Account) (*twTokens,
 		"DeviceProof":  map[string]interface{}{"Signature": sig, "Timestamp": ts, "Nonce": nonce},
 		"IDEVersion":   twIDEVersion,
 	}
-	return m.twExchange(ctx, body)
+	return m.twExchange(ctx, a.APIHost, body)
 }
 
 // twExchange 调 ExchangeToken 并宽容解析 {Token, RefreshToken}（平铺或 data/Result 包裹）。
-func (m *Manager) twExchange(ctx context.Context, body map[string]interface{}) (*twTokens, error) {
-	env, err := doEnvelope(ctx, m.hc, http.MethodPost, twBase+twAuthzPath, twLoginHeaders(), body)
+// host 为空时回退 CN 默认（api.trae.cn）。
+func (m *Manager) twExchange(ctx context.Context, host string, body map[string]interface{}) (*twTokens, error) {
+	if strings.TrimSpace(host) == "" {
+		host = twBase
+	}
+	env, err := doEnvelope(ctx, m.hc, http.MethodPost, host+twAuthzPath, twLoginHeaders(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -311,13 +354,17 @@ func (m *Manager) twExchange(ctx context.Context, body map[string]interface{}) (
 }
 
 // twUserInfo 查询 TRAE 用户信息（尽力而为：失败不阻断入库，uid 兜底随机）。
-func (m *Manager) twUserInfo(ctx context.Context, token string) (nick, uid string) {
+// host 为空时回退 CN 默认。
+func (m *Manager) twUserInfo(ctx context.Context, host, token string) (nick, uid string) {
 	if token == "" {
 		return "", ""
 	}
+	if strings.TrimSpace(host) == "" {
+		host = twBase
+	}
 	h := twLoginHeaders()
 	h.Set("x-cloudide-token", token)
-	env, err := doEnvelope(ctx, m.hc, http.MethodPost, twBase+twUserInfoPath, h,
+	env, err := doEnvelope(ctx, m.hc, http.MethodPost, host+twUserInfoPath, h,
 		map[string]interface{}{"ReqSource": "Lite", "IDEVersion": twIDEVersion})
 	if err != nil {
 		slog.Warn("checkin: TraeWork 用户信息查询失败（不阻断入库）", "error", err)
