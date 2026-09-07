@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -31,14 +30,16 @@ func JWTMiddleware(getter SettingsGetter, next http.Handler) http.Handler {
 		}
 
 		whitelist := map[string]bool{
-			"/api/auth/status":     true,
-			"/api/auth/setup":      true,
-			"/api/auth/login":      true,
-			"/api/health":          true,
-			"/api/github-stars":    true,
-			"/api/browser-login":   true,
-			"/api/oauth-callback":  true,
-			"/api/oauth-submit":    true,
+			"/api/auth/status":                  true,
+			"/api/auth/setup":                   true,
+			"/api/auth/login":                   true,
+			"/api/health":                       true,
+			"/api/self/diag":                    true,
+			"/api/github-stars":                 true,
+			"/api/browser-login":                true,
+			"/api/oauth-callback":               true,
+			"/api/oauth-submit":                 true,
+			"/api/checkin/trae_login/callback":  true,
 		}
 		if whitelist[path] {
 			next.ServeHTTP(w, r)
@@ -53,8 +54,14 @@ func JWTMiddleware(getter SettingsGetter, next http.Handler) http.Handler {
 
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			writeAuthError(w, "missing authorization header")
-			return
+			// WebSocket clients cannot set headers; allow the token as a
+			// query parameter for those requests only.
+			if q := r.URL.Query().Get("token"); q != "" && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				authHeader = "Bearer " + q
+			} else {
+				writeAuthError(w, "missing authorization header")
+				return
+			}
 		}
 
 		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
@@ -86,11 +93,7 @@ func writeAuthError(w http.ResponseWriter, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusUnauthorized)
-	// Use json.Marshal so msg is properly escaped (avoids JSON injection if
-	// msg ever contains quotes/backslashes).
-	if data, err := json.Marshal(map[string]string{"detail": msg}); err == nil {
-		w.Write(data)
-	}
+	w.Write([]byte(`{"detail":"` + msg + `"}`))
 }
 
 func AuthenticatedUser(r *http.Request) string {

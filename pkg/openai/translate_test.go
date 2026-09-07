@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
 )
 
 // --- TranslateRequest tests ---
@@ -385,9 +385,9 @@ func TestResolveModel_Empty(t *testing.T) {
 
 // Test 25: Non-empty returns input
 func TestResolveModel_NonEmpty(t *testing.T) {
-	result := ResolveModel("GLM-5.1", "", "")
-	if result != "GLM-5.1" {
-		t.Errorf("expected GLM-5.1, got %s", result)
+	result := ResolveModel("MiniMax-M3", "", "")
+	if result != "MiniMax-M3" {
+		t.Errorf("expected MiniMax-M3, got %s", result)
 	}
 }
 

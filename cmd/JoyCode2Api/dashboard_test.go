@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -225,6 +227,72 @@ func TestStaticFileServing(t *testing.T) {
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+
+	t.Run("index_no_cache", func(t *testing.T) {
+		resp, err := http.Get(base + "/")
+		if err != nil {
+			t.Fatalf("get index: %v", err)
+		}
+		defer resp.Body.Close()
+		if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("Cache-Control = %q, want no-cache", cc)
+		}
+	})
+
+	t.Run("hashed_asset_immutable", func(t *testing.T) {
+		idx, err := http.Get(base + "/")
+		if err != nil {
+			t.Fatalf("get index: %v", err)
+		}
+		body, _ := io.ReadAll(idx.Body)
+		idx.Body.Close()
+		m := regexp.MustCompile(`/assets/[A-Za-z0-9_-]+\.js`).Find(body)
+		if m == nil {
+			t.Fatal("no asset reference found in index.html")
+		}
+		resp, err := http.Get(base + string(m))
+		if err != nil {
+			t.Fatalf("get asset: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+			t.Errorf("Cache-Control = %q, want immutable", cc)
+		}
+	})
+
+	t.Run("missing_asset_404_no_store", func(t *testing.T) {
+		resp, err := http.Get(base + "/assets/does-not-exist-xyz.js")
+		if err != nil {
+			t.Fatalf("get missing asset: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
+			t.Errorf("Content-Type = %q, must not be text/html", ct)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("Cache-Control = %q, want no-store", cc)
+		}
+	})
+
+	t.Run("spa_fallback_no_cache", func(t *testing.T) {
+		resp, err := http.Get(base + "/accounts")
+		if err != nil {
+			t.Fatalf("get accounts page: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("Cache-Control = %q, want no-cache", cc)
 		}
 	})
 }

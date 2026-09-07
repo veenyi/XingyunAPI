@@ -1,11 +1,12 @@
-module github.com/vibe-coding-labs/JoyCode2Api
+module github.com/veenyi/XingyunAPI
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/crypto v0.50.0
+	golang.org/x/crypto v0.56.0
 	modernc.org/sqlite v1.53.0
 )
 
@@ -17,7 +18,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

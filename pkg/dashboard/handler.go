@@ -21,19 +21,13 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/auth"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/health"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keepalive"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/proxy"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/provider"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/route"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/checkin"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/custom"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/freepool"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyfree"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keyed"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
+	"github.com/veenyi/XingyunAPI/pkg/auth"
+	"github.com/veenyi/XingyunAPI/pkg/checkin"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/keepalive"
+	"github.com/veenyi/XingyunAPI/pkg/proxy"
+	"github.com/veenyi/XingyunAPI/pkg/route"
+	"github.com/veenyi/XingyunAPI/pkg/store"
 )
 
 type Handler struct {
@@ -41,28 +35,40 @@ type Handler struct {
 	staticFS  fs.FS
 	modelList []string
 	keeper    *keepalive.Keeper
-	// Health 是所有渠道共用的模型健康表；为 nil 时健康接口返回空名单。
-	Health *health.Registry
-	// Channels 返回当前参与路由的上游渠道及其此刻可见的模型名，供排序页使用。
-	Channels func() []route.Source
-	// Keyless 返回当前免登录 / 自带 Key 渠道，供看板聊天框直接按模型名测试。
-	// 用函数而非切片，因为账号可能在启动后通过签到中心添加/刷新。
-	Keyless func() []provider.Keyless
-	// CustomProviders 是用户自定义渠道管理器，为 nil 时不暴露。
-	CustomProviders *custom.Manager
-	// KeyfreeClient / KeyedClient 用于"刷新渠道"按钮强制重拉目录。
-	KeyfreeClient *keyfree.Client
-	KeyedClient   *keyed.Client
-	// Router9Client / FreeLLMClient 是免 Key 聚合代理渠道，同样纳入强制刷新。
-	Router9Client *freepool.Client
-	FreeLLMClient *freepool.Client
-	// CheckinManager 是签到中心管理器，为 nil 时签到接口返回 503。
-	CheckinManager *checkin.Manager
-	// Route 负责候选排序与冷却记账；为 nil 时看板聊天只按用户点名的模型走一次。
-	Route *route.Router
+	// router 驱动模型与渠道页（候选/冷却/排序）；channelPresets 与
+	// refreshChannels 由 server 启动时注入（SetChannelDeps）。
+	router          *route.Router
+	channelPresets  []map[string]string
+	refreshChannels func()
+	// onSettingsSaved 在 PUT /api/settings 落库成功后回调（coerce 后的
+	// 键值对），让运行中的组件（如 custom 渠道管理器）即时感知变更。
+	onSettingsSaved func(map[string]string)
+	// checkin 驱动签到中心；syncQoder/syncWB 在对应平台登录成功后重载账号池。
+	checkin   *checkin.Manager
+	syncQoder func()
+	syncWB    func()
 	// Version is the proxy version reported by /api/health; set by the server
 	// at startup (the build-time Version lives in package main).
 	Version string
+	// 公网入口反向隧道（/api/devcloud/tunnel）。
+	tm *TunnelManager
+	// 管理面操作审计（AuditMiddleware / handleAudit）。
+	auditMu   sync.Mutex
+	auditPath string
+}
+
+// SetChannelDeps wires the routing view and channel registry into the
+// dashboard (call once at startup, before serving).
+func (h *Handler) SetChannelDeps(rt *route.Router, presets []map[string]string, refresh func()) {
+	h.router = rt
+	h.channelPresets = presets
+	h.refreshChannels = refresh
+}
+
+// SetSettingsSavedHook registers a callback fired after every successful
+// PUT /api/settings with the coerced key/value map.
+func (h *Handler) SetSettingsSavedHook(fn func(map[string]string)) {
+	h.onSettingsSaved = fn
 }
 
 func NewHandler(s *store.Store, staticFS fs.FS, k *keepalive.Keeper) *Handler {
@@ -71,6 +77,7 @@ func NewHandler(s *store.Store, staticFS fs.FS, k *keepalive.Keeper) *Handler {
 		staticFS:  staticFS,
 		modelList: joycode.Models,
 		keeper:    k,
+		tm:        NewTunnelManager(),
 	}
 }
 
@@ -92,51 +99,37 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/oauth-submit", h.handleOAuthSubmit)
 	mux.HandleFunc("/api/qr-login/init", h.handleQRLoginInit)
 	mux.HandleFunc("/api/qr-login/status", h.handleQRLoginStatus)
-	mux.HandleFunc("/api/jdhgpt-login/init", h.handleJdHptInit)
-	mux.HandleFunc("/api/jdhgpt-login/status", h.handleJdHptStatus)
 	mux.HandleFunc("/api/models", h.handleModels)
 	mux.HandleFunc("/api/model-status", h.handleModelStatus)
 	mux.HandleFunc("/api/model-ranking", h.handleModelRanking)
-	mux.HandleFunc("/api/stats", h.handleStats)
-	mux.HandleFunc("/api/settings", h.handleSettings)
-	mux.HandleFunc("/api/custom_providers", h.handleCustomProviders)
-	mux.HandleFunc("/api/channels/refresh", h.handleChannelsRefresh)
 	mux.HandleFunc("/api/model-blocklist", h.handleModelBlocklist)
 	mux.HandleFunc("/api/channel-presets", h.handleChannelPresets)
-	h.registerCheckinRoutes(mux)
+	mux.HandleFunc("/api/channels/refresh", h.handleChannelsRefresh)
+	mux.HandleFunc("/api/rotate-aggregate-key", h.handleRotateAggregateKey)
+	mux.HandleFunc("/api/audit", h.handleAudit)
+	mux.HandleFunc("/api/chat", h.handleChat)
+	mux.HandleFunc("/api/chat-history", h.handleChatHistory)
+	mux.HandleFunc("/api/stats", h.handleStats)
+	mux.HandleFunc("/api/settings", h.handleSettings)
 	mux.HandleFunc("/api/health", h.handleHealth)
+	mux.HandleFunc("/api/self/diag", h.handleSelfDiag)
 	mux.HandleFunc("/api/errors", h.handleErrors)
 	mux.HandleFunc("/api/github-stars", h.handleGitHubStars)
 	mux.HandleFunc("/api/accounts-export", h.handleExportAccounts)
 	mux.HandleFunc("/api/accounts-import", h.handleImportAccounts)
-	mux.HandleFunc("/api/chat", h.handleChat)
-	mux.HandleFunc("/api/chat-history", h.handleChatHistory)
-	mux.HandleFunc("/api/rotate-aggregate-key", h.handleRotateAggregateKey)
-}
 
-// handleRotateAggregateKey 重新生成聚合 API Key（旧 Key 立即失效）。
-func (h *Handler) handleRotateAggregateKey(w http.ResponseWriter, r *http.Request) {
-	setCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		writeError(w, http.StatusInternalServerError, "生成密钥失败")
-		return
-	}
-	key := "sk-joy-" + hex.EncodeToString(b)
-	if err := h.store.SetSetting("aggregate_key", key); err != nil {
-		slog.Error("rotate aggregate key", "error", err)
-		writeError(w, http.StatusInternalServerError, "保存密钥失败")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "key": key})
+	// Devcloud (cloud hosts) endpoints + web SSH terminal bridge
+	mux.HandleFunc("/api/devcloud/projects", h.handleDevcloudProjects)
+	mux.HandleFunc("POST /api/devcloud/projects/create", h.handleDevcloudCreate)
+	mux.HandleFunc("/api/devcloud/projects/", h.handleDevcloudProjectAction)
+	mux.HandleFunc("/api/devcloud/tunnel", h.handleTunnel)
+	mux.HandleFunc("/api/devcloud/ws/ssh", h.handleDevcloudWSSSH)
+	// ZCode 登录卡片（代理 zcode-api 的 admin 登录端点）
+	mux.HandleFunc("/api/zcode/login/status", h.handleZcodeLoginStatus)
+	mux.HandleFunc("/api/zcode/login/init", h.handleZcodeLoginInit)
+	mux.HandleFunc("/api/zcode/login/complete", h.handleZcodeLoginComplete)
+	mux.HandleFunc("/api/zcode/login/logout", h.handleZcodeLoginLogout)
+	h.registerCheckinRoutes(mux)
 }
 
 // GitHub Stars cache
@@ -148,10 +141,6 @@ var (
 
 const ghStarsCacheTTL = 1 * time.Hour
 const ghRepo = "veenyi/XingyunAPI"
-
-// ghClient has a timeout so a slow/unreachable GitHub API can't hold a
-// handler goroutine indefinitely.
-var ghClient = &http.Client{Timeout: 10 * time.Second}
 
 func (h *Handler) handleGitHubStars(w http.ResponseWriter, r *http.Request) {
 	setCors(w)
@@ -173,7 +162,7 @@ func (h *Handler) handleGitHubStars(w http.ResponseWriter, r *http.Request) {
 	}
 	ghStarsMu.Unlock()
 
-	resp, err := ghClient.Get("https://api.github.com/repos/" + ghRepo)
+	resp, err := http.Get("https://api.github.com/repos/" + ghRepo)
 	if err != nil {
 		slog.Warn("github stars fetch failed", "error", err)
 		ghStarsMu.Lock()
@@ -263,16 +252,20 @@ var knownAPISet = map[string]bool{
 	"/audio/translations":    true,
 }
 
+// wantsHTML reports whether this is a browser page navigation. SDKs send
+// Accept: application/json and curl sends */*, so they keep the JSON hint.
+func wantsHTML(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
 // ServeStatic serves the SPA frontend for non-API routes.
 func (h *Handler) ServeStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	// Intercept known API paths that are missing the /v1/ prefix.
 	// Return a structured JSON 404 so SDKs get a clear error instead of HTML.
-	// 例外：/models 也是前端「模型与渠道」页的路由，浏览器刷新（Accept 含
-	// text/html）必须回落到 SPA index.html，否则刷新页面会看到 JSON 报错。
-	// 只有非浏览器（SDK/curl，Accept 不含 text/html）的裸 API 路径才给提示。
-	if knownAPISet[path] && !acceptsHTML(r) {
+	// /models doubles as an SPA route, so browsers must keep falling through.
+	if knownAPISet[path] && !wantsHTML(r) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{
 			"error": map[string]string{
 				"type":    "invalid_request_error",
@@ -297,9 +290,24 @@ func (h *Handler) ServeStatic(w http.ResponseWriter, r *http.Request) {
 		defer f.Close()
 		stat, _ := f.Stat()
 		if !stat.IsDir() {
+			if strings.HasPrefix(path, "/assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			http.ServeContent(w, r, filepath.Base(path), stat.ModTime(), readFileSeeker{f})
 			return
 		}
+	}
+
+	// A missing asset must never fall through to the SPA fallback: serving
+	// index.html under a .js URL lets browsers cache text/html for that exact
+	// URL, and module scripts then fail the strict MIME check with no way to
+	// revalidate (embed.FS has no modtime, so responses carry no validators).
+	if isStaticAssetPath(path) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
 	}
 
 	// SPA fallback
@@ -310,18 +318,24 @@ func (h *Handler) ServeStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	stat, _ := f.Stat()
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, "index.html", stat.ModTime(), readFileSeeker{f})
+}
+
+// isStaticAssetPath reports whether the URL targets a build asset rather than
+// an SPA route: SPA routes never carry a file extension.
+func isStaticAssetPath(path string) bool {
+	base := path
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	dot := strings.LastIndexByte(base, '.')
+	return dot > 0 && dot < len(base)-1
 }
 
 // readFileSeeker wraps fs.File to implement io.ReadSeeker.
 type readFileSeeker struct {
 	fs.File
-}
-
-// acceptsHTML 判定是否为浏览器导航请求（地址栏直达 / 刷新）。
-// 这类请求要回落到 SPA 前端，而不是当成漏写 /v1 前缀的 API 调用报错。
-func acceptsHTML(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
 func (r readFileSeeker) Seek(offset int64, whence int) (int64, error) {
@@ -400,6 +414,15 @@ func (h *Handler) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if h.store.GetSetting(jwtSecretKey) == "" {
 		secret := generateRandomHex(32)
 		h.store.SetSetting(jwtSecretKey, secret)
+	}
+
+	// 首次初始化自动生成聚合 Key（与「重新生成」同一格式与加密存储）
+	if v, err := h.store.GetSecretSetting("aggregate_key"); err == nil && strings.TrimSpace(v) == "" {
+		if err := h.store.SetSecretSetting("aggregate_key", "sk-joy-aggregate-"+generateRandomHex(12)); err != nil {
+			slog.Error("auth setup: generate aggregate key failed", "error", err)
+		} else {
+			slog.Info("auth: aggregate key auto-generated")
+		}
 	}
 
 	token, err := h.issueJWT()
@@ -507,31 +530,6 @@ func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 同步更新 .env 中的 PASSWORD 记录（TRIM_PKGVAR 由 cmd/main 注入）。
-	// 数据库是密码校验的唯一来源，.env 仅作记录；同步避免用户查 .env 看到旧密码产生困惑。
-	if pkgVar := os.Getenv("TRIM_PKGVAR"); pkgVar != "" {
-		envFile := filepath.Join(pkgVar, ".env")
-		if data, rerr := os.ReadFile(envFile); rerr == nil {
-			lines := strings.Split(string(data), "\n")
-			found := false
-			for i, l := range lines {
-				if strings.HasPrefix(l, "PASSWORD=") {
-					lines[i] = "PASSWORD=" + body.NewPassword
-					found = true
-					break
-				}
-			}
-			if !found {
-				lines = append(lines, "PASSWORD="+body.NewPassword)
-			}
-			if werr := os.WriteFile(envFile, []byte(strings.Join(lines, "\n")), 0600); werr != nil {
-				slog.Warn("change password: sync .env failed", "error", werr)
-			} else {
-				slog.Info("auth: root password changed and synced to .env")
-			}
-		}
-	}
-
 	slog.Info("auth: root password changed")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
@@ -569,9 +567,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	setCors(w)
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Error("writeJSON: encode failed", "error", err)
-	}
+	json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
@@ -632,32 +628,6 @@ func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"accounts": accounts})
 }
 
-// autoActivateAccount 后台自动激活新添加的账号。
-//
-// JoyCode 上游对新账号有灰度白名单限制（AI_GRAY_ACCESS_DENIED / "不在内测范围"），
-// 官方客户端首次发送一条聊天消息后账号才被放行。这里在账号入库后立即异步模拟
-// 客户端首聊（最小 chat 请求），让用户导入 ptKey 后无需手动下载/打开 JoyCode 激活。
-// 即使激活失败也无副作用：请求阶段还有 PostStreamWithActivation 等自动兜底。
-func autoActivateAccount(userID, ptKey string) {
-	if userID == "" || ptKey == "" {
-		return
-	}
-	go func() {
-		defer func() {
-			if p := recover(); p != nil {
-				slog.Error("auto-activate panic", "user_id", userID, "panic", p)
-			}
-		}()
-		cl := joycode.NewClient(ptKey, userID)
-		cl.SetTimeout(30 * time.Second)
-		if cl.TryActivate() {
-			slog.Info("dashboard: account auto-activated on add", "user_id", userID)
-		} else {
-			slog.Warn("dashboard: account activation not triggered", "user_id", userID)
-		}
-	}()
-}
-
 func (h *Handler) addAccount(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Nickname     string `json:"nickname"`
@@ -678,23 +648,12 @@ func (h *Handler) addAccount(w http.ResponseWriter, r *http.Request) {
 	if body.IsDefault != nil {
 		isDefault = *body.IsDefault
 	}
-	// If no explicit preference and there are no accounts yet, make this the
-	// default account (matches the QR/OAuth/auto-login paths' behavior so the
-	// "joycode" fallback key always routes to a real account).
-	if !isDefault {
-		if existing, _ := h.store.ListAccounts(); len(existing) == 0 {
-			isDefault = true
-		}
-	}
 
 	if err := h.store.AddAccount(body.UserID, body.PtKey, body.Nickname, isDefault, body.DefaultModel); err != nil {
 		slog.Error("add account", "user_id", body.UserID, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	// 后台自动激活（模拟客户端首聊），新账号无需手动下载 JoyCode 激活
-	autoActivateAccount(body.UserID, body.PtKey)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "user_id": body.UserID, "nickname": body.Nickname})
 }
@@ -769,14 +728,11 @@ func (h *Handler) handleAutoLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.AddAccountWithContext(userID, creds.PtKey, nickname, isDefault, "GLM-5.1",
-		creds.Tenant, creds.LoginType, creds.ColorBaseURL, creds.MasterBaseURL, creds.OrgFullName); err != nil {
+	if err := h.store.AddAccount(userID, creds.PtKey, nickname, isDefault, "GLM-5.1"); err != nil {
 		slog.Error("auto-login: save account failed", "user_id", userID, "error", err)
 		writeError(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 		return
 	}
-
-	autoActivateAccount(userID, creds.PtKey)
 
 	slog.Info("auto-login: account saved", "user_id", userID, "nickname", nickname)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -964,8 +920,6 @@ func (h *Handler) validateAndSavePtKey(ptKey string) (userID, nickname string, e
 		return "", "", fmt.Errorf("save account failed: %w", saveErr)
 	}
 
-	autoActivateAccount(userID, ptKey)
-
 	slog.Info("oauth: account saved", "user_id", userID, "nickname", nickname)
 	return userID, nickname, nil
 }
@@ -1140,8 +1094,6 @@ func (h *Handler) handleQRLoginStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	autoActivateAccount(result.UserID, result.PtKey)
-
 	slog.Info("qr-login: account saved", "user_id", result.UserID, "nickname", nickname)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":    "confirmed",
@@ -1190,12 +1142,12 @@ func (h *Handler) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		h.getAccountStats(w, r, apiKey)
 	case action == "logs" && r.Method == http.MethodGet:
 		h.getAccountLogs(w, r, apiKey)
+	case action == "point" && r.Method == http.MethodGet:
+		h.getAccountPoint(w, r, apiKey)
 	case action == "renew-token" && r.Method == http.MethodPost:
 		h.renewToken(w, r, apiKey)
 	case action == "remark" && r.Method == http.MethodPut:
 		h.updateRemark(w, r, apiKey)
-	case action == "point" && r.Method == http.MethodGet:
-		h.getAccountPoint(w, r, apiKey)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -1251,9 +1203,6 @@ func (h *Handler) validateAccount(w http.ResponseWriter, r *http.Request, apiKey
 	}
 
 	client := joycode.NewClient(account.PtKey, account.UserID)
-	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
-		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
-	}
 	valid := true
 	if err := client.Validate(); err != nil {
 		valid = false
@@ -1291,9 +1240,6 @@ func (h *Handler) listAccountModels(w http.ResponseWriter, r *http.Request, apiK
 	}
 
 	client := joycode.NewClient(account.PtKey, account.UserID)
-	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
-		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
-	}
 	models, err := client.ListModels()
 	if err != nil {
 		slog.Error("list account models", "api_key", apiKey, "error", err)
@@ -1344,6 +1290,34 @@ func (h *Handler) getAccountLogs(w http.ResponseWriter, r *http.Request, apiKey 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"logs": logs, "total": len(logs)})
 }
 
+// getAccountPoint 查询账号积分卡（/api/accounts/{id}/point，AccountDetail
+// 页每 60s 轮询）。上游 data 已含前端要的 usageItems/accountRole/detail。
+func (h *Handler) getAccountPoint(w http.ResponseWriter, r *http.Request, apiKey string) {
+	account, err := h.store.GetAccount(apiKey)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if account == nil {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	client := joycode.NewClient(account.PtKey, account.UserID)
+	resp, err := client.GetPoint()
+	if err != nil {
+		slog.Warn("get account point", "user_id", apiKey, "error", err)
+		writeError(w, http.StatusBadGateway, "查询积分失败: "+err.Error())
+		return
+	}
+	// 前端（Accounts 列表/AccountDetail/Dashboard）都在响应顶层读 usageItems，
+	// 不能包 {ok,data} 外壳，否则积分列全部显示「-」。
+	data, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		data = map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, data)
+}
+
 func (h *Handler) renewToken(w http.ResponseWriter, r *http.Request, apiKey string) {
 	token, err := h.store.RenewToken(apiKey)
 	if err != nil {
@@ -1368,46 +1342,6 @@ func (h *Handler) updateRemark(w http.ResponseWriter, r *http.Request, userID st
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "user_id": userID, "remark": body.Remark})
-}
-
-// getAccountPoint 查询账号的积分/套餐用量（上游 getNewIdePoint）。
-func (h *Handler) getAccountPoint(w http.ResponseWriter, r *http.Request, apiKey string) {
-	account, err := h.store.GetAccount(apiKey)
-	if err != nil {
-		slog.Error("get account", "api_key", apiKey, "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if account == nil {
-		writeError(w, http.StatusNotFound, "account not found")
-		return
-	}
-
-	client := joycode.NewClient(account.PtKey, account.UserID)
-	if account.Tenant != "" || account.LoginType != "" || account.ColorBaseURL != "" || account.MasterBaseURL != "" || account.OrgFullName != "" {
-		client.SetColorContext(account.ColorBaseURL, account.MasterBaseURL, account.Tenant, account.LoginType, account.OrgFullName)
-	}
-	resp, err := client.GetPoint()
-	if err != nil {
-		slog.Error("get account point", "api_key", apiKey, "error", err)
-		writeError(w, http.StatusBadGateway, "查询积分失败: "+err.Error())
-		return
-	}
-	code, ok := resp["code"].(float64)
-	if !ok || code != 0 {
-		msg, _ := resp["msg"].(string)
-		if msg == "" {
-			msg = "unknown error"
-		}
-		slog.Warn("get account point upstream error", "api_key", apiKey, "code", code, "msg", msg)
-		writeError(w, http.StatusOK, "上游返回错误: "+msg)
-		return
-	}
-	data, _ := resp["data"].(map[string]interface{})
-	if data == nil {
-		data = map[string]interface{}{}
-	}
-	writeJSON(w, http.StatusOK, data)
 }
 
 func (h *Handler) handleClearJoyCodeSession(w http.ResponseWriter, r *http.Request) {
@@ -1439,16 +1373,7 @@ func (h *Handler) handleClearJoyCodeSession(w http.ResponseWriter, r *http.Reque
 	}
 	defer db.Close()
 
-	// Use a transaction so the DELETE + UPDATE are atomic; a failure in the
-	// middle won't leave the JoyCode state DB half-cleaned.
-	tx, err := db.Begin()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "开启事务失败: "+err.Error())
-		return
-	}
-	defer tx.Rollback()
-
-	result, err := tx.Exec("DELETE FROM ItemTable WHERE key IN ('JoyCoder.IDE', 'joycode.storageUser')")
+	result, err := db.Exec("DELETE FROM ItemTable WHERE key IN ('JoyCoder.IDE', 'joycode.storageUser')")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "清除会话失败: "+err.Error())
 		return
@@ -1457,21 +1382,15 @@ func (h *Handler) handleClearJoyCodeSession(w http.ResponseWriter, r *http.Reque
 
 	// Also clear jdhLoginInfo from JoyCode.joycoder-editor to prevent auto-restore
 	var editorVal string
-	if err := tx.QueryRow("SELECT value FROM ItemTable WHERE key = 'JoyCode.joycoder-editor'").Scan(&editorVal); err == nil {
+	if err := db.QueryRow("SELECT value FROM ItemTable WHERE key = 'JoyCode.joycoder-editor'").Scan(&editorVal); err == nil {
 		var editor map[string]interface{}
 		if json.Unmarshal([]byte(editorVal), &editor) == nil {
 			delete(editor, "jdhLoginInfo")
 			if newVal, err := json.Marshal(editor); err == nil {
-				if _, err := tx.Exec("UPDATE ItemTable SET value = ? WHERE key = 'JoyCode.joycoder-editor'", string(newVal)); err == nil {
-					n++
-				}
+				db.Exec("UPDATE ItemTable SET value = ? WHERE key = 'JoyCode.joycoder-editor'", string(newVal))
+				n++
 			}
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, "提交事务失败: "+err.Error())
-		return
 	}
 
 	slog.Info("clear-joycode-session: cleared", "rows_affected", n)
@@ -1494,68 +1413,34 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 优先从上游实时获取模型列表（默认账号），失败时回退内置列表
-	models := h.modelList
-	if account, _ := h.store.GetDefaultAccount(); account != nil {
-		full, err := h.store.GetAccount(account.UserID)
-		if err == nil && full != nil {
-			client := joycode.NewClient(full.PtKey, full.UserID)
-			if full.Tenant != "" || full.LoginType != "" || full.ColorBaseURL != "" || full.MasterBaseURL != "" || full.OrgFullName != "" {
-				client.SetColorContext(full.ColorBaseURL, full.MasterBaseURL, full.Tenant, full.LoginType, full.OrgFullName)
-			}
-			if upstream, uerr := client.ListModels(); uerr == nil && len(upstream) > 0 {
-				names := make([]string, 0, len(upstream))
-				for _, m := range upstream {
-					name := m.ChatAPIModel
-					if name == "" {
-						name = m.Label
-					}
-					if name != "" {
-						names = append(names, name)
-					}
-				}
-				if len(names) > 0 {
-					models = names
-				}
-			} else {
-				slog.Debug("list models upstream fallback", "error", uerr)
-			}
+	// 聊天页下拉 = JoyCode 内置模型 ∪ 路由渠道模型（custom 等），去重。
+	models := append([]string(nil), h.modelList...)
+	if h.router != nil {
+		seen := make(map[string]bool, len(models))
+		for _, m := range models {
+			seen[m] = true
 		}
-	}
-
-	// 免登录 / 自带 Key 渠道的模型也列进下拉，看板聊天框才能直接测它们。
-	// 以 "渠道/模型" 前缀形式输出（B.AI/qwen3.8-max），同名模型按渠道区分。
-	list := append([]string(nil), models...)
-	seen := make(map[string]bool, len(list))
-	for _, m := range list {
-		seen[m] = true
-	}
-	for _, src := range h.channels() {
-		if src.Name == route.JoyCodeProvider || src.Models == nil {
-			continue
-		}
-		for _, m := range src.Models() {
-			if m == "" {
-				continue
+		for _, m := range route.CleanNames(h.router.ModelNames()) {
+			if !seen[m] {
+				seen[m] = true
+				models = append(models, m)
 			}
-			prefixed := src.Name + "/" + m
-			if seen[prefixed] {
-				continue
-			}
-			seen[prefixed] = true
-			list = append(list, prefixed)
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"models": modelInfos(list),
+		"models": modelInfos(models),
 	})
 }
 
 func modelInfos(models []string) []map[string]string {
 	result := make([]map[string]string, len(models))
 	for i, m := range models {
-		result[i] = map[string]string{"id": m, "name": m}
+		item := map[string]string{"id": m, "name": m}
+		if note, ok := joycode.ModelNotes[m]; ok {
+			item["note"] = note
+		}
+		result[i] = item
 	}
 	return result
 }
@@ -1628,11 +1513,18 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if settings == nil {
 			settings = map[string]string{}
 		}
-		// 整表原样返回会把上游 Key 明文带出浏览器；凭据键统一换成占位值，
-		// 键仍然在，前端表单能正常回填，提交时按"未修改"处理。
-		for k := range settings {
-			if store.IsSecretSetting(k) {
-				settings[k] = store.SecretMask
+		// 敏感键落库为密文：aggregate_key 解密回明文展示（聚合 Key 卡片
+		// 需要复制），其余密钥类打码。
+		for k, v := range settings {
+			if !store.IsSecretSetting(k) || v == "" {
+				continue
+			}
+			if k == "aggregate_key" {
+				if val, err := h.store.GetSecretSetting(k); err == nil {
+					settings[k] = val
+				}
+			} else {
+				settings[k] = "●●●●●●●●"
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"settings": settings})
@@ -1647,29 +1539,32 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		settings := make(map[string]string, len(raw))
-		secrets := make(map[string]string)
 		for k, v := range raw {
-			value := coerceSettingValue(v)
-			if !store.IsSecretSetting(k) {
-				settings[k] = value
+			settings[k] = coerceSettingValue(v)
+		}
+		plain := make(map[string]string, len(settings))
+		for k, v := range settings {
+			// 密钥类键：空值与打码占位都表示「保持不变」；其余走加密存储。
+			if store.IsSecretSetting(k) {
+				if v == "" || strings.Trim(v, "●") == "" {
+					continue
+				}
+				if err := h.store.SetSecretSetting(k, v); err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
 				continue
 			}
-			// 前端把 GET 里的占位值原样回填：这说明用户没改，不能覆盖真值。
-			if value == store.SecretMask {
-				continue
-			}
-			secrets[k] = value
+			plain[k] = v
 		}
-		if err := h.store.SetSettings(settings); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		for k, v := range secrets {
-			// 空值 = 删除：上游 Key 不该因为"清空输入框"而继续留在库里。
-			if err := h.store.SetSecretSetting(k, v); err != nil {
+		if len(plain) > 0 {
+			if err := h.store.SetSettings(plain); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+		}
+		if h.onSettingsSaved != nil {
+			h.onSettingsSaved(settings)
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 
@@ -1719,246 +1614,4 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"accounts": count,
 		"version":  version,
 	})
-}
-
-// handleChatHistory GET/POST /api/chat-history — 服务器端聊天历史
-func (h *Handler) handleChatHistory(w http.ResponseWriter, r *http.Request) {
-	setCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		userID := r.URL.Query().Get("user_id")
-		if userID == "" {
-			userID = "root"
-		}
-		data, err := h.store.GetChatHistory(userID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if data == "" {
-			data = "[]"
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"messages": json.RawMessage(data)})
-
-	case http.MethodPost:
-		var body struct {
-			UserID   string          `json:"user_id"`
-			Messages json.RawMessage `json:"messages"`
-		}
-		if !readJSONBody(w, r, &body) {
-			return
-		}
-		if body.UserID == "" {
-			body.UserID = "root"
-		}
-		if len(body.Messages) == 0 {
-			body.Messages = json.RawMessage("[]")
-		}
-		if err := h.store.SaveChatHistory(body.UserID, string(body.Messages)); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
-
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-// handleCustomProviders GET 列出 / PUT 保存自定义渠道。
-// PUT  接收 []ProviderEntry，将 api_key 加密后写入 settings.custom_providers。
-func (h *Handler) handleCustomProviders(w http.ResponseWriter, r *http.Request) {
-	setCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if h.CustomProviders == nil {
-		writeError(w, http.StatusNotFound, "custom providers not configured")
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"providers": h.CustomProviders.ListEntries(),
-		})
-	case http.MethodPut:
-		var entries []custom.ProviderEntry
-		if !readJSONBody(w, r, &entries) {
-			return
-		}
-		if err := h.CustomProviders.Save(entries); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// 重新加载以刷新内存中的客户端实例（无需重启）。
-		if err := h.CustomProviders.Load(); err != nil {
-			slog.Error("custom: reload after save failed", "error", err)
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-// handleChannelsRefresh POST /api/channels/refresh — 强制重拉所有免登录渠道
-// 的模型目录。免费名单随官方策略变动，看板"刷新"按钮走这里立即生效，
-// 不必等 6h 目录缓存过期。
-func (h *Handler) handleChannelsRefresh(w http.ResponseWriter, r *http.Request) {
-	setCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	results := map[string]interface{}{}
-	if h.KeyfreeClient != nil {
-		ids, err := h.KeyfreeClient.Client.RefreshNow()
-		entry := map[string]interface{}{"count": len(ids)}
-		if err != nil {
-			entry["error"] = err.Error()
-		}
-		results["opencode-free"] = entry
-	}
-	if h.KeyedClient != nil {
-		ids, err := h.KeyedClient.Client.RefreshNow()
-		entry := map[string]interface{}{"count": len(ids)}
-		if err != nil {
-			entry["error"] = err.Error()
-		}
-		results["keyed"] = entry
-	}
-	if h.Router9Client != nil {
-		ids, err := h.Router9Client.Client.RefreshNow()
-		entry := map[string]interface{}{"count": len(ids)}
-		if err != nil {
-			entry["error"] = err.Error()
-		}
-		results["9router"] = entry
-	}
-	if h.FreeLLMClient != nil {
-		ids, err := h.FreeLLMClient.Client.RefreshNow()
-		entry := map[string]interface{}{"count": len(ids)}
-		if err != nil {
-			entry["error"] = err.Error()
-		}
-		results["freellmapi"] = entry
-	}
-	if h.CustomProviders != nil {
-		for name, err := range h.CustomProviders.RefreshAll() {
-			entry := map[string]interface{}{}
-			if err != nil {
-				entry["error"] = err.Error()
-			}
-			results[name] = entry
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "results": results})
-}
-
-// handleModelBlocklist GET 列出 / PUT 覆写 / POST 增删单条 — 手动屏蔽模型。
-// 被屏蔽的模型从目录、路由与模型与渠道页面同时消失。
-func (h *Handler) handleModelBlocklist(w http.ResponseWriter, r *http.Request) {
-	setCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if h.store == nil {
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	raw := strings.TrimSpace(h.store.GetSetting(custom.SettingBlocklist))
-	readList := func() []string {
-		if raw == "" {
-			return []string{}
-		}
-		var keys []string
-		if json.Unmarshal([]byte(raw), &keys) != nil {
-			return []string{}
-		}
-		return keys
-	}
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]interface{}{"blocked": readList()})
-	case http.MethodPut:
-		var body struct {
-			Blocked []string `json:"blocked"`
-		}
-		if !readJSONBody(w, r, &body) {
-			return
-		}
-		cleaned := make([]string, 0, len(body.Blocked))
-		for _, k := range body.Blocked {
-			if k = strings.TrimSpace(k); k != "" {
-				cleaned = append(cleaned, strings.ToLower(k))
-			}
-		}
-		data, _ := json.Marshal(cleaned)
-		if err := h.store.SetSetting(custom.SettingBlocklist, string(data)); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "count": len(cleaned)})
-	case http.MethodPost:
-		var body struct {
-			Key    string `json:"key"`    // "provider|model"
-			Hidden bool   `json:"hidden"` // true=屏蔽 false=恢复
-		}
-		if !readJSONBody(w, r, &body) {
-			return
-		}
-		key := strings.ToLower(strings.TrimSpace(body.Key))
-		if key == "" {
-			writeError(w, http.StatusBadRequest, "key is required")
-			return
-		}
-		set := map[string]bool{}
-		for _, k := range readList() {
-			set[k] = true
-		}
-		if body.Hidden {
-			set[key] = true
-		} else {
-			delete(set, key)
-		}
-		out := make([]string, 0, len(set))
-		for k := range set {
-			out = append(out, k)
-		}
-		sort.Strings(out)
-		data, _ := json.Marshal(out)
-		if err := h.store.SetSetting(custom.SettingBlocklist, string(data)); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-// handleChannelPresets GET /api/channel-presets — 内置免费渠道预设清单
-// （B.AI/NVIDIA/Groq/Cerebras/Mistral/OpenRouter/ModelScope/SiliconFlow/Z.ai…）。
-// 自定义渠道表单一键填入官方地址，用户到对应官方申请 Key 即接入。
-func (h *Handler) handleChannelPresets(w http.ResponseWriter, r *http.Request) {
-	setCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"presets": keyed.Presets()})
 }

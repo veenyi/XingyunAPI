@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -26,19 +27,14 @@ const (
 )
 
 type Account struct {
-	UserID        string `json:"user_id"`
-	Nickname      string `json:"nickname"`
-	Remark        string `json:"remark"`
-	APIToken      string `json:"api_token"`
-	PtKey         string `json:"-"`
-	IsDefault     bool   `json:"is_default"`
-	DefaultModel  string `json:"default_model"`
-	CreatedAt     string `json:"created_at,omitempty"`
-	Tenant        string `json:"tenant"`
-	LoginType     string `json:"login_type"`
-	ColorBaseURL  string `json:"color_base_url"`
-	MasterBaseURL string `json:"master_base_url"`
-	OrgFullName   string `json:"org_full_name"`
+	UserID       string `json:"user_id"`
+	Nickname     string `json:"nickname"`
+	Remark       string `json:"remark"`
+	APIToken     string `json:"api_token"`
+	PtKey        string `json:"-"`
+	IsDefault    bool   `json:"is_default"`
+	DefaultModel string `json:"default_model"`
+	CreatedAt    string `json:"created_at,omitempty"`
 }
 
 func (a *Account) DisplayName() string {
@@ -282,39 +278,14 @@ func (s *Store) migrate() error {
 	}
 
 	// Migration: add error_message column to request_logs
-	if err := addColumnIfMissing(s.db, "request_logs", "error_message", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
+	s.db.Exec("ALTER TABLE request_logs ADD COLUMN error_message TEXT DEFAULT ''")
 
 	// Migration: add token columns to request_logs
-	if err := addColumnIfMissing(s.db, "request_logs", "input_tokens", "INTEGER DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(s.db, "request_logs", "output_tokens", "INTEGER DEFAULT 0"); err != nil {
-		return err
-	}
+	s.db.Exec("ALTER TABLE request_logs ADD COLUMN input_tokens INTEGER DEFAULT 0")
+	s.db.Exec("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER DEFAULT 0")
 
 	// Migration: add display_order column to accounts
-	if err := addColumnIfMissing(s.db, "accounts", "display_order", "INTEGER DEFAULT 0"); err != nil {
-		return err
-	}
-
-	// Migration: 账号专属网关上下文（官方客户端请求必需，写死默认会导致 401/AI_GRAY_ACCESS_DENIED）
-	if err := addColumnIfMissing(s.db, "accounts", "tenant", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(s.db, "accounts", "login_type", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(s.db, "accounts", "color_base_url", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(s.db, "accounts", "master_base_url", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(s.db, "accounts", "org_full_name", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
+	s.db.Exec("ALTER TABLE accounts ADD COLUMN display_order INTEGER DEFAULT 0")
 
 	// Migration: migrate old schema (api_key as PK) to new schema (user_id as PK)
 	s.migrateUserIDAsPK()
@@ -325,32 +296,7 @@ func (s *Store) migrate() error {
 	// Migration: initialize display_order for existing accounts
 	s.migrateDisplayOrder()
 
-	// Indexes for request_logs (added here so they exist for both fresh and
-	// upgraded databases; CREATE INDEX IF NOT EXISTS is a no-op if present).
-	if _, err := s.db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key);
-		CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at);
-		CREATE INDEX IF NOT EXISTS idx_request_logs_created_at_api_key ON request_logs(created_at, api_key);
-	`); err != nil {
-		slog.Warn("store: create request_logs indexes failed", "error", err)
-	}
-
 	return nil
-}
-
-// addColumnIfMissing runs `ALTER TABLE ... ADD COLUMN` and ignores the
-// "duplicate column name" error that SQLite returns when the column already
-// exists. Any other error (disk full, locked DB, ...) is returned to the
-// caller so migrations don't silently fail.
-func addColumnIfMissing(db *sql.DB, table, column, typeDef string) error {
-	_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typeDef))
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(err.Error(), "duplicate column name") {
-		return nil
-	}
-	return fmt.Errorf("migrate: add column %s.%s: %w", table, column, err)
 }
 
 // migrateUserIDAsPK migrates the old accounts table (api_key as PK) to the new
@@ -458,83 +404,26 @@ func (s *Store) migrateUserIDAsPK() {
 }
 
 // migrateUTCTimestamps converts existing UTC timestamps to localtime.
-//
-// Heuristic: if the newest request_log's created_at is roughly |offset| hours
-// behind (positive offset) or ahead (negative offset) of current localtime,
-// the data was stored in UTC and needs to be shifted by the offset.
-//
-// The check is against the NEWEST record so the migration is idempotent:
-// after shifting, the newest record sits at localtime and won't match again.
-// Supports non-integer-hour offsets (e.g. UTC+5:30) via fractional hours.
+// Uses SQLite to check if the newest record's time is behind local now by more than
+// 30 minutes -- if so, the data was stored in UTC and needs +offset hours.
 func (s *Store) migrateUTCTimestamps() {
 	_, offset := time.Now().Zone()
-	if offset == 0 {
+	hours := offset / 3600
+	if hours <= 0 {
 		return
 	}
-	hours := float64(offset) / 3600.0
-	absHours := hours
-	if absHours < 0 {
-		absHours = -absHours
-	}
-	// SQLite datetime modifiers accept fractional hours, e.g. "+8.5 hours".
-	// Format with enough precision for any real-world timezone offset.
-	shift := fmt.Sprintf("%+g hours", hours)
-
-	// Find the newest record. If it's more than ~30min off from localtime in
-	// the direction of the offset, treat all existing data as UTC-stored.
-	var newest string
-	err := s.db.QueryRow("SELECT MAX(created_at) FROM request_logs").Scan(&newest)
-	if err != nil || newest == "" {
+	// Check if the newest request_log is behind localtime by roughly the offset
+	var count int
+	s.db.QueryRow(fmt.Sprintf(
+		"SELECT COUNT(*) FROM request_logs WHERE created_at < datetime('now', 'localtime') - INTERVAL IS NOT SUPPORTED AND created_at < datetime('now', 'localtime', '-30 minutes')",
+	)).Scan(&count)
+	if count == 0 {
 		return
 	}
-
-	// diffExpr = localtime_now - newest (in hours, as a float string).
-	// For UTC+8 with UTC-stored data: newest is ~8h behind → diff ≈ +8.
-	// For UTC-5 with UTC-stored data: newest is ~5h ahead  → diff ≈ -5.
-	// We trigger when |diff| > (absHours - 0.5), i.e. the gap is close to the
-	// full offset and can't be explained by normal time passage.
-	var diff float64
-	err = s.db.QueryRow(
-		"SELECT (strftime('%s','now','localtime') - strftime('%s', ?)) / 3600.0",
-		newest,
-	).Scan(&diff)
-	if err != nil {
-		slog.Warn("migrateUTCTimestamps: diff query failed", "error", err)
-		return
-	}
-	// Same-sign check: positive offset expects positive diff (UTC behind local),
-	// negative offset expects negative diff (UTC ahead of local).
-	if (hours > 0 && diff < absHours-0.5) || (hours < 0 && diff > -absHours+0.5) {
-		return
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		slog.Warn("migrateUTCTimestamps: begin tx failed", "error", err)
-		return
-	}
-	defer tx.Rollback()
-
-	var fixed int64
-	for _, q := range []string{
-		"UPDATE request_logs SET created_at = datetime(created_at, '" + shift + "')",
-		"UPDATE accounts SET created_at = datetime(created_at, '" + shift + "')",
-		"UPDATE settings SET updated_at = datetime(updated_at, '" + shift + "')",
-	} {
-		res, err := tx.Exec(q)
-		if err != nil {
-			slog.Warn("migrateUTCTimestamps: update failed", "query", q, "error", err)
-			return
-		}
-		if n, err := res.RowsAffected(); err == nil {
-			fixed += n
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		slog.Warn("migrateUTCTimestamps: commit failed", "error", err)
-		return
-	}
-	slog.Info("migrated UTC timestamps to localtime", "offset_hours", hours, "records_fixed", fixed)
+	s.db.Exec(fmt.Sprintf("UPDATE request_logs SET created_at = datetime(created_at, '+%d hours') WHERE created_at < datetime('now', 'localtime', '-30 minutes')", hours))
+	s.db.Exec(fmt.Sprintf("UPDATE accounts SET created_at = datetime(created_at, '+%d hours') WHERE created_at < datetime('now', 'localtime', '-30 minutes')", hours))
+	s.db.Exec(fmt.Sprintf("UPDATE settings SET updated_at = datetime(updated_at, '+%d hours') WHERE updated_at < datetime('now', 'localtime', '-30 minutes')", hours))
+	slog.Info("migrated UTC timestamps to localtime", "offset_hours", hours, "records_fixed", count)
 }
 
 func (s *Store) migrateDisplayOrder() {
@@ -612,11 +501,9 @@ func (s *Store) decrypt(ciphertext string) (string, error) {
 
 // --- Account CRUD ---
 
-func (s *Store) AddAccount(userID, ptKey, nickname string, isDefault bool, defaultModel string) error {
-	return s.AddAccountWithContext(userID, ptKey, nickname, isDefault, defaultModel, "", "", "", "", "")
-}
+const MaxAccounts = 10
 
-func (s *Store) AddAccountWithContext(userID, ptKey, nickname string, isDefault bool, defaultModel, tenant, loginType, colorBaseURL, masterBaseURL, orgFullName string) error {
+func (s *Store) AddAccount(userID, ptKey, nickname string, isDefault bool, defaultModel string) error {
 	if userID == "" {
 		return fmt.Errorf("user_id cannot be empty")
 	}
@@ -637,8 +524,8 @@ func (s *Store) AddAccountWithContext(userID, ptKey, nickname string, isDefault 
 			return fmt.Errorf("encrypt pt_key: %w", err)
 		}
 		_, err = s.db.Exec(
-			"UPDATE accounts SET pt_key = ?, nickname = CASE WHEN nickname = '' OR nickname IS NULL THEN ? ELSE nickname END, tenant = ?, login_type = ?, color_base_url = ?, master_base_url = ?, org_full_name = ?, updated_at = datetime('now', 'localtime') WHERE user_id = ?",
-			encPtKey, nickname, tenant, loginType, colorBaseURL, masterBaseURL, orgFullName, userID,
+			"UPDATE accounts SET pt_key = ?, nickname = CASE WHEN nickname = '' OR nickname IS NULL THEN ? ELSE nickname END, updated_at = datetime('now', 'localtime') WHERE user_id = ?",
+			encPtKey, nickname, userID,
 		)
 		if err != nil {
 			slog.Error("store: update account failed", "user_id", userID, "error", err)
@@ -682,6 +569,13 @@ func (s *Store) AddAccountWithContext(userID, ptKey, nickname string, isDefault 
 			rows.Close()
 		}
 
+	// New account — enforce limit
+	var count int
+	s.db.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&count)
+	if count >= MaxAccounts {
+		return fmt.Errorf("账号数量已达上限（%d 个）。本工具仅供个人学习和研究使用，禁止用于商业转售、API 中转服务或任何违法违规用途", MaxAccounts)
+	}
+
 	encPtKey, err := s.encrypt(ptKey)
 	if err != nil {
 		slog.Error("store: encrypt pt_key failed", "user_id", userID, "error", err)
@@ -704,8 +598,8 @@ func (s *Store) AddAccountWithContext(userID, ptKey, nickname string, isDefault 
 
 	token := generateToken()
 	_, err = s.db.Exec(
-		"INSERT INTO accounts (user_id, nickname, api_token, pt_key, is_default, default_model, display_order, tenant, login_type, color_base_url, master_base_url, org_full_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		userID, nickname, token, encPtKey, def, defaultModel, maxOrder+1, tenant, loginType, colorBaseURL, masterBaseURL, orgFullName,
+		"INSERT INTO accounts (user_id, nickname, api_token, pt_key, is_default, default_model, display_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		userID, nickname, token, encPtKey, def, defaultModel, maxOrder+1,
 	)
 	if err != nil {
 		slog.Error("store: add account failed", "user_id", userID, "error", err)
@@ -743,37 +637,55 @@ func (s *Store) FillAccountStats(accounts []AccountInfo) {
 		return
 	}
 
-	// Single query with conditional aggregation for both all-time and today.
-	rows, err := s.db.Query(`
+	// All-time stats: single GROUP BY query
+	allRows, err := s.db.Query(`
 		SELECT api_key,
-			COUNT(*) as total_req,
-			COALESCE(SUM(input_tokens + output_tokens), 0) as total_tokens,
-			SUM(CASE WHEN date(created_at) = date('now', 'localtime') THEN 1 ELSE 0 END) as today_req,
-			COALESCE(SUM(CASE WHEN date(created_at) = date('now', 'localtime') THEN input_tokens + output_tokens ELSE 0 END), 0) as today_tokens
+			COUNT(*) as req_count,
+			COALESCE(SUM(input_tokens + output_tokens), 0) as token_sum
 		FROM request_logs
 		GROUP BY api_key`)
 	if err != nil {
-		slog.Warn("store: fill account stats query failed", "error", err)
 		return
 	}
-	defer rows.Close()
-
-	type stats struct{ totalReq, totalTok, todayReq, todayTok int }
-	m := make(map[string]stats)
-	for rows.Next() {
+	allMap := make(map[string][2]int)
+	for allRows.Next() {
 		var key string
-		var st stats
-		if err := rows.Scan(&key, &st.totalReq, &st.totalTok, &st.todayReq, &st.todayTok); err == nil {
-			m[key] = st
+		var reqCount, tokenSum int
+		if allRows.Scan(&key, &reqCount, &tokenSum) == nil {
+			allMap[key] = [2]int{reqCount, tokenSum}
 		}
 	}
+	allRows.Close()
+
+	// Today stats: single GROUP BY query
+	todayRows, err := s.db.Query(`
+		SELECT api_key,
+			COUNT(*) as req_count,
+			COALESCE(SUM(input_tokens + output_tokens), 0) as token_sum
+		FROM request_logs
+		WHERE date(created_at) = date('now', 'localtime')
+		GROUP BY api_key`)
+	if err != nil {
+		return
+	}
+	todayMap := make(map[string][2]int)
+	for todayRows.Next() {
+		var key string
+		var reqCount, tokenSum int
+		if todayRows.Scan(&key, &reqCount, &tokenSum) == nil {
+			todayMap[key] = [2]int{reqCount, tokenSum}
+		}
+	}
+	todayRows.Close()
 
 	for i := range accounts {
-		if v, ok := m[accounts[i].UserID]; ok {
-			accounts[i].TotalRequests = v.totalReq
-			accounts[i].TotalTokens = v.totalTok
-			accounts[i].TodayRequests = v.todayReq
-			accounts[i].TodayTokens = v.todayTok
+		if v, ok := allMap[accounts[i].UserID]; ok {
+			accounts[i].TotalRequests = v[0]
+			accounts[i].TotalTokens = v[1]
+		}
+		if v, ok := todayMap[accounts[i].UserID]; ok {
+			accounts[i].TodayRequests = v[0]
+			accounts[i].TodayTokens = v[1]
 		}
 	}
 }
@@ -783,9 +695,9 @@ func (s *Store) GetAccount(userID string) (*Account, error) {
 	var encPtKey string
 	var isDef int
 	err := s.db.QueryRow(
-		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts WHERE user_id = ?",
+		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at FROM accounts WHERE user_id = ?",
 		userID,
-	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName)
+	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -809,9 +721,9 @@ func (s *Store) GetAccountByToken(token string) (*Account, error) {
 	var encPtKey string
 	var isDef int
 	err := s.db.QueryRow(
-		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts WHERE api_token = ?",
+		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at FROM accounts WHERE api_token = ?",
 		token,
-	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName)
+	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, &isDef, &a.DefaultModel, &a.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -844,8 +756,8 @@ func (s *Store) GetDefaultAccount() (*Account, error) {
 	var a Account
 	var encPtKey string
 	err := s.db.QueryRow(
-		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts WHERE is_default = 1 LIMIT 1",
-	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, new(int), &a.DefaultModel, &a.CreatedAt, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName)
+		"SELECT user_id, nickname, remark, api_token, pt_key, is_default, default_model, created_at FROM accounts WHERE is_default = 1 LIMIT 1",
+	).Scan(&a.UserID, &a.Nickname, &a.Remark, &a.APIToken, &encPtKey, new(int), &a.DefaultModel, &a.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -932,24 +844,25 @@ func (s *Store) UpdateCredentialRefreshedAt(userID string) {
 	)
 }
 
-// SetCredentialValid 更新账号凭证校验结果，并推进 credential_refreshed_at。
-//
-// 必须同时推进时间戳：ListStaleAccounts 以 credential_refreshed_at 作为退避锚点
-// （失败账号按 4x 阈值拉长间隔）。此前只写 valid 不写时间，失败账号永远落在退避
-// 窗口之外，每分钟被重试一次 userInfo + 遥测 + 保活——对已失效会话持续打点，
-// 正是容易触发京东风控的行为。失败也要记一次时间，退避才真正生效。
+// SetCredentialValid updates the credential_valid status for an account.
 func (s *Store) SetCredentialValid(userID string, valid bool) {
 	v := 0
 	if valid {
 		v = 1
 	}
-	now := time.Now().Format("2006-01-02 15:04:05")
-	if _, err := s.db.Exec(
-		"UPDATE accounts SET credential_valid = ?, credential_refreshed_at = ? WHERE user_id = ?",
-		v, now, userID,
-	); err != nil {
-		slog.Error("store: set credential valid failed", "user_id", userID, "error", err)
-	}
+	s.db.Exec("UPDATE accounts SET credential_valid = ? WHERE user_id = ?", v, userID)
+}
+
+// ColorContext returns the color-gateway routing fields for an account
+// (all empty strings when unset).
+func (s *Store) ColorContext(userID string) (tenant, loginType, colorURL, masterURL, org string, err error) {
+	err = s.db.QueryRow(
+		`SELECT COALESCE(tenant,''), COALESCE(login_type,''), COALESCE(color_base_url,''),
+		        COALESCE(master_base_url,''), COALESCE(org_full_name,'')
+		 FROM accounts WHERE user_id = ?`,
+		userID,
+	).Scan(&tenant, &loginType, &colorURL, &masterURL, &org)
+	return
 }
 
 // ListStaleAccounts returns accounts that need credential checking.
@@ -960,7 +873,7 @@ func (s *Store) ListStaleAccounts(threshold time.Duration) ([]Account, error) {
 	normalCutoff := time.Now().Add(-threshold).Format("2006-01-02 15:04:05")
 	backoffCutoff := time.Now().Add(-threshold * 4).Format("2006-01-02 15:04:05")
 	rows, err := s.db.Query(
-		`SELECT user_id, nickname, pt_key, default_model, tenant, login_type, color_base_url, master_base_url, org_full_name FROM accounts
+		`SELECT user_id, nickname, pt_key, default_model FROM accounts
 		 WHERE credential_refreshed_at = ''
 		    OR credential_valid = -1
 		    OR (credential_valid = 1 AND credential_refreshed_at < ?)
@@ -978,7 +891,7 @@ func (s *Store) ListStaleAccounts(threshold time.Duration) ([]Account, error) {
 	for rows.Next() {
 		var a Account
 		var encPtKey string
-		if err := rows.Scan(&a.UserID, &a.Nickname, &encPtKey, &a.DefaultModel, &a.Tenant, &a.LoginType, &a.ColorBaseURL, &a.MasterBaseURL, &a.OrgFullName); err != nil {
+		if err := rows.Scan(&a.UserID, &a.Nickname, &encPtKey, &a.DefaultModel); err != nil {
 			slog.Error("store: list stale accounts scan failed", "error", err)
 			return nil, err
 		}
@@ -1095,10 +1008,7 @@ func (s *Store) GetSettings() (map[string]string, error) {
 
 func (s *Store) GetSetting(key string) string {
 	var val string
-	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val)
-	if err != nil && err != sql.ErrNoRows {
-		slog.Error("store: get setting failed", "key", key, "error", err)
-	}
+	s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val)
 	return val
 }
 
@@ -1125,58 +1035,6 @@ func (s *Store) SetSetting(key, value string) error {
 	return err
 }
 
-// SecretSettingKeys 是加密存放、且绝不能原样出现在 HTTP 响应里的设置键。
-// 新增上游凭据类设置只要往这里加一行，读写两侧就都自动受保护。
-// checkin_accounts / custom_providers 是整包凭据 JSON（内含加密 token），
-// 加进来防止 /api/settings 整表输出把凭据 blob 带进浏览器。
-var SecretSettingKeys = map[string]bool{
-	"keyed_api_key":   true,
-	"checkin_accounts": true,
-	"custom_providers": true,
-	"router9_api_key": true,
-	"freellm_api_key": true,
-}
-
-// IsSecretSetting 表示这个设置键属于凭据。
-func IsSecretSetting(key string) bool { return SecretSettingKeys[key] }
-
-// SecretMask 是敏感设置在 GET 响应里的占位值。前端表单会原样回填并再次提交，
-// 收到它就当作"用户没改这一项"，不能覆盖真值。
-const SecretMask = "********"
-
-// SetSecretSetting 用与账号 token 相同的 AES-GCM 密钥加密后存入 settings，
-// 避免上游 API Key 以明文躺在表里、再被 /api/settings 整表带出。空值表示删除。
-func (s *Store) SetSecretSetting(key, value string) error {
-	if strings.TrimSpace(value) == "" {
-		_, err := s.db.Exec("DELETE FROM settings WHERE key = ?", key)
-		if err != nil {
-			slog.Error("store: delete secret setting failed", "key", key, "error", err)
-		}
-		return err
-	}
-	sealed, err := s.encrypt(value)
-	if err != nil {
-		slog.Error("store: encrypt secret setting failed", "key", key, "error", err)
-		return err
-	}
-	return s.SetSetting(key, sealed)
-}
-
-// GetSecretSetting 解密敏感设置。解不开就当不存在——绝不回落到原样返回，
-// 否则误存的明文会被当成密钥发到上游。
-func (s *Store) GetSecretSetting(key string) string {
-	raw := s.GetSetting(key)
-	if raw == "" {
-		return ""
-	}
-	plain, err := s.decrypt(raw)
-	if err != nil {
-		slog.Error("store: decrypt secret setting failed", "key", key, "error", err)
-		return ""
-	}
-	return plain
-}
-
 func (s *Store) SetSettings(settings map[string]string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1195,6 +1053,118 @@ func (s *Store) SetSettings(settings map[string]string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// --- Secret Settings（落库前 AES 加密）---
+
+// Encrypt/Decrypt 供渠道包加密落库凭据（keyed 渠道 api key 等）。
+func (s *Store) Encrypt(plaintext string) (string, error) { return s.encrypt(plaintext) }
+func (s *Store) Decrypt(ciphertext string) (string, error) { return s.decrypt(ciphertext) }
+
+// SecretSettingKeys 列出需要加密存储（API 返回时打码）的设置键；
+// 渠道类密钥（keyed_<id>_key、<渠道>_api_key）也视为敏感（IsSecretSetting）。
+var SecretSettingKeys = []string{"aggregate_key"}
+
+func IsSecretSetting(key string) bool {
+	for _, k := range SecretSettingKeys {
+		if k == key {
+			return true
+		}
+	}
+	if strings.HasPrefix(key, "keyed_") && strings.HasSuffix(key, "_key") {
+		return true
+	}
+	return strings.HasSuffix(key, "_api_key")
+}
+
+func (s *Store) GetSecretSetting(key string) (string, error) {
+	enc := s.GetSetting(key)
+	if enc == "" {
+		return "", nil
+	}
+	val, err := s.decrypt(enc)
+	if err != nil {
+		slog.Error("store: decrypt secret setting failed", "key", key, "error", err)
+		return "", err
+	}
+	return val, nil
+}
+
+func (s *Store) SetSecretSetting(key, value string) error {
+	enc, err := s.encrypt(value)
+	if err != nil {
+		slog.Error("store: encrypt secret setting failed", "key", key, "error", err)
+		return err
+	}
+	return s.SetSetting(key, enc)
+}
+
+// AggregateKey returns the aggregate API key (used as one of the /v1 auth
+// credentials). Historical builds stored it in plaintext; such rows are
+// transparently migrated to encrypted storage on first read.
+func (s *Store) AggregateKey() string {
+	raw := s.GetSetting("aggregate_key")
+	if raw == "" {
+		return ""
+	}
+	val, err := s.decrypt(raw)
+	if err != nil {
+		// Not valid ciphertext: either plaintext legacy row or corrupt data.
+		if strings.HasPrefix(raw, "sk-joy-") {
+			if err := s.SetSecretSetting("aggregate_key", raw); err == nil {
+				slog.Info("store: migrated plaintext aggregate_key to encrypted storage")
+				return raw
+			}
+		}
+		slog.Error("store: aggregate_key unreadable", "error", err)
+		return ""
+	}
+	return val
+}
+
+// ValidAPIKey reports whether key is an accepted /v1 credential: an account
+// api_token, an account user_id, or the aggregate key.
+func (s *Store) ValidAPIKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	if s.AggregateKey() != "" && subtle.ConstantTimeCompare([]byte(key), []byte(s.AggregateKey())) == 1 {
+		return true
+	}
+	if a, _ := s.GetAccountByToken(key); a != nil {
+		return true
+	}
+	if a, _ := s.GetAccount(key); a != nil {
+		return true
+	}
+	return false
+}
+
+// --- Chat History（聊天页按 user_id 存最近 N 条消息 JSON）---
+
+func (s *Store) SaveChatHistory(userID, data string) error {
+	_, err := s.db.Exec(
+		"INSERT INTO chat_history (user_id, data, updated_at) VALUES (?, ?, datetime('now', 'localtime')) "+
+			"ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = datetime('now', 'localtime')",
+		userID, data,
+	)
+	if err != nil {
+		slog.Error("store: save chat history failed", "user_id", userID, "error", err)
+	}
+	return err
+}
+
+func (s *Store) GetChatHistory(userID string) (string, error) {
+	var data string
+	err := s.db.QueryRow("SELECT data FROM chat_history WHERE user_id = ?", userID).Scan(&data)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		slog.Error("store: get chat history failed", "user_id", userID, "error", err)
+		return "", err
+	}
+	return data, nil
 }
 
 // --- Request Logging ---
@@ -1222,30 +1192,19 @@ func (s *Store) GetStats() (*Stats, error) {
 	// near the day boundary for non-UTC servers.
 	tf := "date(created_at) = date('now', 'localtime')"
 
-	// Single aggregate query for all per-day totals (replaces 7 round-trips).
-	err := s.db.QueryRow(`
-		SELECT
-			COUNT(*),
-			COALESCE(AVG(latency_ms), 0),
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(input_tokens), 0),
-			COALESCE(SUM(output_tokens), 0)
-		FROM request_logs WHERE `+tf).Scan(
-		&stats.TotalRequests, &stats.AvgLatencyMs, &stats.ErrorCount,
-		&stats.StreamCount, &stats.SuccessCount,
-		&stats.TotalInputTk, &stats.TotalOutputTk,
-	)
+	err := s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE "+tf).Scan(&stats.TotalRequests)
 	if err != nil {
-		slog.Error("store: get stats aggregate failed", "error", err)
+		slog.Error("store: get stats count failed", "error", err)
 		return nil, err
 	}
 
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&stats.AccountsCount); err != nil {
-		slog.Error("store: get accounts count failed", "error", err)
-		return nil, err
-	}
+	s.db.QueryRow("SELECT COALESCE(AVG(latency_ms), 0) FROM request_logs WHERE "+tf).Scan(&stats.AvgLatencyMs)
+	s.db.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&stats.AccountsCount)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE "+tf+" AND status_code >= 400").Scan(&stats.ErrorCount)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE "+tf+" AND stream = 1").Scan(&stats.StreamCount)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE "+tf+" AND status_code < 400").Scan(&stats.SuccessCount)
+	s.db.QueryRow("SELECT COALESCE(SUM(input_tokens), 0) FROM request_logs WHERE "+tf).Scan(&stats.TotalInputTk)
+	s.db.QueryRow("SELECT COALESCE(SUM(output_tokens), 0) FROM request_logs WHERE "+tf).Scan(&stats.TotalOutputTk)
 
 	rows, err := s.db.Query("SELECT model, COUNT(*) as cnt FROM request_logs WHERE "+tf+" AND model != '' GROUP BY model ORDER BY cnt DESC")
 	if err != nil {
@@ -1294,17 +1253,10 @@ func (s *Store) GetStats() (*Stats, error) {
 
 func (s *Store) GetAllTimeTotals() (*AllTimeTotals, error) {
 	t := &AllTimeTotals{}
-	err := s.db.QueryRow(`
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(input_tokens), 0),
-			COALESCE(SUM(output_tokens), 0),
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0)
-		FROM request_logs`).Scan(&t.TotalRequests, &t.TotalInputTk, &t.TotalOutputTk, &t.ErrorCount)
-	if err != nil {
-		slog.Error("store: get all-time totals failed", "error", err)
-		return nil, err
-	}
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs").Scan(&t.TotalRequests)
+	s.db.QueryRow("SELECT COALESCE(SUM(input_tokens), 0) FROM request_logs").Scan(&t.TotalInputTk)
+	s.db.QueryRow("SELECT COALESCE(SUM(output_tokens), 0) FROM request_logs").Scan(&t.TotalOutputTk)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE status_code >= 400").Scan(&t.ErrorCount)
 	return t, nil
 }
 
@@ -1338,24 +1290,13 @@ func (s *Store) GetAccountStats(userID string) (*AccountStats, error) {
 	as := &AccountStats{UserID: userID}
 	tf := "created_at >= datetime('now', 'localtime', '-24 hours')"
 
-	err := s.db.QueryRow(`
-		SELECT
-			COUNT(*),
-			COALESCE(AVG(latency_ms), 0),
-			COALESCE(SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(input_tokens), 0),
-			COALESCE(SUM(output_tokens), 0)
-		FROM request_logs WHERE api_key = ? AND `+tf, userID).Scan(
-		&as.TotalRequests, &as.AvgLatencyMs, &as.StreamCount,
-		&as.ErrorCount, &as.SuccessCount,
-		&as.TotalInputTk, &as.TotalOutputTk,
-	)
-	if err != nil {
-		slog.Error("store: get account stats failed", "user_id", userID, "error", err)
-		return nil, err
-	}
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE api_key = ? AND "+tf, userID).Scan(&as.TotalRequests)
+	s.db.QueryRow("SELECT COALESCE(AVG(latency_ms), 0) FROM request_logs WHERE api_key = ? AND "+tf, userID).Scan(&as.AvgLatencyMs)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE api_key = ? AND stream = 1 AND "+tf, userID).Scan(&as.StreamCount)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE api_key = ? AND status_code >= 400 AND "+tf, userID).Scan(&as.ErrorCount)
+	s.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE api_key = ? AND status_code < 400 AND "+tf, userID).Scan(&as.SuccessCount)
+	s.db.QueryRow("SELECT COALESCE(SUM(input_tokens), 0) FROM request_logs WHERE api_key = ? AND "+tf, userID).Scan(&as.TotalInputTk)
+	s.db.QueryRow("SELECT COALESCE(SUM(output_tokens), 0) FROM request_logs WHERE api_key = ? AND "+tf, userID).Scan(&as.TotalOutputTk)
 
 	rows, err := s.db.Query("SELECT model, COUNT(*) as cnt FROM request_logs WHERE api_key = ? AND "+tf+" GROUP BY model ORDER BY cnt DESC", userID)
 	if err != nil {
@@ -1644,37 +1585,4 @@ func DBExists() bool {
 	}
 	_, err = os.Stat(path)
 	return err == nil
-}
-
-// GetChatHistory 读取用户聊天历史（JSON 数组）。
-func (s *Store) GetChatHistory(userID string) (string, error) {
-	var data string
-	err := s.db.QueryRow("SELECT data FROM chat_history WHERE user_id = ?", userID).Scan(&data)
-	if err != nil && err != sql.ErrNoRows {
-		slog.Error("store: get chat history failed", "user_id", userID, "error", err)
-		return "", err
-	}
-	return data, nil
-}
-
-// SaveChatHistory 保存用户聊天历史（JSON 数组）。
-func (s *Store) SaveChatHistory(userID, data string) error {
-	_, err := s.db.Exec(
-		"INSERT OR REPLACE INTO chat_history (user_id, data, updated_at) VALUES (?, ?, datetime('now', 'localtime'))",
-		userID, data,
-	)
-	if err != nil {
-		slog.Error("store: save chat history failed", "user_id", userID, "error", err)
-	}
-	return err
-}
-
-// Encrypt 对外暴露 AES-GCM 加密，供上层包（如 custom）对 JSON 内个别字段加密用。
-func (s *Store) Encrypt(plaintext string) (string, error) {
-	return s.encrypt(plaintext)
-}
-
-// Decrypt 对外暴露 AES-GCM 解密，供上层包（如 custom）对 JSON 内个别字段解密用。
-func (s *Store) Decrypt(ciphertext string) (string, error) {
-	return s.decrypt(ciphertext)
 }

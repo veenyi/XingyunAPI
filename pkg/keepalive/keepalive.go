@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/store"
 )
 
 // CredentialStatus represents the health of an account's credentials.
@@ -20,36 +20,23 @@ type CredentialStatus struct {
 
 // Keeper runs periodic keep-alive checks for all accounts.
 type Keeper struct {
-	store          *store.Store
-	mu             sync.RWMutex
-	status         map[string]*CredentialStatus
-	running        bool
-	stopCh         chan struct{}
-	refreshTTL     time.Duration          // max age before an account needs refresh
-	keepaliveTTL   time.Duration          // max age before an account needs a keepalive chat message
-	lastKeepalive  map[string]time.Time   // userID → 上次保活消息发送时间
+	store    *store.Store
+	mu       sync.RWMutex
+	status   map[string]*CredentialStatus
+	running  bool
+	stopCh   chan struct{}
+	refreshTTL time.Duration // max age before an account needs refresh
 }
 
 // NewKeeper creates a new keepalive keeper.
 // refreshTTL: how old a credential_refreshed_at can be before we re-check (e.g., 1h).
 func NewKeeper(s *store.Store, refreshTTL time.Duration) *Keeper {
 	return &Keeper{
-		store:         s,
-		status:        make(map[string]*CredentialStatus),
-		stopCh:        make(chan struct{}),
-		refreshTTL:    refreshTTL,
-		lastKeepalive: make(map[string]time.Time),
+		store:      s,
+		status:     make(map[string]*CredentialStatus),
+		stopCh:     make(chan struct{}),
+		refreshTTL: refreshTTL,
 	}
-}
-
-// SetKeepaliveTTL 设置账号保活间隔。超过该时长未发送保活消息的账号，
-// 会在下一轮 keepalive 循环中收到一条随机极短聊天消息（模拟 JoyCode 客户端对话，
-// 防止账号因长期无客户端活动被上游冻结）。0 或负值表示关闭保活。
-func (k *Keeper) SetKeepaliveTTL(ttl time.Duration) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.keepaliveTTL = ttl
-	slog.Info("keepalive: keepalive TTL set", "ttl", ttl.String())
 }
 
 // GetStatus returns the credential status for an account.
@@ -110,21 +97,6 @@ func (k *Keeper) Stop() {
 // checkStale queries accounts whose credential_refreshed_at exceeds the TTL
 // and refreshes only those. Accounts never refreshed (empty field) are always checked.
 func (k *Keeper) checkStale() {
-	// 保活：对所有账号检查（独立于凭据刷新状态），防止账号被上游冻结。
-	// ListStaleAccounts 只返回凭据过期的账号，保活必须覆盖全部账号。
-	if all, err := k.store.ListAccounts(); err == nil {
-		for _, acc := range all {
-			if acc.UserID == "" {
-				continue
-			}
-			full, gerr := k.store.GetAccount(acc.UserID)
-			if gerr != nil || full == nil || full.PtKey == "" {
-				continue
-			}
-			k.maybeKeepalive(full)
-		}
-	}
-
 	accounts, err := k.store.ListStaleAccounts(k.refreshTTL)
 	if err != nil {
 		slog.Error("keepalive: failed to list stale accounts", "error", err)
@@ -137,7 +109,7 @@ func (k *Keeper) checkStale() {
 	startTime := time.Now()
 	slog.Info("keepalive: round started", "stale_count", len(accounts), "refresh_ttl", k.refreshTTL)
 
-	var validCount, refreshedCount, failedCount int
+	var validCount, refreshedCount, warmedCount, failedCount int
 
 	for i, acc := range accounts {
 		slog.Info("keepalive: checking account",
@@ -146,19 +118,18 @@ func (k *Keeper) checkStale() {
 			"user_id", acc.UserID,
 		)
 
-		result := k.checkOne(&acc)
+		result := k.checkOne(acc.UserID, acc.PtKey, acc.UserID)
 
 		switch result {
 		case "valid":
 			validCount++
 		case "refreshed":
 			refreshedCount++
+		case "warmed":
+			warmedCount++
 		case "failed":
 			failedCount++
 		}
-
-		// 保活：模拟 JoyCode 客户端对话，防止账号被上游冻结
-		k.maybeKeepalive(&acc)
 
 		if i < len(accounts)-1 {
 			time.Sleep(5 * time.Second)
@@ -169,53 +140,17 @@ func (k *Keeper) checkStale() {
 		"duration", time.Since(startTime).Round(time.Millisecond),
 		"valid", validCount,
 		"refreshed", refreshedCount,
+		"warmed", warmedCount,
 		"failed", failedCount,
 		"total", len(accounts),
 	)
 }
 
-// maybeKeepalive 若账号距上次保活超过 keepaliveTTL，则发送一条随机极短聊天消息
-// （模拟 JoyCode 客户端对话）。京东上游会冻结长期无客户端活动的账号
-// （AI_GRAY_ACCESS_DENIED），定期对话可保持账号存活；若账号已被冻结，
-// 这条消息恰好也能触发激活放行。
-// 发送失败同样记录时间：等下一个 TTL 周期再试，避免每轮循环刷上游。
-func (k *Keeper) maybeKeepalive(acc *store.Account) {
-	if acc == nil || acc.UserID == "" || acc.PtKey == "" {
-		return
-	}
-	k.mu.RLock()
-	ttl := k.keepaliveTTL
-	last, seen := k.lastKeepalive[acc.UserID]
-	k.mu.RUnlock()
-	if ttl <= 0 {
-		return // 保活关闭
-	}
-	if seen && time.Since(last) < ttl {
-		return // 未到保活时间
-	}
-	k.mu.Lock()
-	k.lastKeepalive[acc.UserID] = time.Now()
-	k.mu.Unlock()
-
-	client := joycode.NewClient(acc.PtKey, acc.UserID)
-	// 账号专属网关上下文：写死默认值会导致 401 / AI_GRAY_ACCESS_DENIED
-	if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
-		client.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
-	}
-	client.SetTimeout(30 * time.Second)
-	// 先上报客户端遥测：上游的灰度授权窗口只认这个（chat 流量不计入活跃），
-	// 主动上报既能续期，也能在已冻结时立即解冻，不必等 SendKeepalive 被拒后补救。
-	_ = client.ReportClientActivity()
-	_ = client.ReportUsageMetrics()
-	client.SendKeepalive()
-}
-
-// checkOne validates a single account and refreshes pt_key if possible.
-// Returns "valid", "refreshed", or "failed".
-func (k *Keeper) checkOne(acc *store.Account) string {
-	apiKey := acc.UserID
-	userID := acc.UserID
-	ptKey := acc.PtKey
+// checkOne validates a single account, refreshes pt_key if possible, and
+// clears the gray-release activity gate (AI_GRAY_ACCESS_DENIED) by replaying
+// IDE telemetry when the color chat path is gated.
+// Returns "valid", "refreshed", "warmed", or "failed".
+func (k *Keeper) checkOne(apiKey, ptKey, userID string) string {
 	if userID == "" {
 		slog.Error("keepalive: checkOne called with empty userID")
 		return "failed"
@@ -223,14 +158,16 @@ func (k *Keeper) checkOne(acc *store.Account) string {
 
 	checkStart := time.Now()
 
-	client := joycode.NewClient(ptKey, userID)
-	// 校验与发消息必须用同一份网关上下文：企业账号(PIN_JD_CLOUD)用默认
-	// N_PIN_PC 登录态问 userInfo，上游会以"账号未登录"(401)拒绝——
-	// 凭证本未过期却被误判为已过期（2026-09-01 三账号全灭的根因）。
-	if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
-		client.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
+	buildClient := func(key string) *joycode.Client {
+		cl := joycode.NewClient(key, userID)
+		cl.SetTimeout(30 * time.Second)
+		if tenant, loginType, colorURL, masterURL, org, ctxErr := k.store.ColorContext(userID); ctxErr == nil {
+			cl.SetColorContext(colorURL, masterURL, tenant, loginType, org)
+		}
+		return cl
 	}
-	client.SetTimeout(30 * time.Second)
+
+	client := buildClient(ptKey)
 
 	refreshedPtKey, err := client.UserInfoWithRefresh()
 	checkDuration := time.Since(checkStart)
@@ -242,7 +179,6 @@ func (k *Keeper) checkOne(acc *store.Account) string {
 	if err != nil {
 		slog.Warn("keepalive: account check failed",
 			"user_id", apiKey,
-			"user_id", userID,
 			"error", err,
 			"duration", checkDuration,
 			"pt_key_prefix", maskKey(ptKey),
@@ -261,11 +197,11 @@ func (k *Keeper) checkOne(acc *store.Account) string {
 		Valid:       true,
 		LastChecked: now,
 	}
+	result := "valid"
 
 	if refreshedPtKey != "" && refreshedPtKey != ptKey {
 		slog.Info("keepalive: pt_key refresh available",
 			"user_id", apiKey,
-			"user_id", userID,
 			"old_prefix", maskKey(ptKey),
 			"new_prefix", maskKey(refreshedPtKey),
 		)
@@ -277,29 +213,26 @@ func (k *Keeper) checkOne(acc *store.Account) string {
 			)
 		} else {
 			status.LastRefreshed = now
+			result = "refreshed"
 
 			verifyClient := joycode.NewClient(refreshedPtKey, userID)
 			verifyClient.SetTimeout(15 * time.Second)
-			if acc.Tenant != "" || acc.LoginType != "" || acc.ColorBaseURL != "" || acc.MasterBaseURL != "" || acc.OrgFullName != "" {
-				verifyClient.SetColorContext(acc.ColorBaseURL, acc.MasterBaseURL, acc.Tenant, acc.LoginType, acc.OrgFullName)
-			}
 			if verifyErr := verifyClient.Validate(); verifyErr != nil {
 				slog.Error("keepalive: refreshed pt_key verification FAILED",
 					"user_id", apiKey,
-					"user_id", userID,
 					"error", verifyErr,
 				)
 			} else {
 				slog.Info("keepalive: refreshed pt_key verified OK",
 					"user_id", apiKey,
-					"user_id", userID,
 				)
 			}
 
 			slog.Info("keepalive: pt_key refreshed and saved",
 				"user_id", apiKey,
-				"user_id", userID,
 			)
+
+			client = buildClient(refreshedPtKey)
 		}
 	} else {
 		// No refresh needed, but update credential_refreshed_at so this account
@@ -308,16 +241,31 @@ func (k *Keeper) checkOne(acc *store.Account) string {
 
 		slog.Info("keepalive: account valid, no refresh needed",
 			"user_id", apiKey,
-			"user_id", userID,
 			"duration", checkDuration,
 		)
 	}
 
-	k.status[apiKey] = status
-	if refreshedPtKey != "" && refreshedPtKey != ptKey {
-		return "refreshed"
+	// saas 面正常不代表 color 聊天可用：灰度活跃门按 IDE 客户端活跃信号放行。
+	denied, probeErr := client.GrayDenied()
+	if denied {
+		slog.Warn("keepalive: gray gate active, replaying IDE telemetry", "user_id", apiKey)
+		if warmErr := client.WarmTelemetry(); warmErr != nil {
+			slog.Error("keepalive: telemetry warm failed", "user_id", apiKey, "error", warmErr)
+		}
+		time.Sleep(8 * time.Second)
+		if still, reErr := client.GrayDenied(); reErr == nil && !still {
+			result = "warmed"
+			slog.Info("keepalive: gray gate cleared after warm", "user_id", apiKey)
+		} else {
+			status.ErrorMessage = "AI_GRAY_ACCESS_DENIED persists after warm"
+			slog.Error("keepalive: gray gate still active after warm", "user_id", apiKey)
+		}
+	} else if probeErr != nil {
+		slog.Warn("keepalive: color chat probe failed", "user_id", apiKey, "error", probeErr)
 	}
-	return "valid"
+
+	k.status[apiKey] = status
+	return result
 }
 
 // maskKey returns a masked version of a pt_key for logging (first 6...last 6 chars).

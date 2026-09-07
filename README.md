@@ -1,152 +1,180 @@
-# 行云API（XingyunAPI）
+<div align="center">
 
-京东 JoyCode 模型在线服务平台 —— 把 JoyCode（京东 AI 编程助手）的模型能力转成标准 OpenAI / Anthropic 兼容接口，自带 Web 管理面板：在线聊天、账号管理、积分监控、多账号自动轮询。支持飞牛 fnOS 一键安装（FPK）。
+# JoyCode2Api
 
-## 功能特性
+**一个不太正经的协议翻译器**
 
-- **在线聊天**：复刻 JoyCode IDE 问答面板 —— 问答 / 编程双模式、深度思考展示、联网搜索自动触发（模型 tool call → 网页搜索 → 回填续跑）
-- **账号管理**：添加京东账号（OAuth 授权 / 手动粘贴 pt_key / 本机一键导入），数量不限
-- **积分监控**：实时显示每个账号的已用 / 剩余积分、套餐有效期，数据概览页汇总
-- **聚合 API Key**：一个 Key 自动在多个账号间按剩余积分轮询，积分不足自动切换，兼容 OpenAI / Anthropic 接口
-- **API 兼容**：`/v1/chat/completions`（OpenAI）、`/v1/messages`（Anthropic/Claude Code）、`/v1/models`
-- **深浅色主题**：跟随系统 / 浅色 / 深色一键切换
-- **飞牛应用中心**：应用详情页「打开」按钮直达面板，安装向导设置密码
+让 Claude Code、Cursor 这类工具能直接用上 JoyCode 的模型
 
-## 快速开始
+JoyAI-Code · GLM-5.1 · Kimi-K2.6 · MiniMax-M2.7 · Doubao-Seed-2.0-pro
 
-### 方式一：飞牛 fnOS 应用中心安装（推荐）
+[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat)](./LICENSE)
 
-1. 按设备架构下载 FPK（GitHub Releases）：
-   - `xingyun-api_vX.X.X.fpk` — x86_64 设备
-   - `xingyun-api_vX.X.X_arm64.fpk` — ARM 设备（如飞牛 ARM 机型）
-   - `xingyun-api-docker_vX.X.X.fpk` — Docker 版安装包（自动拉取 ghcr.io 镜像，x86_64 / ARM 通用）
-2. 打开飞牛应用中心 → 手动安装 → 上传对应 FPK
-3. 安装向导中设置面板密码（≥6 位，留空自动生成）
-4. 安装完成后点击「打开」进入面板（端口 **34891**）
+</div>
 
-### 方式二：直接运行二进制
+---
 
-```bash
-# 准备目录
-mkdir -p ~/xingyun && cd ~/xingyun
+> **免责声明：** 本项目仅供**个人学习和技术研究**使用。禁止用于商业转售、API 中转服务（**中转站属于违法行为**）、大规模薅号或任何黑灰产/违法违规活动。因不当使用造成的一切后果由使用者**自行承担**，与项目作者无关。本项目不是 JoyCode 官方产品。
 
-# Linux x64
-wget <release-url>/xingyun-api-linux-amd64
-chmod +x xingyun-api-linux-amd64
+---
 
-# 启动（面板端口 34891）
-./xingyun-api-linux-amd64 serve --port 34891
+## 起因
+
+事情是这样的：JoyCode（京东的 AI 编程助手）里面有一些不错的模型，GLM、Kimi、MiniMax、Doubao 这些都有。但它的 API 协议跟 Anthropic 和 OpenAI 的不一样，所以 Claude Code、Cursor 这些主流编程工具接不上。
+
+JoyCode2Api 就是在中间做了一个翻译层，把协议对齐了。改两个环境变量，Claude Code 就能直接用 JoyCode 的模型了。
+
+```
+Claude Code / Cursor / Windsurf  →  JoyCode2Api  →  JoyCode API
+                                    (协议翻译)
 ```
 
-首次访问 `http://<主机IP>:34891` 按提示设置 root 密码。
+说白了就这点事，没有多复杂。做这个东西初衷是学习 Go 和了解 API 协议的差异，顺便给自己用着方便。
 
-### 方式三：Docker 部署
+## 界面
+
+自带一个管理后台，账号、用量、配置都能在上面看和改。
+
+<div align="center">
+<img src="data/imgs/dashboard.png" alt="Dashboard" width="720" />
+<p><sub>数据概览 — 请求量、Token 消耗、延迟统计、模型分布</sub></p>
+</div>
+
+<div align="center">
+<img src="data/imgs/accounts.png" alt="账号管理" width="720" />
+<p><sub>账号管理 — 支持多个 JD 账号，扫码添加</sub></p>
+</div>
+
+<div align="center">
+<img src="data/imgs/account-detail.png" alt="账号详情" width="720" />
+<p><sub>账号详情 — 单个账号的用量、模型分布、请求记录</sub></p>
+</div>
+
+<div align="center">
+<img src="data/imgs/settings.png" alt="系统设置" width="720" />
+<p><sub>系统设置 — 默认模型、超时时间、日志保留，改完马上生效</sub></p>
+</div>
+
+## 能做什么
+
+- **Anthropic + OpenAI 双协议** — 同时兼容 Anthropic Messages API 和 OpenAI Chat Completions API，Claude Code 和 Cursor 各走各的通道
+- **Tool Use 完整翻译** — Claude Code 的工具调用（读写文件、执行命令等）完整映射，不影响正常使用
+- **SSE 流式输出** — 实时流式返回，打字机效果
+- **多模型可选** — JoyAI-Code、GLM-5.1、GLM-5、GLM-4.7、Kimi-K2.6、Kimi-K2.5、MiniMax-M2.7、Doubao-Seed-2.0-pro
+- **多账号管理** — Dashboard 上扫码添加多个 JD 账号，每个账号有独立的 API Key
+- **智能上下文截断** — 对话过长时自动截断早期消息，不会卡死，`/compact` 正常工作
+- **单文件部署** — 前端打包进 Go 二进制，丢一个文件就能跑，也支持 Docker
+
+## 怎么跑起来
+
+### 构建
+
+需要 Go 1.22+ 和 Node.js 18+。
 
 ```bash
-# 方式 A：直接拉取官方镜像（ghcr.io，推荐，支持 amd64 / arm64 双架构）
-docker pull ghcr.io/veenyi/xingyun-api:latest
-docker run -d --name xingyun-api \
-  -p 34891:34891 \
-  -v ./data:/data \
-  --restart unless-stopped \
-  ghcr.io/veenyi/xingyun-api:latest
+# 先构建前端
+cd web && npm install && npm run build && cd ..
 
-# 方式 B：源码构建
-git clone https://github.com/veenyi/XingyunAPI.git && cd XingyunAPI
-docker compose -f docker/docker-compose.yml up -d
-
-# 查看状态 / 日志
-docker ps
-docker logs -f xingyun-api
+# 再构建后端（前端会自动嵌入）
+go build -o JoyCode2Api ./cmd/JoyCode2Api/
 ```
 
-面板：`http://<主机IP>:34891`，数据（账号、设置、聊天历史）持久化在宿主机 `./data` 目录（镜像内 `/data`，即 `~/.joycode-proxy/`）。自定义端口：修改 `PORT` 环境变量与端口映射，或直接 `docker run -e PORT=xxxx -p xxxx:xxxx ghcr.io/veenyi/xingyun-api:latest`。镜像默认以 root 运行以保证绑定卷可写；如需更换数据目录，把 `-v ./data:/data` 改为你的目录即可。
-
-## 使用流程
-
-1. **登录面板**：浏览器打开 `http://<NAS_IP>:34891`，输入安装时设置的密码
-2. **添加账号**：「账号管理」→「OAuth 授权登录」（NAS 环境在弹窗中直接粘贴 pt_key）或「一键导入本地 JoyCode 已登录账户」（本机已装 JoyCode 且登录时）
-3. **聊天**：左侧「聊天」页直接对话，支持联网搜索与深度思考
-4. **API 接入**：在「账号管理」复制账号的 API Token，或用「聚合 API Key」（设置页可查看 / 重新生成）
-
-## API 使用
-
-### OpenAI 兼容
+或者用 Docker：
 
 ```bash
-curl http://<NAS_IP>:34891/v1/chat/completions \
-  -H "Authorization: Bearer <API_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"GLM-5.1","messages":[{"role":"user","content":"你好"}]}'
+docker build -t joycode-proxy .
+docker run -p 34891:34891 joycode-proxy
 ```
 
-### Claude Code
+> **构建时连不上 Alpine 源?** 如果 `docker build` 卡在 `apk add` 并报 `ca-certificates`/`gcc`/`musl-dev` "no such package"，根因通常是网络连不上官方源 `dl-cdn.alpinelinux.org`（国内常见）。用 `ALPINE_MIRROR` 构建参数切到国内镜像即可：
+>
+> ```bash
+> docker build \
+>   --build-arg ALPINE_MIRROR=https://mirrors.aliyun.com/alpine \
+>   -t joycode-proxy .
+> ```
+>
+> 镜像源任选其一（写到 `/alpine` 为止）：阿里云 `https://mirrors.aliyun.com/alpine`、清华 `https://mirrors.tuna.tsinghua.edu.cn/alpine`、中科大 `https://mirrors.ustc.edu.cn/alpine`。若 `go mod download` 也慢，可在构建环境设 `GOPROXY=https://goproxy.cn,direct`。
+
+### 启动
 
 ```bash
-export ANTHROPIC_BASE_URL="http://<NAS_IP>:34891"
-export ANTHROPIC_API_KEY="<API_TOKEN>"
-export ANTHROPIC_MODEL="GLM-5.1"
+./JoyCode2Api serve
+```
+
+默认监听 `0.0.0.0:34891`。macOS 首次启动会自动从本地 JoyCode 客户端读取凭据，不需要手动配。
+
+### 接到 Claude Code
+
+改两个环境变量就行：
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:34891
+export ANTHROPIC_API_KEY=joycode
+
 claude
 ```
 
-### 聚合 API Key（多账号自动轮询）
+### 多账号
 
-在「设置」页查看聚合 Key（`sk-joy-...`，可重新生成）。使用聚合 Key 请求时：
-
-- 自动查询所有账号剩余积分（缓存 60 秒）
-- 剩余积分 ≥ 阈值（默认 10，可在设置页调整）的账号视为可用
-- 可用账号之间轮流切换；全部不足时回退到积分最高的账号
+打开 `http://localhost:34891`，用 JD App 扫码添加账号。每个账号会生成一个独立的 API Key：
 
 ```bash
-curl http://<NAS_IP>:34891/v1/chat/completions \
-  -H "Authorization: Bearer <聚合KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"GLM-5.1","messages":[{"role":"user","content":"你好"}]}'
+export ANTHROPIC_API_KEY=sk-joy-xxxx
+claude
 ```
 
-## 常见问题
+### Docker / 远程部署登录
 
-**Q：无法从本机获取 JoyCode 凭据？**
-NAS 上没有安装 JoyCode IDE 属正常提示。请使用「OAuth 授权登录」粘贴 pt_key，或在已登录 JoyCode 的电脑上把 `state.vscdb` 上传到 NAS 后使用「一键导入」。
+非 macOS（尤其是 Docker）环境拿不到本地 JoyCode 客户端凭据，登录方式如下：
 
-**Q：模型列表与官方不一致？**
-模型列表实时从上游获取（账号有权访问的模型），获取失败时回退内置列表。
+1. **OAuth 授权（推荐）**：在 Dashboard 点「OAuth授权登录」，在打开的 JoyCode 页面完成授权。
+   - 本地直接部署时，回调会自动检测并添加账号。
+   - **Docker / 远程部署时，浏览器会跳转到一个无法访问的 `localhost` 页面，这是正常现象**。把该页面地址栏里的完整 URL（形如 `http://127.0.0.1:34891/?pt_key=xxx&...`）复制下来，粘贴进弹窗的输入框，点「提交授权」即可。弹窗里的粘贴框现在一打开就可见，不用再等。
+2. **手动添加**：若你已经有 `pt_key`，可在「手动添加」里直接填。
+   - `pt_key`：来自上面 OAuth 回调 URL 的 `pt_key` 参数，或本地 JoyCode IDE 的 `state.vscdb`。
+   - `user_id`：JoyCode 客户端 → 设置 → 个人信息。
+3. **挂载本地凭据**：如果宿主机装了 JoyCode IDE，可把其状态库挂进容器，让「一键导入」可用：
+   ```bash
+   docker run -p 34891:34891 \
+     -e JOYCODE_STATE_DB=/data/state.vscdb \
+     -v /path/to/JoyCode/state.vscdb:/data/state.vscdb:ro \
+     joycode-proxy
+   ```
 
-**Q：聚合 Key 失效？**
-聚合 Key 可在设置页重新生成，旧 Key 立即失效；如客户端 401，请更新为设置页显示的最新 Key。
+## API 端点
 
-## 开发构建
+| 路径 | 说明 |
+|------|------|
+| `POST /v1/messages` | Anthropic Messages API，Claude Code 走这个 |
+| `POST /v1/chat/completions` | OpenAI Chat Completions API，Cursor 走这个 |
+| `POST /v1/web-search` | 网页搜索 |
+| `POST /v1/rerank` | 文档重排序 |
+| `GET /v1/models` | 拉取可用模型列表 |
+| `GET /health` | 健康检查 |
+| `GET /` | Dashboard 管理界面 |
 
-```bash
-# 前端
-cd web && npm install && npm run build
+## 项目结构
 
-# 二进制（Linux x64）
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o xingyun-api ./cmd/JoyCode2Api
-
-# 飞牛 FPK 打包
-bash xingyun-api/build.sh   # 产物在 xingyun-api/pkg/
+```
+cmd/JoyCode2Api/    入口，HTTP 服务器
+pkg/anthropic/       Anthropic 协议翻译（请求、响应、SSE 流式）
+pkg/openai/          OpenAI 协议翻译
+pkg/joycode/         JoyCode API 客户端
+pkg/auth/            凭据读取、JD 扫码登录
+pkg/store/           SQLite 存储（账号、设置、请求日志）
+pkg/dashboard/       Dashboard API
+web/                 前端（React + Ant Design）
 ```
 
-## 使用立场与禁止商用
+## 使用限制
 
-本项目基于 [JoyCode2Api](https://github.com/vibe-coding-labs/JoyCode2Api)（Apache 2.0）衍生开发，并遵守上游开源许可。
+- 每个用户最多配置 **10 个账号**，超出限制将无法添加或导入
+- 使用本项目前，请确保你已了解并遵守 JoyCode 的服务条款
+- 如果你觉得 JoyCode 的模型好用，建议去 [JoyCode 官方](https://joycode.jd.com/) 支持正版
 
-**作者立场声明：**
+## 许可证
 
-- 本项目定位为**个人学习、内部研究、非商业环境**使用
-- 作者**不支持、不授权、不背书**任何将本项目用于商业目的的行为（包括但不限于：转售、打包售卖、对外提供收费服务、企业生产环境商业化部署等）
-- 任何商业使用均属于**使用者个人行为**，与作者无关；作者不对商业使用提供任何支持、维护或担保
-- 商用衍生、再分发需自行评估并遵守上游 Apache 2.0 许可及相关法律法规，由此产生的一切后果由使用者自行承担
-
-## 免责声明
-
-1. 本项目仅作为服务集成工具，不对上游软件（含第三方 API、模型服务、账号体系等）本身的安全性、稳定性、可用性作任何保证
-2. 使用者需自行确保其使用行为符合上游平台的服务条款与当地法律法规（如账号使用、接口调用、数据合规等）
-3. 因使用本项目产生的任何直接或间接损失（包括但不限于：数据丢失、账号封禁、服务中断、接口变更、法律纠纷等），作者均不承担责任
-4. 本项目按"现状"（AS-IS）提供，无任何明示或默示的担保；使用者自行承担全部使用风险
-5. 本项目不包含任何用户的账号、密钥、聊天记录等个人数据（均存储于使用者本地服务器）
-
-## License
-
-Apache 2.0（遵循上游 JoyCode2Api 许可；作者立场声明见上文「使用立场与禁止商用」）
+Apache 2.0

@@ -5,10 +5,10 @@ import (
 	"runtime"
 
 	"github.com/spf13/cobra"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
 )
 
-var Version = "0.6.6"
+var Version = "0.6.21"
 
 var versionCmd = &cobra.Command{
 	Use:     "version",

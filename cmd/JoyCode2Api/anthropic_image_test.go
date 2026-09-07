@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/anthropic"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/anthropic"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
 )
 
 // Regression for issue #4 (vision sub-bug): the Anthropic /v1/messages path

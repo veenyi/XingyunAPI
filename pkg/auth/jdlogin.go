@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
 )
 
 func minInt(a, b int) int {
@@ -26,10 +26,7 @@ func minInt(a, b int) int {
 const (
 	qrShowURL         = "https://qr.m.jd.com/show?appid=133&size=147&t=%d"
 	qrCheckURL        = "https://qr.m.jd.com/check?appid=133&token=%s&callback=jsonpCallback&_=%d"
-	// qrValidURL 对齐 joycode 网页端参数（appId/ssoDomains/ReturnUrl），否则不返回 pt_key cookie。
-	// 注意：这个常量会被当作 Sprintf 的格式串使用，ReturnUrl 里的百分号必须写成 %%，
-	// 否则 %3A/%2F 会被当成格式化动词，扫码登录请求的地址在运行时是坏的。
-	qrValidURL        = "https://passport.jd.com/uc/qrCodeTicketValidation?ReturnUrl=https%%3A%%2F%%2Fjoycode.jd.com%%2F&appId=133&t=%s&ssoDomains=sso.jdcloud.com"
+	qrValidURL        = "https://passport.jd.com/uc/qrCodeTicketValidation?t=%s"
 	jdUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 	qrSessionTTL      = 3 * time.Minute
 	qrCleanupInterval = 1 * time.Minute
@@ -95,18 +92,15 @@ func QRInit() (sessionID, qrImageBase64 string, err error) {
 	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
 
 	reqURL := fmt.Sprintf(qrShowURL, time.Now().UnixMilli())
-	req, err := http.NewRequest("GET", reqURL, nil)
-	if err != nil {
-		return "", "", fmt.Errorf("create QR request: %w", err)
-	}
+	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("User-Agent", jdUserAgent)
 	req.Header.Set("Referer", "https://passport.jd.com/new/login.aspx")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("request QR code: %w", err)
 	}
-	defer resp.Body.Close()
 	pngData, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if err != nil {
 		return "", "", fmt.Errorf("read QR image: %w", err)
 	}
@@ -149,10 +143,7 @@ func QRPollStatus(sessionID string) (status string, result *QRLoginResult, err e
 	}
 
 	reqURL := fmt.Sprintf(qrCheckURL, url.QueryEscape(session.Token), time.Now().UnixMilli())
-	req, err := http.NewRequest("GET", reqURL, nil)
-	if err != nil {
-		return "error", nil, fmt.Errorf("create qr-check request: %w", err)
-	}
+	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("User-Agent", jdUserAgent)
 	req.Header.Set("Referer", "https://passport.jd.com/new/login.aspx")
 	resp, err := session.client.Do(req)
@@ -160,11 +151,8 @@ func QRPollStatus(sessionID string) (status string, result *QRLoginResult, err e
 		slog.Error("qr-check request failed", "session", sessionID, "error", err)
 		return "error", nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "error", nil, fmt.Errorf("read qr-check response: %w", err)
-	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 
 	str := string(body)
 	start := strings.Index(str, "(")
@@ -257,10 +245,7 @@ func dumpAllCookies(jar http.CookieJar) {
 
 func validateAndFetchInfo(client *http.Client, ticket string) (*QRLoginResult, error) {
 	reqURL := fmt.Sprintf(qrValidURL, url.QueryEscape(ticket))
-	req, err := http.NewRequest("GET", reqURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create qr-validate request: %w", err)
-	}
+	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("User-Agent", jdUserAgent)
 	req.Header.Set("Referer", "https://passport.jd.com/new/login.aspx")
 
@@ -283,11 +268,8 @@ func validateAndFetchInfo(client *http.Client, ticket string) (*QRLoginResult, e
 	if err != nil {
 		return nil, fmt.Errorf("validate ticket: %w", err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read qr-validate response: %w", err)
-	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 
 	slog.Info("qr-validate response", "status", resp.StatusCode, "redirects", len(redirectChain), "body", string(body[:minInt(len(body), 500)]))
 	slog.Info("qr-validate resp-headers", "set-cookie", resp.Header.Values("Set-Cookie"))
@@ -329,20 +311,16 @@ func validateAndFetchInfo(client *http.Client, ticket string) (*QRLoginResult, e
 		if strings.HasPrefix(followURL, "http://") {
 			followURL = "https://" + followURL[7:]
 		}
-		rReq, err := http.NewRequest("GET", followURL, nil)
+		rReq, _ := http.NewRequest("GET", followURL, nil)
+		rReq.Header.Set("User-Agent", jdUserAgent)
+		rReq.Header.Set("Referer", "https://passport.jd.com/new/login.aspx")
+		rReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		rResp, err := client.Do(rReq)
 		if err != nil {
-			slog.Warn("qr-validate follow request creation failed", "url", followURL, "error", err)
+			slog.Warn("qr-validate URL follow failed", "error", err)
 		} else {
-			rReq.Header.Set("User-Agent", jdUserAgent)
-			rReq.Header.Set("Referer", "https://passport.jd.com/new/login.aspx")
-			rReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-			rResp, err := client.Do(rReq)
-			if err != nil {
-				slog.Warn("qr-validate URL follow failed", "error", err)
-			} else {
-				slog.Info("qr-validate URL resp", "status", rResp.StatusCode, "set-cookie", rResp.Header.Values("Set-Cookie"))
-				rResp.Body.Close()
-			}
+			slog.Info("qr-validate URL resp", "status", rResp.StatusCode, "set-cookie", rResp.Header.Values("Set-Cookie"))
+			rResp.Body.Close()
 		}
 		ptKey, ptPin = extractPtKey(client.Jar)
 	}

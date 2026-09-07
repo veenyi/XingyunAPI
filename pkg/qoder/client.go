@@ -1,522 +1,216 @@
-// client.go Qoder CN 核心客户端：HTTP 连接、ChatStream、token 刷新、配额查询。
 package qoder
 
+// Client 是 Qoder 上游聊天客户端：单次请求执行 + 模型目录抓取。
+// 账号轮换的重试语义在 Pool.DoChatWithRetry。
+
 import (
-	"crypto/tls"
-	"encoding/base64"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
-	"strings"
-	"sync"
 	"time"
 )
 
-// QoderAccount 是运行时账号表示（从 checkin.Account 同步而来）。
-type QoderAccount struct {
-	UID          string
-	Nickname     string
-	AccessToken  string // dt-
-	RefreshToken string // drt-
-	ExpiresAt    int64  // unix 秒
-	MachineID    string
-	MachineToken string
-	MachineType  string
-}
+// dynModelsTTL 是动态模型目录的刷新周期。
+const dynModelsTTL = 10 * time.Minute
 
-// NeedsRefresh 判断 token 是否需要刷新。
-func (a *QoderAccount) NeedsRefresh(skew time.Duration) bool {
-	if a.ExpiresAt <= 0 {
-		return true
-	}
-	return time.Now().Add(skew).Unix() >= a.ExpiresAt
-}
-
-// Client 是 Qoder CN 渠道客户端，实现 provider.Keyless。
+// Client 是 Qoder 网关客户端。
 type Client struct {
-	HTTP    *http.Client
-	Base    string // OpenAPIBase
-	Gateway string // GatewayBase
-
-	mu       sync.RWMutex
-	modelMap map[string]string // 动态 name→key 缓存
-
-	dynCache *dynamicModelsCache
-
-	accountsMu sync.RWMutex
-	accounts   []*QoderAccount
+	pool *Pool
+	http *http.Client
 }
 
-// New 创建 Qoder 客户端。强制 HTTP/1.1（网关 HTTP/2 有 INTERNAL_ERROR bug）。
-func New() *Client {
-	return &Client{
-		HTTP: &http.Client{
-			Timeout: 180 * time.Second,
-			Transport: &http.Transport{
-				TLSNextProto:        map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 20,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-		Base:     OpenAPIBase,
-		Gateway:  GatewayBase,
-		dynCache: &dynamicModelsCache{},
-	}
+func newClient(p *Pool, hc *http.Client) *Client {
+	return &Client{pool: p, http: hc}
 }
 
-func (c *Client) gatewayBase() string { return c.Gateway }
-func (c *Client) openapiBase() string { return c.Base }
+// Name 实现 provider.Keyless。
+func (c *Client) Name() string { return Name }
 
-// Name 返回渠道名（用于模型前缀 "qoder/model"）。
-func (c *Client) Name() string { return "qoder" }
+// Enabled 透传池开关。
+func (c *Client) Enabled() bool { return c.pool.Enabled() }
 
-// Enabled 当有至少一个活跃账号时启用。
-func (c *Client) Enabled() bool {
-	c.accountsMu.RLock()
-	defer c.accountsMu.RUnlock()
-	for _, a := range c.accounts {
-		if a.AccessToken != "" {
-			return true
-		}
-	}
-	return false
-}
+// ListModels 实现 provider.Keyless。
+func (c *Client) ListModels() []string { return c.pool.ListModels() }
 
-// SyncAccounts 从签到中心账号列表同步 Qoder 账号。
-func (c *Client) SyncAccounts(accs []*QoderAccount) {
-	c.accountsMu.Lock()
-	defer c.accountsMu.Unlock()
-	c.accounts = accs
-}
+// Supports 实现 provider.Keyless。
+func (c *Client) Supports(model string) bool { return c.pool.Supports(model) }
 
-// ListModels 返回可用模型列表：动态优先，静态兜底。
-func (c *Client) ListModels() ([]ModelEntry, error) {
-	if entries, ok := c.dynCache.get(); ok {
-		return c.entriesToModels(entries), nil
-	}
+// SyncAccounts 重载账号池。
+func (c *Client) SyncAccounts() { c.pool.SyncAccounts() }
 
-	c.accountsMu.RLock()
-	var acct *QoderAccount
-	for _, a := range c.accounts {
-		if a.AccessToken != "" {
-			acct = a
-			break
-		}
-	}
-	c.accountsMu.RUnlock()
-
-	if acct == nil {
-		return c.staticEntries(), nil
-	}
-
-	entries, err := c.FetchModels(acct)
-	c.dynCache.set(entries, err)
-	if err != nil {
-		slog.Warn("qoder: dynamic model fetch failed, using static", "error", err)
-		return c.staticEntries(), nil
-	}
-	return c.entriesToModels(entries), nil
-}
-
-// ModelEntry 是 ListModels 返回的模型条目。
-type ModelEntry struct {
-	ID            string
-	ContextWindow int
-}
-
-func (c *Client) entriesToModels(entries []DynamicModelEntry) []ModelEntry {
-	out := make([]ModelEntry, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, ModelEntry{ID: e.Name, ContextWindow: e.ContextWindow})
-	}
-	return out
-}
-
+// staticEntries 返回静态模型表（含 std↔custom 映射）。
 func (c *Client) staticEntries() []ModelEntry {
-	sm := StaticModels()
-	out := make([]ModelEntry, len(sm))
-	for i, m := range sm {
-		out[i] = ModelEntry{ID: m.ChatAPIModel, ContextWindow: m.MaxTotalTokens}
+	out := make([]ModelEntry, 0, len(StaticModels))
+	for _, m := range StaticModels {
+		std := NormalizeModelName(m)
+		out = append(out, ModelEntry{Name: std, Upstream: customModelName(std)})
 	}
 	return out
 }
 
-// Supports 判定该模型是否由 Qoder 渠道提供。
-func (c *Client) Supports(model string) bool {
-	if k := c.modelKey(model); k != "" {
-		return true
-	}
-	entries, ok := c.dynCache.get()
-	if !ok {
-		return false
-	}
-	for _, e := range entries {
-		if e.Name == model {
-			return true
-		}
-	}
-	return false
+// modelKey 返回模型的规范键（健康键/动态缓存查找用）。
+func (c *Client) modelKey(model string) string { return NormalizeModelName(model) }
+
+// pickAccount 按排除表挑一个账号（单次，无重试）。
+func (c *Client) pickAccount(exclude map[string]bool) *QoderAccount {
+	return c.pool.PickExcluding(exclude)
 }
 
-// Chat 非流式聊天：强制上游流式，本地聚合。
-func (c *Client) Chat(body map[string]any) (map[string]any, error) {
-	rawBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	rc, status, respBody, err := c.doChat(rawBody)
-	if err != nil {
-		return nil, err
-	}
-	if rc != nil {
-		defer rc.Close()
-		model, _ := body["model"].(string)
-		return aggregate(rc, model)
-	}
-	if respBody != nil {
-		var result map[string]any
-		if err := json.Unmarshal(respBody, &result); err != nil {
-			return nil, fmt.Errorf("upstream http %d: %s", status, truncateStr(string(respBody), 200))
-		}
-		return result, nil
-	}
-	return nil, fmt.Errorf("upstream http %d", status)
-}
-
-// ChatStream 流式聊天：返回上游 SSE 响应。
-func (c *Client) ChatStream(body map[string]any) (*http.Response, error) {
-	rawBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	rc, status, respBody, err := c.doChat(rawBody)
-	if err != nil {
-		return nil, err
-	}
-	if rc != nil {
-		return &http.Response{
-			StatusCode: status,
-			Body:       rc,
-			Header:     http.Header{"Content-Type": {"text/event-stream"}},
-		}, nil
-	}
-	if respBody != nil {
-		return &http.Response{
-			StatusCode: status,
-			Body:       io.NopCloser(strings.NewReader(string(respBody))),
-			Header:     http.Header{"Content-Type": {"application/json"}},
-		}, nil
-	}
-	return nil, fmt.Errorf("upstream http %d", status)
-}
-
-// doChat 选一个账号然后发请求（Client 直接调用，无粘性路由）。
-func (c *Client) doChat(rawBody []byte) (io.ReadCloser, int, []byte, error) {
-	acct := c.pickAccount()
+// FetchModels 拉取上游动态模型目录并写入缓存。
+func (c *Client) FetchModels(ctx context.Context) error {
+	acct := c.pickAccount(nil)
 	if acct == nil {
-		return nil, 0, nil, fmt.Errorf("no available qoder account")
+		return errors.New("qoder: 没有可用账号，无法拉取模型目录")
 	}
-	return c.doChatForAccount(acct, rawBody)
-}
-
-// doChatForAccount 对指定账号执行一次上游请求。
-func (c *Client) doChatForAccount(acct *QoderAccount, rawBody []byte) (io.ReadCloser, int, []byte, error) {
-	var peek struct {
-		Model           string           `json:"model"`
-		Messages        []map[string]any `json:"messages"`
-		Tools           []any            `json:"tools"`
-		ReasoningEffort string           `json:"reasoning_effort"`
-	}
-	if err := json.Unmarshal(rawBody, &peek); err != nil {
-		return nil, 0, nil, err
-	}
-
-	modelKey := c.modelKey(peek.Model)
-	if modelKey == "" {
-		modelKey = peek.Model
-	}
-
-	enableReasoning := peek.ReasoningEffort != ""
-
-	agentBody, err := buildAgentBody(peek.Messages, modelKey, peek.Tools, enableReasoning)
+	req, err := http.NewRequestWithContext(ctx, "GET", OpenAPIBase+modelsPath, nil)
 	if err != nil {
-		return nil, 0, nil, err
+		return err
 	}
-	encoded := qoderEncode(agentBody)
-	url := c.gatewayBase() + EpChat
-
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(encoded))
+	ApplyOpenAPIHeaders(req.Header, acct.AccessToken)
+	hc := c.http
+	if hc == nil {
+		hc = &http.Client{Timeout: 30 * time.Second}
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, 0, nil, err
+		return fmt.Errorf("qoder: 模型目录拉取失败: %w", err)
 	}
-	req.Header.Set("cosy-user", acct.UID)
-	sess, err := NewCosySession(acct.MachineID, acct.MachineToken, acct.MachineType, acct.Nickname, acct.UID, acct.AccessToken, acct.RefreshToken)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("cosy session: %w", err)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("qoder: 模型目录拉取失败: HTTP %d: %s", resp.StatusCode, truncateRunes(string(raw), 200))
 	}
-	if err := sess.ApplyHeaders(req, encoded, url, true, modelKey); err != nil {
-		return nil, 0, nil, err
+	var parsed struct {
+		Data []DynamicModelEntry `json:"data"`
 	}
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, 0, nil, err
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return fmt.Errorf("qoder: 模型目录解析失败: %w", err)
 	}
-
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		return nil, resp.StatusCode, raw, nil
-	}
-
-	return resp.Body, resp.StatusCode, nil, nil
-}
-
-// pickAccount 从池中选一个可用账号（简单轮询，pool.go 提供粘性路由）。
-func (c *Client) pickAccount() *QoderAccount {
-	c.accountsMu.RLock()
-	defer c.accountsMu.RUnlock()
-	for _, a := range c.accounts {
-		if a.AccessToken != "" {
-			return a
+	items := make([]DynamicModelEntry, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID != "" {
+			items = append(items, m)
 		}
 	}
+	dynModels.set(items)
 	return nil
 }
 
-// RefreshToken 刷新账号 token。POST /api/v1/deviceToken/refresh。
-func RefreshToken(a *QoderAccount) error {
-	if a.RefreshToken == "" {
-		return fmt.Errorf("no refresh token")
+// ensureModels 在缓存过期时后台刷新动态目录。
+func (c *Client) ensureModels() {
+	if !dynModels.stale(dynModelsTTL) {
+		return
 	}
-	url := OpenAPIBase + EpDTRefresh
-	payload := fmt.Sprintf(`{"refresh_token":%q}`, a.RefreshToken)
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return fmt.Errorf("session dead: http %d", resp.StatusCode)
-	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("refresh http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
-	}
-
-	var tok map[string]any
-	if err := json.Unmarshal(raw, &tok); err != nil {
-		return err
-	}
-
-	newToken := getStr(tok, "token")
-	if newToken == "" {
-		newToken = getStr(tok, "device_token")
-	}
-	if newToken == "" {
-		return fmt.Errorf("no token in refresh response")
-	}
-	newRefresh := getStr(tok, "refresh_token")
-	if newRefresh != "" {
-		a.RefreshToken = newRefresh
-	}
-	a.AccessToken = newToken
-
-	if ea, ok := tok["expires_at"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, ea); err == nil {
-			a.ExpiresAt = t.Unix()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	go func() {
+		defer cancel()
+		if err := c.FetchModels(ctx); err != nil {
+			// 退避内沿用上一次名单
+			return
 		}
-	} else if ei, ok := tok["expires_in"].(float64); ok {
-		// expires_in 单位是毫秒
-		a.ExpiresAt = time.Now().Add(time.Duration(ei) * time.Millisecond).Unix()
-	} else {
-		a.ExpiresAt = time.Now().Add(30 * 24 * time.Hour).Unix()
-	}
-
-	slog.Info("qoder: token refreshed", "uid", a.UID)
-	return nil
+	}()
 }
 
-// UserResource 查询账号余额。返回 (剩余积分, 总积分, error)。
-func UserResource(a *QoderAccount) (remain, total int64, err error) {
-	url := OpenAPIBase + EpQuotaUsage
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return 0, 0, err
+// Chat 单次非流式聊天（无账号重试）。
+func (c *Client) Chat(ctx context.Context, body map[string]interface{}) (map[string]interface{}, error) {
+	acct := c.pickAccount(nil)
+	if acct == nil {
+		return nil, errors.New("qoder: 没有可用账号")
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return 0, 0, fmt.Errorf("http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
-	}
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	slog.Info("qoder: UserResource raw response", "uid", a.UID, "status", resp.StatusCode, "body", truncateStr(string(raw), 500))
-
-	var data struct {
-		UserQuota struct {
-			Remaining float64 `json:"remaining"`
-			Total     float64 `json:"total"`
-		} `json:"userQuota"`
-		AddOnQuota struct {
-			Remaining float64 `json:"remaining"`
-			Total     float64 `json:"total"`
-		} `json:"addOnQuota"`
-	}
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return 0, 0, err
-	}
-	remain = int64(data.UserQuota.Remaining) + int64(data.AddOnQuota.Remaining)
-	total = int64(data.UserQuota.Total) + int64(data.AddOnQuota.Total)
-	return remain, total, nil
+	_, out, err := c.doChat(ctx, acct, body, false)
+	return out, err
 }
 
-// UserResourceF64 查询账号余额，保留小数精度。
-func UserResourceF64(a *QoderAccount) (remain, total float64, err error) {
-	url := OpenAPIBase + EpQuotaUsage
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// ChatStream 单次流式聊天（无账号重试），返回规范化后的 OpenAI SSE 流。
+func (c *Client) ChatStream(ctx context.Context, body map[string]interface{}) (io.ReadCloser, error) {
+	acct := c.pickAccount(nil)
+	if acct == nil {
+		return nil, errors.New("qoder: 没有可用账号")
+	}
+	resp, _, err := c.doChat(ctx, acct, body, true)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return 0, 0, fmt.Errorf("http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
-	}
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-
-	var data struct {
-		UserQuota struct {
-			Remaining float64 `json:"remaining"`
-			Total     float64 `json:"total"`
-		} `json:"userQuota"`
-		AddOnQuota struct {
-			Remaining float64 `json:"remaining"`
-			Total     float64 `json:"total"`
-		} `json:"addOnQuota"`
-	}
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return 0, 0, err
-	}
-	remain = data.UserQuota.Remaining + data.AddOnQuota.Remaining
-	total = data.UserQuota.Total + data.AddOnQuota.Total
-	return remain, total, nil
+	return resp, nil
 }
 
-// EnsureFingerprint 为账号生成持久机器指纹（幂等）。
-func EnsureFingerprint(a *QoderAccount) {
-	if a.MachineID == "" {
-		a.MachineID = uuid4()
+// doChatForAccount 单账号非流式聊天（Pool 轮换循环的每步调用）。
+func (c *Client) doChatForAccount(ctx context.Context, acct *QoderAccount, body map[string]interface{}) (map[string]interface{}, error) {
+	_, out, err := c.doChat(ctx, acct, body, false)
+	return out, err
+}
+
+// doChat 执行一次网关聊天请求：stream=true 返回规范化 SSE 流，
+// 否则返回聚合后的 OpenAI 形状响应（两个返回值二选一）。
+func (c *Client) doChat(ctx context.Context, acct *QoderAccount, body map[string]interface{}, stream bool) (io.ReadCloser, map[string]interface{}, error) {
+	if acct.AccessToken == "" && acct.RefreshToken == "" {
+		return nil, nil, errors.New("qoder: 账号缺少令牌，请重新登录")
 	}
-	if a.MachineToken == "" {
-		raw := uuid4() + uuid4()
-		a.MachineToken = base64.RawURLEncoding.EncodeToString([]byte(raw))[:50]
+	payload, err := json.Marshal(buildAgentBody(acct, body, stream))
+	if err != nil {
+		return nil, nil, err
 	}
-	if a.MachineType == "" {
-		id := uuid4()
-		id = strings.ReplaceAll(id, "-", "")
-		if len(id) > 18 {
-			id = id[:18]
+	req, err := http.NewRequestWithContext(ctx, "POST", GatewayBase+chatPath, bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, err
+	}
+	sessionFor(acct).ApplyHeaders(req.Header)
+	hc := c.http
+	if hc == nil {
+		hc = &http.Client{Timeout: 30 * time.Minute}
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("qoder: 聊天请求失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, nil, fmt.Errorf("qoder: HTTP %d: %s", resp.StatusCode, truncateRunes(string(raw), 300))
+	}
+	if stream {
+		return normalizeQoderStream(resp.Body), nil, nil
+	}
+	model := NormalizeModelName(fmt.Sprint(body["model"]))
+	out, err := decodeChatResponse(resp, model)
+	if err != nil {
+		return nil, nil, err
+	}
+	if msg := errorMessage(out); msg != "" {
+		return nil, nil, errors.New(msg)
+	}
+	return nil, out, nil
+}
+
+// errorMessage 提取 200 响应体内嵌的错误对象文本。
+func errorMessage(out map[string]interface{}) string {
+	e, ok := out["error"]
+	if !ok {
+		return ""
+	}
+	switch v := e.(type) {
+	case map[string]interface{}:
+		if m, _ := v["message"].(string); m != "" {
+			return m
 		}
-		a.MachineType = id
-	}
-}
-
-// Classify 将上游 HTTP 状态码 + 响应体分类为错误类型。
-func Classify(status int, body string) ErrKind {
-	if status == 402 {
-		return ErrHardCredit
-	}
-	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, m) {
-			return ErrHardCredit
-		}
-	}
-	if status == 401 {
-		return ErrSessionDead
-	}
-	if status == 429 {
-		return ErrSoftRate
-	}
-	if status == 404 {
-		return ErrNotFound
-	}
-	if status >= 500 {
-		return ErrServer
-	}
-	if status >= 400 {
-		return ErrClient
-	}
-	return ErrNone
-}
-
-// ErrKind 错误分类。
-type ErrKind int
-
-const (
-	ErrNone        ErrKind = iota
-	ErrHardCredit          // 余额/权益不足 → 长冷却
-	ErrSoftRate            // 429 → 短冷却
-	ErrSessionDead         // 登录态失效 → 禁用
-	ErrNotFound            // 404 → 短冷却
-	ErrServer              // 5xx
-	ErrClient              // 其他 4xx
-)
-
-var hardMarkers = []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
-	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
-	"not enough credit", "isquotaexceeded\":true",
-	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
-}
-
-// StreamUpstream 将上游 SSE 流直接转写为 OpenAI SSE 响应。
-func StreamUpstream(w http.ResponseWriter, r io.Reader, model string) error {
-	return Stream(w, r, model)
-}
-
-// AggregateUpstream 将上游 SSE 流聚合为 OpenAI completion。
-func AggregateUpstream(r io.Reader, model string) (map[string]any, error) {
-	return aggregate(r, model)
-}
-
-func getStr(m map[string]any, key string) string {
-	if v, ok := m[key].(string); ok {
+		raw, _ := json.Marshal(v)
+		return string(raw)
+	case string:
 		return v
 	}
-	return ""
+	return fmt.Sprintf("upstream error: %v", e)
+}
+
+// sessionFor 用账号字段构造 Cosy 会话。
+func sessionFor(acct *QoderAccount) *CosySession {
+	s := NewCosySession(acct.AccessToken, acct.RefreshToken, acct.MachineID)
+	s.MachineID = acct.MachineID
+	s.MachineType = acct.MachineType
+	s.Region = acct.Region
+	s.EnterpriseID = acct.EnterpriseID
+	return s
 }

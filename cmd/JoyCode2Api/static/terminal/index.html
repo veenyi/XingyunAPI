@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>云主机 SSH 终端 — 行云API</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #14161a; color: #d6dae0;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: #1b1e24; border-bottom: 1px solid #2a2e36;
+  }
+  header .title { font-weight: 600; margin-right: 6px; }
+  select, button {
+    background: #262b33; color: #d6dae0; border: 1px solid #3a414c;
+    border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  select { min-width: 180px; }
+  button:hover { background: #313845; }
+  button.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  button.primary:hover { background: #3f7cf0; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { font-size: 12px; color: #8b93a1; margin-left: auto; }
+  #status.ok { color: #4cc38a; } #status.err { color: #e5534b; }
+  #term {
+    flex: 1; min-height: 0; padding: 6px 10px;
+  }
+  #loginHint {
+    margin: 40px auto; max-width: 420px; text-align: center; color: #8b93a1;
+    font-size: 14px; line-height: 1.8; display: none;
+  }
+  #loginHint a { color: #5b9bff; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">云主机 SSH 终端</span>
+  <select id="host"><option value="">加载中…</option></select>
+  <button id="connectBtn" class="primary">连接</button>
+  <button id="startBtn">开机</button>
+  <button id="stopBtn">关机</button>
+  <span id="status">未连接</span>
+</header>
+<div id="term"></div>
+<div id="loginHint">
+  登录态无效或已过期。<br>
+  请先到 <a href="/">行云API 面板</a> 登录，然后回到本页。
+</div>
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script src="addon-web-links.js"></script>
+<script>
+(function () {
+  var statusEl = document.getElementById('status');
+  var hostEl = document.getElementById('host');
+  var connectBtn = document.getElementById('connectBtn');
+  var startBtn = document.getElementById('startBtn');
+  var stopBtn = document.getElementById('stopBtn');
+  var loginHint = document.getElementById('loginHint');
+  var termEl = document.getElementById('term');
+
+  var token = localStorage.getItem('joycode_jwt') || '';
+  var projects = [];
+  var ws = null, term = null, fitAddon = null;
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || '';
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ 'Authorization': 'Bearer ' + token }, opts.headers || {});
+    return fetch(path, opts);
+  }
+
+  function initTerm() {
+    if (term) return;
+    term = new window.Terminal({
+      fontFamily: 'Consolas, "Courier New", monospace',
+      fontSize: 14,
+      theme: { background: '#14161a', foreground: '#d6dae0', cursor: '#5b9bff' },
+      scrollback: 5000,
+      cursorBlink: true
+    });
+    fitAddon = new window.FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+    term.open(termEl);
+    // 键盘与粘贴输入回传：二进制帧（文本帧留给 resize 控制协议）
+    var encoder = new TextEncoder();
+    term.onData(function (d) {
+      if (ws && ws.readyState === 1) ws.send(encoder.encode(d));
+    });
+    term.onResize(function (s) {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'resize', cols: s.cols, rows: s.rows }));
+      }
+    });
+    fitAddon.fit();
+    window.addEventListener('resize', function () {
+      fitAddon.fit();
+      sendResize();
+    });
+  }
+
+  function sendResize() {
+    if (ws && ws.readyState === 1 && term) {
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+    }
+  }
+
+  function currentProject() {
+    if (hostEl.value === '') return null;
+    return projects[Number(hostEl.value)] || null;
+  }
+
+  function projectAccount(p) {
+    return (p && (p.accountUserId || p.account_user_id)) || '';
+  }
+
+  function projectDisplay(p) {
+    return (p && (p.accountDisplay || p.account_display)) || '默认账号';
+  }
+
+  function loadHosts() {
+    if (!token) { loginHint.style.display = 'block'; return; }
+    api('/api/devcloud/projects').then(function (r) {
+      if (r.status === 401) {
+        loginHint.style.display = 'block';
+        setStatus('登录态无效', 'err');
+        return null;
+      }
+      return r.json();
+    }).then(function (d) {
+      if (!d) return;
+      projects = d.projects || [];
+      hostEl.innerHTML = '';
+      projects.forEach(function (p, idx) {
+        var opt = document.createElement('option');
+        opt.value = idx;
+        opt.textContent = p.name + '（' + (p.status || '?') + '）— ' + projectDisplay(p);
+        hostEl.appendChild(opt);
+      });
+      if (!projects.length) {
+        hostEl.innerHTML = '<option value="">无云主机</option>';
+      }
+      var errs = d.errors || [];
+      setStatus(errs.length ? '部分账号查询失败' : '就绪', errs.length ? 'err' : 'ok');
+    }).catch(function (e) {
+      setStatus('加载失败: ' + e, 'err');
+    });
+  }
+
+  function disconnect() {
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  }
+
+  function connect() {
+    var p = currentProject();
+    if (!p) return;
+    initTerm();
+    term.reset();
+    disconnect();
+    setStatus('连接中…');
+    connectBtn.disabled = true;
+    var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    var url = proto + '://' + location.host +
+      '/api/devcloud/ws/ssh?project=' + encodeURIComponent(p.id) +
+      '&account=' + encodeURIComponent(projectAccount(p)) +
+      '&token=' + encodeURIComponent(token);
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () {
+      setStatus('已连接 ' + p.name, 'ok');
+      sendResize();
+      term.focus();
+    };
+    ws.onmessage = function (ev) {
+      term.write(typeof ev.data === 'string' ? ev.data : new Uint8Array(ev.data));
+    };
+    ws.onclose = function (ev) {
+      var msg = ev.reason ? '（' + ev.reason + '）' : '';
+      setStatus('已断开 ' + msg, ev.wasClean ? '' : 'err');
+      connectBtn.disabled = false;
+    };
+    ws.onerror = function () { setStatus('连接错误', 'err'); };
+  }
+
+  function power(action) {
+    var p = currentProject();
+    if (!p) return;
+    api('/api/devcloud/projects/' + p.id + '/' + action + '?account=' + encodeURIComponent(projectAccount(p)), { method: 'POST' })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d || {} }; }); })
+      .then(function (res) {
+        if (!res.ok) { setStatus(action + ' 失败: ' + (res.d.detail || res.d.message || ''), 'err'); return; }
+        setStatus(action + ' 指令已发送', 'ok');
+        setTimeout(loadHosts, 4000);
+      }).catch(function (e) { setStatus(action + ' 失败: ' + e, 'err'); });
+  }
+
+  connectBtn.onclick = connect;
+  startBtn.onclick = function () { power('start'); };
+  stopBtn.onclick = function () { power('stop'); };
+  loadHosts();
+})();
+</script>
+</body>
+</html>

@@ -1,175 +1,108 @@
-// models.go 动态模型拉取：COSY 签名 GET，body 必须为空串。
 package qoder
 
+// 模型表：静态模型 + 动态目录缓存 + std↔custom 名称映射。
+
 import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"log/slog"
-	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-var nonAlphaNum = regexp.MustCompile(`[^a-z0-9.]+`)
+// StaticModels 是内置静态模型（strings-notes §4）。
+var StaticModels = []string{"qmodel_latest", "qwen3.7-flash", "qwen3.6-flash"}
 
-// NormalizeModelName 将上游 display_name 转为客户端模型名。
-// "Qwen3.8-Max" → "qwen3.8-max"
-func NormalizeModelName(s string) string {
-	s = strings.ToLower(s)
-	s = nonAlphaNum.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-")
-	return s
+// ModelEntry 是对外的模型表项：Name 对外暴露，Upstream 发往上游。
+type ModelEntry struct {
+	Name     string `json:"name"`
+	Upstream string `json:"upstream"`
+	Dynamic  bool   `json:"dynamic,omitempty"`
 }
 
-type dynamicModel struct {
-	Key           string `json:"key"`
-	DisplayName   string `json:"display_name"`
-	Enable        bool   `json:"enable"`
-	IsReasoning   bool   `json:"is_reasoning"`
-	IsVL          bool   `json:"is_vl"`
-	MaxInputTokens int   `json:"max_input_tokens"`
-	PriceFactor   float64 `json:"price_factor"`
-}
-
-// FetchModels 通过 COSY 签名 GET 拉取动态模型列表。
-// 注意：签名 body 必须为空串 ""，不是 "{}"。
-func (c *Client) FetchModels(a *QoderAccount) ([]DynamicModelEntry, error) {
-	url := c.gatewayBase() + EpModels
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("cosy-user", a.UID)
-	sess, err := NewCosySession(a.MachineID, a.MachineToken, a.MachineType, a.Nickname, a.UID, a.AccessToken, a.RefreshToken)
-	if err != nil {
-		return nil, fmt.Errorf("cosy session: %w", err)
-	}
-	if err := sess.ApplyHeaders(req, "", url, false, ""); err != nil {
-		return nil, err
-	}
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, truncateStr(string(raw), 200))
-	}
-
-	var env struct {
-		Data struct {
-			Chat []dynamicModel `json:"chat"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return nil, err
-	}
-
-	c.mu.Lock()
-	if c.modelMap == nil {
-		c.modelMap = map[string]string{}
-	}
-	c.mu.Unlock()
-
-	var out []DynamicModelEntry
-	for _, dm := range env.Data.Chat {
-		if !dm.Enable || dm.Key == "" {
-			continue
-		}
-		name := NormalizeModelName(dm.DisplayName)
-		if name == "" {
-			name = dm.Key
-		}
-		ctx := 180000
-		if dm.MaxInputTokens > 0 {
-			ctx = dm.MaxInputTokens
-		}
-		out = append(out, DynamicModelEntry{
-			Name:          name,
-			Key:           dm.Key,
-			ContextWindow: ctx,
-			IsReasoning:   dm.IsReasoning,
-			PriceFactor:   dm.PriceFactor,
-		})
-
-		c.mu.Lock()
-		c.modelMap[name] = dm.Key
-		c.mu.Unlock()
-	}
-
-	slog.Debug("qoder: fetched dynamic models", "count", len(out))
-	return out, nil
-}
-
-// DynamicModelEntry 是动态模型的规范化表示。
+// DynamicModelEntry 是动态目录里的一条模型。
 type DynamicModelEntry struct {
-	Name          string
-	Key           string
-	ContextWindow int
-	IsReasoning   bool
-	PriceFactor   float64
+	ID    string `json:"id"`
+	Name  string `json:"name,omitempty"`
+	Label string `json:"label,omitempty"`
 }
 
-// modelKey 解析客户端模型名到上游 key：动态缓存优先，静态表兜底。
-func (c *Client) modelKey(clientName string) string {
-	c.mu.RLock()
-	if k, ok := c.modelMap[clientName]; ok {
-		c.mu.RUnlock()
-		return k
+// staticModelKeys 是静态模型的规范名集合。
+var staticModelKeys = func() map[string]bool {
+	m := make(map[string]bool, len(StaticModels))
+	for _, k := range StaticModels {
+		m[NormalizeModelName(k)] = true
 	}
-	c.mu.RUnlock()
-	return ModelKey(clientName)
+	return m
+}()
+
+// stdToCustom 将标准模型名映射为 Qoder 上游使用的自定义名
+// （值未从二进制还原，静态三项取同名，另补常用别名；见推断清单）。
+var stdToCustom = map[string]string{
+	"qmodel_latest": "qmodel_latest",
+	"qwen3.7-flash": "qwen3.7-flash",
+	"qwen3.6-flash": "qwen3.6-flash",
+	"qwen-flash":    "qwen3.7-flash",
+	"latest":        "qmodel_latest",
 }
 
-// dynamicModelsCache 缓存动态模型列表，避免每次请求都拉取。
+// customToStd 是 stdToCustom 的反向映射。
+var customToStd = func() map[string]string {
+	m := make(map[string]string, len(stdToCustom))
+	for k, v := range stdToCustom {
+		if _, exists := m[v]; !exists {
+			m[v] = k
+		}
+	}
+	return m
+}()
+
+// NormalizeModelName 规范化模型名：去渠道前缀（"qoder/xxx"）、去空白、转小写。
+func NormalizeModelName(name string) string {
+	n := strings.TrimSpace(name)
+	if i := strings.Index(n, "/"); i >= 0 {
+		n = n[i+1:]
+	}
+	return strings.ToLower(strings.TrimSpace(n))
+}
+
+// dynamicModelsCache 是动态模型目录的进程内缓存。
 type dynamicModelsCache struct {
-	mu       sync.RWMutex
-	entries  []DynamicModelEntry
-	fetchedAt time.Time
-	err      error
-	errAt    time.Time
+	mu    sync.Mutex
+	items []DynamicModelEntry
+	at    time.Time
 }
 
-const (
-	dynamicModelsTTL       = 1 * time.Hour
-	dynamicModelsFailTTL   = 5 * time.Minute
-)
-
-func (c *dynamicModelsCache) get() ([]DynamicModelEntry, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	now := time.Now()
-	if c.entries != nil && now.Sub(c.fetchedAt) < dynamicModelsTTL {
-		return c.entries, true
-	}
-	if c.err != nil && now.Sub(c.errAt) < dynamicModelsFailTTL {
-		return nil, false
-	}
-	return nil, false
-}
-
-func (c *dynamicModelsCache) set(entries []DynamicModelEntry, err error) {
+// get 返回缓存副本与抓取时间。
+func (c *dynamicModelsCache) get() []DynamicModelEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err != nil {
-		c.err = err
-		c.errAt = time.Now()
-		return
-	}
-	c.entries = entries
-	c.fetchedAt = time.Now()
-	c.err = nil
+	return append([]DynamicModelEntry(nil), c.items...)
 }
 
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
+// set 覆盖缓存。
+func (c *dynamicModelsCache) set(items []DynamicModelEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items = append([]DynamicModelEntry(nil), items...)
+	c.at = time.Now()
+}
+
+// stale 报告缓存是否超过 ttl。
+func (c *dynamicModelsCache) stale(ttl time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.items == nil || time.Since(c.at) > ttl
+}
+
+// dynModels 是包级动态模型缓存。
+var dynModels = &dynamicModelsCache{}
+
+// dynamicModel 在动态缓存里按规范名查找模型。
+func dynamicModel(name string) (DynamicModelEntry, bool) {
+	key := NormalizeModelName(name)
+	for _, m := range dynModels.get() {
+		if NormalizeModelName(m.ID) == key || NormalizeModelName(m.Name) == key {
+			return m, true
+		}
 	}
-	return s[:n]
+	return DynamicModelEntry{}, false
 }

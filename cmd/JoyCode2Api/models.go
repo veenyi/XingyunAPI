@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
 )
 
 var modelsCmd = &cobra.Command{

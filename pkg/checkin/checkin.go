@@ -1,452 +1,169 @@
-// Package checkin 实现多平台每日自动签到（积分领取）。
-// 首批支持 WorkBuddy(CodeBuddy) 与 TraeWork(Trae SOLO)，协议移植自 wild-work
-// 实测实现：token 自动刷新 + 每日定时签到 + 积分查询。
-// 凭据以 AES-GCM 加密存于 settings.checkin_accounts，绝不落日志。
+// Package checkin implements the multi-platform auto check-in manager
+// (CodeBuddy/WorkBuddy, TraeWork, Qoder) added in v0.7.2:
+//
+//   - WorkBuddy/CodeBuddy: POST /v2/billing/meter/daily-checkin (签到),
+//     /v2/billing/meter/get-user-resource (积分), WeChat-scan login via
+//     copilot.tencent.com /v2/plugin/auth/state + /v2/plugin/login/account.
+//   - TraeWork: /trae/api/v2/ug/checkin_credits/status + /claim with a strict
+//     device fingerprint (x-device-id); random device ids are rejected with
+//     risk code 9074.
+//   - Qoder: no check-in action, only quota refresh via /api/v2/quota/usage;
+//     login delegates to qoder.LoginManager (device flow).
+//
+// Accounts live in the settings blob (key checkin_accounts) with tokens
+// encrypted at rest (enc_access/enc_refresh/enc_machine_token); per-account
+// runtime state (last_checkin_at/last_checkin_ok/credits) lives in the
+// checkin_state settings key; the schedule lives in checkin_times
+// (default ["09:00"], each time fires once per day).
 package checkin
 
 import (
-	"encoding/json"
-	"fmt"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"log/slog"
+	"net/http"
+	"sort"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
 )
 
+// Platform identifiers (frontend CheckinAccount.platform values).
 const (
-	SettingAccounts = "checkin_accounts" // 加密的账号凭据 JSON
-	SettingState    = "checkin_state"    // 明文的运行状态 JSON
-	SettingTimes    = "checkin_times"    // 每日签到时刻 ["09:00", ...]
-
-	PlatformWorkBuddy = "workbuddy"
-	PlatformTraeWork  = "traework"
-	PlatformQoder     = "qoder"
-
-	defaultRefreshAfter = 12 * time.Hour
+	platformWorkBuddy = "workbuddy"
+	platformTraeWork  = "traework"
+	platformQoder     = "qoder"
 )
 
-// Account 是一条签到账号。凭据字段在持久化时整体走 store.Encrypt，
-// 对前端只回显掩码。
-type Account struct {
-	ID       string `json:"id"`
-	Platform string `json:"platform"`
-	Name     string `json:"name"`
-	UID      string `json:"uid"`
+// Settings keys (endpoints-and-schema §3).
+const (
+	timesKey    = "checkin_times"    // JSON []string of HH:mm
+	stateKey    = "checkin_state"    // JSON map[id]checkinState
+	accountsKey = "checkin_accounts" // JSON []storedAccount blob
+)
 
-	// 凭据（加密存储，列表接口输出掩码）
-	AccessToken  string `json:"access_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	EnterpriseID string `json:"enterprise_id,omitempty"` // workbuddy 租户
-	Domain       string `json:"domain,omitempty"`        // workbuddy 部门
-	DeviceID     string `json:"device_id,omitempty"`     // traework 设备指纹（签到强校验）
-	MachineID    string `json:"machine_id,omitempty"`    // traework 机器号
-	ApiHost      string `json:"api_host,omitempty"`      // traework OAuth host，留空用官方
+// Upstream bases & endpoints (endpoints-and-schema §1.3, binary-confirmed).
+const (
+	wbBase = "https://www.codebuddy.cn"
+	// wbCheckinPath 每日签到；wbUsagePath 积分查询。
+	wbCheckinPath = "/v2/billing/meter/daily-checkin"
+	wbUsagePath   = "/v2/billing/meter/get-user-resource"
 
-	// Qoder 平台专用字段（加密存储）
-	MachineToken string `json:"machine_token,omitempty"` // qoder 机器令牌
-	MachineType  string `json:"machine_type,omitempty"`  // qoder 机器类型标识
-	Nickname     string `json:"nickname,omitempty"`      // qoder 用户昵称
+	wbAuthBase      = "https://copilot.tencent.com"
+	wbAuthStatePath = "/v2/plugin/auth/state"
+	wbLoginPath     = "/v2/plugin/login/account"
 
-	Enabled bool `json:"enabled"`
+	twBase = "https://api.trae.cn"
+	// twStatusPath 签到状态；twClaimPath 领取签到积分。
+	twStatusPath = "/trae/api/v2/ug/checkin_credits/status"
+	twClaimPath  = "/trae/api/v2/ug/checkin_credits/claim"
 
-	// 运行状态（存 settings.checkin_state，明文无敏感信息）
-	LastCheckinAt string `json:"last_checkin_at,omitempty"`
-	LastCheckinOK bool   `json:"last_checkin_ok"`
-	LastResult    string `json:"last_result,omitempty"`
-	Credits       int64  `json:"credits"`
-	CreditsTotal  int64  `json:"credits_total"`
-	LastRefreshAt string `json:"last_refresh_at,omitempty"`
-	LastRefreshOK bool   `json:"last_refresh_ok"`
+	// qoderUsagePath 只刷积分，无签到动作（qoder.OpenAPIBase 前缀）。
+	qoderUsagePath = "/api/v2/quota/usage"
+)
+
+// User-visible copy（strings-notes §1 checkin 段，一字不差）。
+const (
+	textCheckinOK         = "签到成功"
+	textCheckedIn         = "已签到"
+	textCheckedToday      = "今日已签到"
+	textNotCheckedIn      = "未签到"
+	textCheckinFailed     = "签到请求失败"
+	textScheduleFired     = "到达定时时刻，开始自动签到"
+	textDisabled          = "签到功能未启用"
+	textCheckinUnfinished = "签到未完成"
+
+	errRateLimited9074   = "签到被限流（9074），请稍后重试"
+	errDeviceFingerprint = "TraeWork 签到强校验设备指纹：device_id 必须是账号真实注册的设备 ID，随机值会以 9074 被拒"
+
+	errStateQuery      = "查询签到状态失败"
+	errStateParse      = "签到状态解析失败"
+	errCheckinParse    = "签到响应解析失败"
+	errCreditsParse    = "积分响应解析失败"
+	errRefreshFallback = "刷新失败，改用现有 access token 继续签到"
+
+	errNoAccessToken = "缺少 access_token，请编辑签到账号补充凭据"
+	errNoQoderCreds  = "未找到 Qoder 账号凭据，请先通过设备流登录添加"
+)
+
+// tokenRefreshInterval 是「行云定期刷新 token」的周期（对齐 qoder/workbuddy）。
+const tokenRefreshInterval = 6 * time.Hour
+
+// defaultTimes 是 checkin_times 的缺省时刻表。
+var defaultTimes = []string{"09:00"}
+
+// checkinHTTP 是包级默认 HTTP 客户端。
+var checkinHTTP = &http.Client{Timeout: 30 * time.Second}
+
+// errAlreadyCheckedIn 哨兵错误：上游回报当日已签到（run 据此转为
+// ok=false + 「今日已签到」提示，对齐前端 toast 的 info 分支）。
+var errAlreadyCheckedIn = errors.New(textCheckedToday)
+
+// errWBPending 哨兵错误：WorkBuddy 扫码会话尚未被确认（继续轮询）。
+var errWBPending = errors.New("login pending")
+
+// creditMarkers 命中说明上游回报额度类问题（积分不足/每日上限等），
+// 原样透传给前端展示（strings-notes §1 checkin 段）。
+var creditMarkers = []string{
+	"积分不足", "积分用完", "额度用尽", "余额不足", "配额用尽", "每日上限",
+	"insufficient", "out of credit", "quota exhaust",
 }
 
-// Masked 返回给前端的副本：凭据替换为掩码。
-func (a Account) Masked() Account {
-	out := a
-	if out.AccessToken != "" {
-		out.AccessToken = store.SecretMask
-	}
-	if out.RefreshToken != "" {
-		out.RefreshToken = store.SecretMask
-	}
-	if out.MachineToken != "" {
-		out.MachineToken = store.SecretMask
-	}
-	return out
+// alreadyCheckedMarkers 命中说明上游回报当日已签到。
+var alreadyCheckedMarkers = []string{
+	"已签到", "今日已签", "重复签到", "already", "checked_in", "checked in",
+	"duplicate",
 }
 
-// Result 是一次签到的结果。
-type Result struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Platform string `json:"platform"`
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
-	Credits int64  `json:"credits"`
+// randHex 返回 n 字节的随机 hex 字符串（2n 个字符）。
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// 随机源失败时退化为时间戳，保证 id 唯一性
+		return hex.EncodeToString([]byte(time.Now().Format("150405.000000000")))
+	}
+	return hex.EncodeToString(b)
 }
 
-// Manager 管理签到账号与后台调度。
-type Manager struct {
-	mu      sync.Mutex
-	store   *store.Store
-	version string
-	stop    chan struct{}
-	timer   *time.Timer
-	running bool
-	// runMu 串行化签到执行（含网络请求），与 m.mu 分离：
-	// run 流程内要写状态（拿 m.mu），持 m.mu 跑网络请求会自锁。
-	runMu  sync.Mutex
-	// today 记录调度器已签到的日期（本地时区），防止同一天重复。
-	today map[string]string
-	// wbSessions 暂存进行中的 WorkBuddy 扫码登录会话（sessionID → state），带 TTL。
-	wbSessions map[string]*wbLoginSession
-	// qoderSessions 暂存进行中的 Qoder 设备流登录会话。
-	qoderSessions map[string]*qoderLoginSession
-}
+// nowStr 是状态字段的统一时间戳格式（RFC3339，前端 dayjs 可直接解析）。
+func nowStr() string { return time.Now().Format(time.RFC3339) }
 
-func New(s *store.Store, version string) *Manager {
-	return &Manager{store: s, version: version, today: map[string]string{}, wbSessions: map[string]*wbLoginSession{}, qoderSessions: map[string]*qoderLoginSession{}}
-}
+// todayStr 返回本地日期（每时刻每天一次的守卫键）。
+func todayStr(t time.Time) string { return t.Format("2006-01-02") }
 
-// --- 账号 CRUD ---
-
-// List 返回全部账号（凭据掩码），并合并运行状态。
-func (m *Manager) List() []Account {
-	accounts := m.loadAccounts()
-	state := m.loadState()
-	out := make([]Account, 0, len(accounts))
-	for _, a := range accounts {
-		if st, ok := state[a.ID]; ok {
-			a.LastCheckinAt = st.LastCheckinAt
-			a.LastCheckinOK = st.LastCheckinOK
-			a.LastResult = st.LastResult
-			a.Credits = st.Credits
-			a.CreditsTotal = st.CreditsTotal
-			a.LastRefreshAt = st.LastRefreshAt
-			a.LastRefreshOK = st.LastRefreshOK
-		}
-		out = append(out, a.Masked())
-	}
-	return out
-}
-
-// CheckinPoint is a fresh-queried credit snapshot for one checkin account.
-type CheckinPoint struct {
-	ID       string  `json:"id"`
-	Platform string  `json:"platform"`
-	Name     string  `json:"name"`
-	Credits  float64 `json:"credits"`
-	Total    float64 `json:"total"`
-}
-
-// ListPoints returns a fresh credit snapshot for every checkin account,
-// querying the upstream APIs directly (no stale state).
-func (m *Manager) ListPoints() []CheckinPoint {
-	accounts := m.loadAccounts()
-	out := make([]CheckinPoint, 0, len(accounts))
-	for _, a := range accounts {
-		r, t, err := m.creditsFloat64(&a)
-		if err != nil {
-			slog.Warn("checkin: 积分查询失败", "id", a.ID, "platform", a.Platform, "error", err)
-			continue
-		}
-		out = append(out, CheckinPoint{
-			ID:       a.ID,
-			Platform: a.Platform,
-			Name:     a.Name,
-			Credits:  r,
-			Total:    t,
-		})
-	}
-	return out
-}
-
-// AccountInput 是前端提交的账号表单。凭据为空或掩码时保留旧值。
-type AccountInput struct {
-	ID           string `json:"id"`
-	Platform     string `json:"platform"`
-	Name         string `json:"name"`
-	UID          string `json:"uid"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	EnterpriseID string `json:"enterprise_id"`
-	Domain       string `json:"domain"`
-	DeviceID     string `json:"device_id"`
-	MachineID    string `json:"machine_id"`
-	ApiHost      string `json:"api_host"`
-	MachineToken string `json:"machine_token"`
-	MachineType  string `json:"machine_type"`
-	Nickname     string `json:"nickname"`
-	Enabled      bool   `json:"enabled"`
-}
-
-// Save 全量覆写账号列表（与 custom_providers 同一套交互模式）。
-// 密文保持式：未改动的凭据原样保留旧密文（哪怕此刻解不开也不丢账号），
-// 新给的凭据加密失败立即报错——绝不把明文 token 落库。
-func (m *Manager) Save(inputs []AccountInput) error {
-	if m.store == nil {
-		return fmt.Errorf("store unavailable")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	old := map[string]storedAccount{}
-	for _, sa := range m.loadStored() {
-		old[sa.Account.ID] = sa
-	}
-
-	out := make([]storedAccount, 0, len(inputs))
-	for _, in := range inputs {
-		platform := strings.TrimSpace(strings.ToLower(in.Platform))
-		if platform != PlatformWorkBuddy && platform != PlatformTraeWork && platform != PlatformQoder {
-			continue
-		}
-		base := old[in.ID]
-		a := base.Account
-		a.Platform = platform
-		a.Enabled = in.Enabled
-		if v := strings.TrimSpace(in.Name); v != "" {
-			a.Name = v
-		}
-		if v := strings.TrimSpace(in.UID); v != "" {
-			a.UID = v
-		}
-		if in.EnterpriseID != "" {
-			a.EnterpriseID = strings.TrimSpace(in.EnterpriseID)
-		}
-		if in.Domain != "" {
-			a.Domain = strings.TrimSpace(in.Domain)
-		}
-		if in.DeviceID != "" {
-			a.DeviceID = strings.TrimSpace(in.DeviceID)
-		}
-		if in.MachineID != "" {
-			a.MachineID = strings.TrimSpace(in.MachineID)
-		}
-		if in.ApiHost != "" {
-			a.ApiHost = strings.TrimSpace(in.ApiHost)
-		}
-		if in.MachineToken != "" && in.MachineToken != store.SecretMask {
-			a.MachineToken = strings.TrimSpace(in.MachineToken)
-		}
-		if in.MachineType != "" {
-			a.MachineType = strings.TrimSpace(in.MachineType)
-		}
-		if in.Nickname != "" {
-			a.Nickname = strings.TrimSpace(in.Nickname)
-		}
-		if in.ID == "" {
-			a.ID = fmt.Sprintf("ci_%d", time.Now().UnixNano())
-		} else {
-			a.ID = in.ID
-		}
-		if a.Name == "" {
-			a.Name = a.UID
-		}
-
-		sa := storedAccount{Account: a}
-		if tok := in.AccessToken; tok != "" && tok != store.SecretMask {
-			enc, err := m.store.Encrypt(tok)
-			if err != nil {
-				return fmt.Errorf("加密 access token 失败: %w", err)
-			}
-			sa.EncAccess = enc
-		} else {
-			sa.EncAccess = base.EncAccess
-		}
-		if tok := in.RefreshToken; tok != "" && tok != store.SecretMask {
-			enc, err := m.store.Encrypt(tok)
-			if err != nil {
-				return fmt.Errorf("加密 refresh token 失败: %w", err)
-			}
-			sa.EncRefresh = enc
-		} else {
-			sa.EncRefresh = base.EncRefresh
-		}
-		if tok := in.MachineToken; tok != "" && tok != store.SecretMask {
-			enc, err := m.store.Encrypt(tok)
-			if err != nil {
-				return fmt.Errorf("加密 machine token 失败: %w", err)
-			}
-			sa.EncMachineToken = enc
-		} else {
-			sa.EncMachineToken = base.EncMachineToken
-		}
-		sa.Account.AccessToken = ""
-		sa.Account.RefreshToken = ""
-		sa.Account.MachineToken = ""
-		if sa.EncAccess == "" && sa.EncRefresh == "" && sa.EncMachineToken == "" {
-			continue // 没有任何凭据的账号没有意义
-		}
-		out = append(out, sa)
-	}
-	if err := m.saveStored(out); err != nil {
-		return err
-	}
-	// 裁剪已删除账号的孤儿状态，防止 List 越积越多。
-	state := m.loadState()
-	alive := map[string]bool{}
-	for _, sa := range out {
-		alive[sa.Account.ID] = true
-	}
-	pruned := false
-	for id := range state {
-		if !alive[id] {
-			delete(state, id)
-			pruned = true
-		}
-	}
-	if pruned {
-		_ = m.saveState(state)
-	}
-	return nil
-}
-
-// Remove 删除账号并清理状态。
-func (m *Manager) Remove(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	stored := m.loadStored()
-	out := make([]storedAccount, 0, len(stored))
-	for _, sa := range stored {
-		if sa.Account.ID != id {
-			out = append(out, sa)
-		}
-	}
-	if err := m.saveStored(out); err != nil {
-		return err
-	}
-	state := m.loadState()
-	delete(state, id)
-	return m.saveState(state)
-}
-
-// Times 返回每日签到时刻（HH:MM 列表）。
-func (m *Manager) Times() []string {
-	raw := strings.TrimSpace(m.store.GetSetting(SettingTimes))
-	if raw == "" {
-		return []string{"09:00"}
-	}
-	var times []string
-	if json.Unmarshal([]byte(raw), &times) != nil || len(times) == 0 {
-		return []string{"09:00"}
-	}
-	return times
-}
-
-// SetTimes 覆写每日签到时刻。
-func (m *Manager) SetTimes(times []string) error {
-	cleaned := make([]string, 0, len(times))
+// normalizeTimes 校验/去重/排序 HH:mm 时刻列表（非法项丢弃）。
+func normalizeTimes(times []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(times))
 	for _, t := range times {
 		t = strings.TrimSpace(t)
-		if len(t) == 5 && t[2] == ':' {
-			cleaned = append(cleaned, t)
+		if t == "" {
+			continue
 		}
-	}
-	if len(cleaned) == 0 {
-		cleaned = []string{"09:00"}
-	}
-	data, _ := json.Marshal(cleaned)
-	return m.store.SetSetting(SettingTimes, string(data))
-}
-
-// --- 存储 ---
-
-type storedAccounts struct {
-	Accounts []storedAccount `json:"accounts"`
-}
-
-// storedAccount 是加密存储形态：AccessToken/RefreshToken 各自整体加密。
-type storedAccount struct {
-	Account
-	EncAccess      string `json:"enc_access,omitempty"`
-	EncRefresh     string `json:"enc_refresh,omitempty"`
-	EncMachineToken string `json:"enc_machine_token,omitempty"`
-}
-
-// loadStored 读取原始存储形态（含密文，不解密）。
-func (m *Manager) loadStored() []storedAccount {
-	if m.store == nil {
-		return nil
-	}
-	raw := strings.TrimSpace(m.store.GetSetting(SettingAccounts))
-	if raw == "" {
-		return nil
-	}
-	var stored storedAccounts
-	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
-		slog.Error("checkin: 解析账号失败", "error", err)
-		return nil
-	}
-	return stored.Accounts
-}
-
-// loadAccounts 返回解密后的运行态账号。解密失败的账号仍保留（凭据置空），
-// 下次 Save 会原样保留其密文——绝不因一次解密失败而丢账号。
-func (m *Manager) loadAccounts() []Account {
-	stored := m.loadStored()
-	out := make([]Account, 0, len(stored))
-	for _, sa := range stored {
-		a := sa.Account
-		if sa.EncAccess != "" {
-			if dec, err := m.store.Decrypt(sa.EncAccess); err == nil {
-				a.AccessToken = dec
-			}
+		if _, err := time.ParseInLocation("15:04", t, time.Local); err != nil {
+			slog.Warn("checkin: 忽略非法签到时刻", "time", t)
+			continue
 		}
-		if sa.EncRefresh != "" {
-			if dec, err := m.store.Decrypt(sa.EncRefresh); err == nil {
-				a.RefreshToken = dec
-			}
+		if seen[t] {
+			continue
 		}
-		if sa.EncMachineToken != "" {
-			if dec, err := m.store.Decrypt(sa.EncMachineToken); err == nil {
-				a.MachineToken = dec
-			}
-		}
-		out = append(out, a)
+		seen[t] = true
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	if out == nil {
+		out = []string{}
 	}
 	return out
 }
 
-// saveStored 序列化并写入。调用方保证 token 已是密文（Enc*）且明文已清空。
-func (m *Manager) saveStored(accounts []storedAccount) error {
-	data, err := json.Marshal(storedAccounts{Accounts: accounts})
-	if err != nil {
-		return err
+// containsFold 报告 s 是否包含任一子串（大小写不敏感）。
+func containsFold(s string, subs []string) bool {
+	low := strings.ToLower(s)
+	for _, sub := range subs {
+		if strings.Contains(low, strings.ToLower(sub)) {
+			return true
+		}
 	}
-	return m.store.SetSetting(SettingAccounts, string(data))
-}
-
-func (m *Manager) loadState() map[string]Account {
-	raw := strings.TrimSpace(m.store.GetSetting(SettingState))
-	out := map[string]Account{}
-	if raw == "" {
-		return out
-	}
-	var st map[string]Account
-	if json.Unmarshal([]byte(raw), &st) == nil {
-		return st
-	}
-	return out
-}
-
-func (m *Manager) saveState(state map[string]Account) error {
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	return m.store.SetSetting(SettingState, string(data))
-}
-
-// updateState 在签到/刷新后写回单个账号状态。
-func (m *Manager) updateState(id string, fn func(*Account)) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	state := m.loadState()
-	st := state[id]
-	fn(&st)
-	state[id] = st
-	if err := m.saveState(state); err != nil {
-		slog.Warn("checkin: 保存状态失败", "id", id, "error", err)
-	}
+	return false
 }

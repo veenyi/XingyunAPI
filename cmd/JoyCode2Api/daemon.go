@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/logrot"
+	"github.com/veenyi/XingyunAPI/pkg/logrot"
 )
 
 const (
@@ -30,17 +30,6 @@ const (
 	maxRestartDelay   = 30 * time.Second
 	baseRestartDelay  = 1 * time.Second
 )
-
-// logLevel 让 -v 真的把 slog 的 Debug 打开。在此之前三处 handler 都写死了
-// LevelInfo，而 -v 只挂了一层 HTTP 日志中间件：全项目的 slog.Debug 分支
-// ——探针逐个模型报的"模型可用"、健康度变更等——一条都写不出来，
-// 结果是冷却与复活只能靠猜，没法从日志归因。
-func logLevel() slog.Level {
-	if verbose || os.Getenv(daemonVerboseEnv) == "1" {
-		return slog.LevelDebug
-	}
-	return slog.LevelInfo
-}
 
 var (
 	daemonPIDFile string
@@ -163,7 +152,7 @@ func startDaemon() error {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	setProcAttrDetached(cmd)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start daemon supervisor: %w", err)
@@ -198,7 +187,7 @@ func stopDaemon() error {
 		return nil
 	}
 
-	if err := terminateProcess(proc); err != nil {
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
 		removePIDFile()
 		fmt.Printf("Daemon process %d not responding: %v\n", pidData.PID, err)
 		return nil
@@ -213,7 +202,7 @@ func stopDaemon() error {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		killProcess(proc)
+		proc.Signal(syscall.SIGKILL)
 	}
 
 	removePIDFile()
@@ -234,7 +223,7 @@ func daemonStatusCmdRun() error {
 		return nil
 	}
 
-	if !isProcessAlive(proc) {
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
 		fmt.Printf("Daemon PID %d — NOT running (stale PID file)\n", pidData.PID)
 		removePIDFile()
 		return nil
@@ -274,7 +263,7 @@ func runAsDaemonChild() {
 		log.Fatalf("[daemon] cannot open log file: %v", err)
 	}
 	log.SetOutput(rw)
-	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: logLevel()})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	log.Printf("[daemon-child] serve process started (PID %d)", os.Getpid())
 }
 
@@ -289,7 +278,7 @@ func RunSupervisor(port int) {
 	}
 	defer rw.Close()
 	log.SetOutput(rw)
-	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: logLevel()})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(rw, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	log.Printf("[supervisor] starting (PID %d, port %d)", os.Getpid(), port)
 
@@ -300,7 +289,7 @@ func RunSupervisor(port int) {
 	})
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	var mu sync.Mutex
 	delay := baseRestartDelay
@@ -333,7 +322,7 @@ func RunSupervisor(port int) {
 		cmd.Env = childEnv
 		cmd.Stdout = rw
 		cmd.Stderr = rw
-		setProcAttrDetached(cmd)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 		log.Printf("[supervisor] spawning child process")
 		if err := cmd.Start(); err != nil {
@@ -364,7 +353,7 @@ func RunSupervisor(port int) {
 
 		case sig := <-sigCh:
 			log.Printf("[supervisor] received %v — shutting down", sig)
-			terminateProcess(cmd.Process)
+			cmd.Process.Signal(syscall.SIGTERM)
 			cmd.Wait()
 			removePIDFile()
 			log.Printf("[supervisor] stopped")
@@ -419,7 +408,7 @@ func checkRunningDaemon() (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	if !isProcessAlive(proc) {
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
 		removePIDFile()
 		return 0, false
 	}

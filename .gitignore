@@ -1,36 +1,68 @@
-# 依赖与构建产物
-node_modules/
-web/dist/
-web/node_modules/
-*.fpk
-xingyun-api-slim/
-.fpk
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/JoyCode2Api
+/JoyCodeProxy
 
-# 系统与 IDE
-.DS_Store
-Thumbs.db
+# Go build cache
+*.test
+*.out
+debug
+
+# Build output
+bin/
+dist/
+out/
+joycode_proxy_bin
+joycode_proxy_bin.bak
+cmd/JoyCode2Api/JoyCode2Api
+cmd/JoyCode2Api/JoyCodeProxy
+joycode_proxy_darwin_*
+joycode_proxy_linux_*
+joycode-proxy
+joycode-proxy-new
+
+# Dependency directories
+vendor/
+
+# IDE
 .idea/
 .vscode/
-*.log
+*.swp
+*.swo
+*~
 
-# 敏感信息
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment & secrets
 .env
-credentials.txt
-xingyun-api/app/bin/
+.env.*
+!.env.example
 
-# 打包产物目录（含本地脚本，禁止入库）
-xingyun-api/
-*.db
+# Logs
 *.log
+logs/
 
-# 本地构建产物与调试残留（不入库）
-/JoyCode2Api.exe
-/JoyCode2Api-new
-/JoyCode2Api_x64_v*/
-/JoyCode2Api_arm64_v*/
-/.scratch/
-/astream.txt
-/stream-out.txt
-/out-off.json
-/out-on.json
-/out-on2.json
+# Test & coverage
+coverage.txt
+coverage.html
+coverage.out
+*.coverprofile
+
+# Claude Code
+.claude/
+
+# Docker
+.docker/
+
+# Frontend
+web/node_modules/
+web/dist/
+joycode_proxy/static/

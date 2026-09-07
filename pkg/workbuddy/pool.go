@@ -1,365 +1,417 @@
-// pool.go 多账号粘性路由 + 冷却状态机，实现 provider.Keyless 接口。
 package workbuddy
 
+// Pool 是 WorkBuddy（腾讯 CodeBuddy）账号池（provider.Keyless 实现）：
+// 多账号轮换 + 粘性路由 + session-dead/额度类禁用 + settings blob 持久化。
+
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/common"
+	"github.com/veenyi/XingyunAPI/pkg/health"
 )
 
-const (
-	defaultMaxReqs   = 50
-	defaultMaxRotate = 3
-	hardCooldown     = 12 * time.Hour
-	softCooldown     = 60 * time.Second
-	errCooldown      = 10 * time.Minute
-	errThreshold     = 3
-	refreshSkew      = 10 * time.Minute
-)
-
-type coolKind int
-
-const (
-	coolHard coolKind = iota
-	coolSoft
-	coolErr
-	coolLowBalance
-)
-
-type poolEntry struct {
-	acct     *WBAccount
-	disabled bool
-	reason   string
-	until    time.Time
-	errCount int
-	credits  int64
+// cooldownFor 与 health 默认冷却对齐。
+func cooldownFor(class string) time.Duration {
+	switch class {
+	case health.ClassRateLimited:
+		return 5 * time.Minute
+	case health.ClassNoCredit:
+		return 30 * time.Minute
+	case health.ClassAuthFailed:
+		return time.Hour
+	case health.ClassNotFound:
+		return 24 * time.Hour
+	case health.ClassNetwork:
+		return 2 * time.Minute
+	default:
+		return 5 * time.Minute
+	}
 }
 
-func (e *poolEntry) healthy(now time.Time) bool {
-	if e.disabled {
-		return false
-	}
-	if e.until.IsZero() {
-		return true
-	}
-	return now.After(e.until) || now.Equal(e.until)
-}
-
-// Pool 管理多账号池、粘性路由与冷却。
+// Pool 是 WorkBuddy 账号池。
 type Pool struct {
 	mu      sync.Mutex
-	entries map[string]*poolEntry
+	store   settingsStore
+	http    *http.Client
 	client  *Client
-
-	stickyUID   string
-	stickyCount int
+	entries []*poolEntry
+	sticky  map[string]string // stickyKey -> user_id（成功后固化）
+	pending map[string]string // stickyKey -> user_id（待成功确认）
+	rr      int
 }
 
-// NewPool 创建账号池。
-func NewPool(c *Client) *Pool {
-	return &Pool{
-		entries: make(map[string]*poolEntry),
-		client:  c,
+// New 构造账号池并从 settings 载入账号（hc 为 nil 时用默认客户端）。
+func New(st settingsStore, hc *http.Client) *Pool {
+	if hc == nil {
+		hc = &http.Client{Timeout: 10 * time.Minute}
 	}
+	p := &Pool{
+		store:   st,
+		http:    hc,
+		sticky:  map[string]string{},
+		pending: map[string]string{},
+	}
+	p.client = newClient(p, hc)
+	p.SyncAccounts()
+	return p
 }
 
-// SyncAccounts 同步账号列表到池中。
-func (p *Pool) SyncAccounts(accs []*WBAccount) {
+// Client 返回池内置的上游客户端。
+func (p *Pool) Client() *Client { return p.client }
+
+// --- provider.Keyless ---
+
+// Name 实现 provider.Keyless。
+func (p *Pool) Name() string { return Name }
+
+// Enabled 实现 provider.Keyless：显式开关优先，缺省 = 有账号即启用。
+func (p *Pool) Enabled() bool {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	seen := map[string]bool{}
-	for _, a := range accs {
-		seen[a.UID] = true
-		if e, ok := p.entries[a.UID]; ok {
-			e.acct = a
-		} else {
-			p.entries[a.UID] = &poolEntry{acct: a}
-		}
-	}
-	for uid := range p.entries {
-		if !seen[uid] {
-			delete(p.entries, uid)
-			if p.stickyUID == uid {
-				p.stickyUID = ""
-				p.stickyCount = 0
-			}
-		}
-	}
-
-	p.client.SyncAccounts(accs)
+	n := len(p.entries)
+	p.mu.Unlock()
+	return common.SettingEnabledOr(p.store, EnabledKey, n > 0)
 }
 
-// Pick 选一个健康账号（余额最高优先）。
+// ListModels 实现 provider.Keyless（动态目录，懒刷新）。
+func (p *Pool) ListModels() []string {
+	p.client.ensureModels()
+	return dynModels.get()
+}
+
+// Supports 实现 provider.Keyless。
+func (p *Pool) Supports(model string) bool {
+	k := normalizeModelName(model)
+	for _, m := range dynModels.get() {
+		if normalizeModelName(m) == k {
+			return true
+		}
+	}
+	return false
+}
+
+// Chat 实现 provider.Keyless（非流式，带账号轮换重试）。
+func (p *Pool) Chat(ctx context.Context, body map[string]interface{}) (map[string]interface{}, error) {
+	_, out, err := p.DoChatWithRetry(ctx, body, false)
+	return out, err
+}
+
+// ChatStream 实现 provider.Keyless（流式，带账号轮换重试），
+// 返回经 Stream 归一后的标准 OpenAI SSE 流。
+func (p *Pool) ChatStream(ctx context.Context, body map[string]interface{}) (io.ReadCloser, error) {
+	rc, _, err := p.DoChatWithRetry(ctx, body, true)
+	return rc, err
+}
+
+// DoChatWithRetry 带账号轮换的重试执行：stream=true 返回流，否则返回响应体。
+func (p *Pool) DoChatWithRetry(ctx context.Context, body map[string]interface{}, stream bool) (io.ReadCloser, map[string]interface{}, error) {
+	model := normalizeModelName(fmt.Sprint(body["model"]))
+	exclude := map[string]bool{}
+	var lastErr error
+	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+		acct := p.PickWithSticky(model)
+		if acct == nil {
+			if lastErr == nil {
+				lastErr = errors.New("workbuddy: 没有可用账号")
+			}
+			break
+		}
+		exclude[acct.UserID] = true
+		if stream {
+			upstream, err := p.client.doChatStreamForAccount(ctx, acct, body)
+			if err != nil {
+				lastErr = err
+				slog.Warn("workbuddy: 账号请求失败，轮换下一个", "attempt", attempt+1, "error", err)
+				p.NoteError(acct.UserID, err)
+				p.StickyClear(model)
+				continue
+			}
+			pr, pw := io.Pipe()
+			go func() {
+				err := Stream(ctx, upstream, pw)
+				_ = pw.CloseWithError(err)
+			}()
+			p.StickySuccess(model)
+			return pr, nil, nil
+		}
+		out, err := p.client.doChatForAccount(ctx, acct, body)
+		if err != nil {
+			lastErr = err
+			slog.Warn("workbuddy: 账号请求失败，轮换下一个", "attempt", attempt+1, "error", err)
+			p.NoteError(acct.UserID, err)
+			p.StickyClear(model)
+			continue
+		}
+		p.StickySuccess(model)
+		return nil, out, nil
+	}
+	return nil, nil, lastErr
+}
+
+// --- 账号池管理 ---
+
+// Pick 挑一个可用账号（轮换）。
 func (p *Pool) Pick() *WBAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pickLocked(nil)
-}
-
-// PickExcluding 选一个健康账号，排除已尝试的 UID。
-func (p *Pool) PickExcluding(tried map[string]bool) *WBAccount {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.pickLocked(tried)
-}
-
-func (p *Pool) pickLocked(tried map[string]bool) *WBAccount {
-	now := time.Now()
-	var best *poolEntry
-	for uid, e := range p.entries {
-		if !e.healthy(now) {
-			continue
-		}
-		if tried != nil && tried[uid] {
-			continue
-		}
-		if best == nil || e.credits > best.credits {
-			best = e
-		}
-	}
-	if best == nil {
+	e := p.pickLocked(nil)
+	if e == nil {
 		return nil
 	}
-	return best.acct
+	return e.acct
 }
 
-// PickWithSticky 粘性选择：同一账号连续使用 maxReqs 次。
-func (p *Pool) PickWithSticky() *WBAccount {
+// PickExcluding 按排除表挑一个可用账号。
+func (p *Pool) PickExcluding(exclude map[string]bool) *WBAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	now := time.Now()
-	if p.stickyUID != "" {
-		if e, ok := p.entries[p.stickyUID]; ok && e.healthy(now) && p.stickyCount < defaultMaxReqs {
-			return e.acct
-		}
-		p.stickyUID = ""
-		p.stickyCount = 0
+	e := p.pickLocked(exclude)
+	if e == nil {
+		return nil
 	}
-
-	acct := p.pickLocked(nil)
-	if acct != nil {
-		p.stickyUID = acct.UID
-		p.stickyCount = 0
-	}
-	return acct
+	return e.acct
 }
 
-// StickySuccess 粘性计数 +1。
-func (p *Pool) StickySuccess(uid string) {
+// PickWithSticky 按 sticky 键优先挑选：粘性账号健康时优先复用，
+// 否则轮换新账号并记为待确认（StickySuccess 后固化）。
+func (p *Pool) PickWithSticky(key string) *WBAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.stickyUID == uid {
-		p.stickyCount++
-	}
-	if e, ok := p.entries[uid]; ok {
-		e.errCount = 0
-	}
-}
-
-// StickyClear 清除粘性。
-func (p *Pool) StickyClear() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.stickyUID = ""
-	p.stickyCount = 0
-}
-
-// Cooldown 对账号施加冷却。
-func (p *Pool) Cooldown(uid string, kind coolKind, d time.Duration, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.entries[uid]
-	if !ok {
-		return
-	}
-	e.until = time.Now().Add(d)
-	e.reason = reason
-	e.errCount = 0
-	slog.Info("workbuddy: account cooldown", "uid", uid, "kind", kind, "duration", d, "reason", reason)
-}
-
-// Disable 永久禁用账号。
-func (p *Pool) Disable(uid, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.entries[uid]
-	if !ok {
-		return
-	}
-	e.disabled = true
-	e.reason = reason
-	if p.stickyUID == uid {
-		p.stickyUID = ""
-		p.stickyCount = 0
-	}
-	slog.Warn("workbuddy: account disabled", "uid", uid, "reason", reason)
-}
-
-// NoteError 记录一次错误，达到阈值时触发冷却。
-func (p *Pool) NoteError(uid string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.entries[uid]
-	if !ok {
-		return
-	}
-	e.errCount++
-	if e.errCount >= errThreshold {
-		e.until = time.Now().Add(errCooldown)
-		e.reason = fmt.Sprintf("consecutive errors (%d)", e.errCount)
-		e.errCount = 0
-	}
-}
-
-// SetCredits 更新账号余额。
-func (p *Pool) SetCredits(uid string, credits int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.entries[uid]; ok {
-		e.credits = credits
-	}
-}
-
-// DoChatWithRetry 带重试的聊天请求（粘性路由 + 错误分类 + 冷却）。
-func (p *Pool) DoChatWithRetry(rawBody []byte) (io.ReadCloser, int, []byte, *WBAccount, error) {
-	tried := map[string]bool{}
-
-	for attempt := 0; attempt < defaultMaxRotate; attempt++ {
-		acct := p.PickWithSticky()
-		if acct == nil {
-			return nil, 0, nil, nil, fmt.Errorf("no healthy workbuddy account available")
-		}
-		if tried[acct.UID] {
-			p.StickyClear()
-			acct = p.PickExcluding(tried)
-			if acct == nil {
-				return nil, 0, nil, nil, fmt.Errorf("all accounts unavailable (tried: %d)", len(tried))
-			}
-		}
-		tried[acct.UID] = true
-
-		if acct.NeedsRefresh(refreshSkew) {
-			chatBase := p.client.chatBase(acct)
-			if err := RefreshToken(acct, p.client.HTTP, chatBase); err != nil {
-				p.StickyClear()
-				if strings.Contains(err.Error(), "session dead") || strings.Contains(err.Error(), "401") {
-					p.Disable(acct.UID, "refresh: session dead")
-				} else {
-					p.Cooldown(acct.UID, coolErr, errCooldown, "refresh failed")
+	if key != "" {
+		if id, ok := p.sticky[key]; ok {
+			for _, e := range p.entries {
+				if e.acct != nil && e.acct.UserID == id && p.usableLocked(e) {
+					return e.acct
 				}
-				continue
 			}
+			delete(p.sticky, key)
 		}
+	}
+	e := p.pickLocked(nil)
+	if e == nil {
+		return nil
+	}
+	if key != "" {
+		p.pending[key] = e.acct.UserID
+	}
+	return e.acct
+}
 
-		rc, status, errBody, err := p.client.doChatForAccount(acct, rawBody)
-		if err != nil {
-			p.StickyClear()
-			p.NoteError(acct.UID)
+// StickySuccess 确认 sticky 键本次使用成功（固化绑定）。
+func (p *Pool) StickySuccess(key string) {
+	if key == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if id, ok := p.pending[key]; ok {
+		p.sticky[key] = id
+		delete(p.pending, key)
+	}
+}
+
+// StickyClear 清除 sticky 键的绑定。
+func (p *Pool) StickyClear(key string) {
+	if key == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.sticky, key)
+	delete(p.pending, key)
+}
+
+// pickLocked 在持锁状态下轮换挑选（跳过禁用/冷却/不健康/被排除的账号）。
+func (p *Pool) pickLocked(exclude map[string]bool) *poolEntry {
+	n := len(p.entries)
+	if n == 0 {
+		return nil
+	}
+	for i := 0; i < n; i++ {
+		e := p.entries[(p.rr+i)%n]
+		if exclude != nil && exclude[e.acct.UserID] {
 			continue
 		}
-
-		if rc != nil {
-			p.StickySuccess(acct.UID)
-			return rc, status, nil, acct, nil
+		if !p.usableLocked(e) {
+			continue
 		}
+		p.rr = (p.rr + i + 1) % n
+		return e
+	}
+	return nil
+}
 
-		p.StickyClear()
-		kind := Classify(status, string(errBody))
-		switch kind {
-		case ErrHardCredit:
-			p.Cooldown(acct.UID, coolHard, hardCooldown, "余额/权益不足")
-		case ErrSoftRate:
-			p.Cooldown(acct.UID, coolSoft, softCooldown, "429 rate limit")
-		case ErrSessionDead:
-			p.Disable(acct.UID, fmt.Sprintf("http %d session dead", status))
-		case ErrNotFound:
-			p.Cooldown(acct.UID, coolSoft, softCooldown, "upstream 404")
+func (p *Pool) usableLocked(e *poolEntry) bool {
+	if e == nil || e.acct == nil {
+		return false
+	}
+	if e.disabled || e.acct.Disabled || !e.healthy {
+		return false
+	}
+	if time.Now().Before(e.cooldown) {
+		return false
+	}
+	return e.acct.AccessToken != "" || e.acct.RefreshToken != ""
+}
+
+func (p *Pool) byIDLocked(id string) *poolEntry {
+	for _, e := range p.entries {
+		if e.acct != nil && e.acct.UserID == id {
+			return e
+		}
+	}
+	return nil
+}
+
+// NoteError 记录账号错误：按 class 冷却，session-dead/硬标记禁用。
+func (p *Pool) NoteError(id string, err error) {
+	if err == nil {
+		return
+	}
+	class := Classify(err)
+	dead := hitsAny(err.Error(), sessionDeadMarkers)
+	hard := hitsAny(err.Error(), hardMarkers)
+	p.mu.Lock()
+	e := p.byIDLocked(id)
+	if e != nil {
+		e.healthy = false
+		e.lastErr = truncateDetail(err.Error())
+		e.failClass = class
+		switch {
+		case dead:
+			e.acct.Disabled = true
+		case hard:
+			e.acct.Disabled = true
+		case class == health.ClassAuthFailed:
+			e.acct.Disabled = true
 		default:
-			p.NoteError(acct.UID)
+			e.cooldown = time.Now().Add(cooldownFor(class))
 		}
-		return nil, status, errBody, acct, nil
 	}
-
-	return nil, 0, nil, nil, fmt.Errorf("all accounts unavailable after %d attempts", defaultMaxRotate)
+	p.mu.Unlock()
+	if e != nil {
+		slog.Warn("workbuddy: 账号进入冷却/禁用", "user_id", id, "class", class, "error", e.lastErr)
+	}
 }
 
-// ---- provider.Keyless 接口 ----
-
-// Name 返回渠道名。
-func (p *Pool) Name() string { return "workbuddy" }
-
-// Enabled 当池中有至少一个可用账号时返回 true。
-func (p *Pool) Enabled() bool { return p.client.Enabled() }
-
-// Supports 判定模型是否由 WorkBuddy 渠道提供。
-func (p *Pool) Supports(model string) bool { return p.client.Supports(model) }
-
-// ListModels 返回可用模型列表。
-func (p *Pool) ListModels() ([]joycode.ModelInfo, error) {
-	return p.client.ListModels()
+// Cooldown 手动给账号加冷却。
+func (p *Pool) Cooldown(id string, d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.byIDLocked(id); e != nil {
+		e.cooldown = time.Now().Add(d)
+		e.healthy = false
+	}
 }
 
-// ---- 池化聊天 ----
-
-// ChatStream 流式池化聊天。
-func (p *Pool) ChatStream(body map[string]any) (*http.Response, error) {
-	rawBody, err := json.Marshal(body)
+// Disable 禁用账号（管理操作，持久化）。
+func (p *Pool) Disable(id string) {
+	p.mu.Lock()
+	e := p.byIDLocked(id)
+	var err error
+	if e != nil {
+		e.disabled = true
+		e.healthy = false
+		e.acct.Disabled = true
+		err = saveAccounts(p.store, p.accountListLocked())
+	}
+	p.mu.Unlock()
 	if err != nil {
-		return nil, err
+		slog.Error(errSaveAccounts, "error", err)
 	}
-	rc, status, errBody, _, chatErr := p.DoChatWithRetry(rawBody)
-	if chatErr != nil {
-		return nil, chatErr
-	}
-	if rc != nil {
-		pr, pw := io.Pipe()
-		go func() {
-			defer pw.Close()
-			_ = Stream(pw, rc)
-		}()
-		return &http.Response{
-			StatusCode: 200,
-			Body:       pr,
-			Header:     http.Header{"Content-Type": {"text/event-stream"}},
-		}, nil
-	}
-	return &http.Response{
-		StatusCode: status,
-		Body:       io.NopCloser(strings.NewReader(string(errBody))),
-		Header:     http.Header{"Content-Type": {"application/json"}},
-	}, nil
 }
 
-// Chat 非流式池化聊天：强制上游流式，本地聚合。
-func (p *Pool) Chat(body map[string]any) (map[string]any, error) {
-	rawBody, err := json.Marshal(body)
+// SetCredits 更新账号额度（持久化）。
+func (p *Pool) SetCredits(id string, credits float64) {
+	p.mu.Lock()
+	e := p.byIDLocked(id)
+	var err error
+	if e != nil {
+		e.acct.Credits = credits
+		err = saveAccounts(p.store, p.accountListLocked())
+	}
+	p.mu.Unlock()
 	if err != nil {
-		return nil, err
+		slog.Error(errSaveAccounts, "error", err)
 	}
-	rc, status, errBody, _, chatErr := p.DoChatWithRetry(rawBody)
-	if chatErr != nil {
-		return nil, chatErr
+}
+
+// SyncAccounts 从 settings blob 重载账号（保留运行态：冷却/失败分类），
+// 并对令牌过期的账号在后台刷新（保持在线）。
+func (p *Pool) SyncAccounts() {
+	accts, err := loadAccounts(p.store)
+	if err != nil {
+		slog.Warn("workbuddy: 加载账号失败", "error", err)
 	}
-	if rc != nil {
-		defer rc.Close()
-		model, _ := body["model"].(string)
-		return Aggregate(rc, model)
-	}
-	if errBody != nil {
-		var result map[string]any
-		if json.Unmarshal(errBody, &result) == nil {
-			return result, nil
+	p.mu.Lock()
+	old := map[string]*poolEntry{}
+	for _, e := range p.entries {
+		if e.acct != nil {
+			old[e.acct.UserID] = e
 		}
-		return nil, fmt.Errorf("upstream http %d: %s", status, truncate(string(errBody), 200))
 	}
-	return nil, fmt.Errorf("upstream http %d", status)
+	entries := make([]*poolEntry, 0, len(accts))
+	var stale []*WBAccount
+	for _, a := range accts {
+		e := &poolEntry{acct: a, healthy: true}
+		if prev, ok := old[a.UserID]; ok {
+			e.cooldown = prev.cooldown
+			e.lastErr = prev.lastErr
+			e.failClass = prev.failClass
+			e.healthy = prev.healthy || !a.Disabled
+		}
+		if a.Disabled {
+			e.disabled = true
+			e.healthy = false
+		}
+		entries = append(entries, e)
+		if a.NeedsRefresh() && a.RefreshToken != "" {
+			stale = append(stale, a)
+		}
+	}
+	p.entries = entries
+	p.mu.Unlock()
+	if len(stale) > 0 {
+		go p.refreshStale(stale)
+	}
+}
+
+// refreshStale 后台刷新过期账号令牌并回写 blob。
+func (p *Pool) refreshStale(accts []*WBAccount) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	changed := false
+	for _, a := range accts {
+		if err := RefreshToken(ctx, p.http, a); err != nil {
+			slog.Warn("workbuddy: 刷新账号令牌失败", "user_id", a.UserID, "error", err)
+			continue
+		}
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	p.mu.Lock()
+	err := saveAccounts(p.store, p.accountListLocked())
+	p.mu.Unlock()
+	if err != nil {
+		slog.Error(errSaveAccounts, "error", err)
+	}
+}
+
+// accountListLocked 返回账号切片（须持锁）。
+func (p *Pool) accountListLocked() []*WBAccount {
+	out := make([]*WBAccount, 0, len(p.entries))
+	for _, e := range p.entries {
+		if e.acct != nil {
+			out = append(out, e.acct)
+		}
+	}
+	return out
 }

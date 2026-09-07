@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
-	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
+	"github.com/veenyi/XingyunAPI/pkg/store"
 )
 
 // --- Mock infrastructure ---
@@ -302,7 +302,7 @@ func TestChat_ValidNonStream(t *testing.T) {
 	})
 	defer cleanup()
 
-	body := `{"model":"JoyAI-Code-1.5","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	body := `{"model":"JoyAI-Code","messages":[{"role":"user","content":"hi"}],"stream":false}`
 	resp, err := http.Post(
 		srv.URL+"/v1/chat/completions",
 		"application/json",
