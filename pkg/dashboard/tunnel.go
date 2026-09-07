@@ -43,6 +43,7 @@ type TunnelManager struct {
 	since      time.Time
 	cancel     context.CancelFunc
 	handler    *Handler // back-reference for dynamic discovery
+	autoTried  bool     // 自动建项目只尝试一次（避免反复扣额度）
 }
 
 func NewTunnelManager(h *Handler) *TunnelManager {
@@ -112,6 +113,56 @@ type tunnelTarget struct {
 	publicURL string
 }
 
+// autoCreateTunnelProject 用默认账号自动创建一个 Html 项目并等待启动。
+func (h *Handler) autoCreateTunnelProject() (tunnelTarget, error) {
+	client, _, err := h.devcloudClient("")
+	if err != nil {
+		return tunnelTarget{}, fmt.Errorf("无可用账号: %w", err)
+	}
+	langs, err := client.ListTemplates()
+	if err != nil {
+		return tunnelTarget{}, fmt.Errorf("获取模板目录失败: %w", err)
+	}
+	tmplID := 0
+	for _, l := range langs {
+		if strings.Contains(strings.ToLower(l.Name), "html") {
+			for _, v := range l.Versions {
+				tmplID = v.ID
+				break
+			}
+			break
+		}
+	}
+	if tmplID == 0 {
+		return tunnelTarget{}, fmt.Errorf("未找到 Html 模板")
+	}
+	in := devcloud.CreateInput{
+		Name:              "xingyun-tunnel",
+		AbbrName:          "X",
+		BgColor:           "#16A34A",
+		DevMode:           1,
+		ProjectTemplateID: tmplID,
+		ResourceCPU:       1,
+		ResourceMemory:    "2Gi",
+		ResourceStorage:   "10G",
+	}
+	detail, err := client.CreateProject(in)
+	if err != nil {
+		return tunnelTarget{}, fmt.Errorf("创建项目失败: %w", err)
+	}
+	slog.Info("tunnel: auto-created project", "id", detail.ID, "name", detail.Name)
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		d, err := client.GetProject(detail.ID)
+		if err != nil { continue }
+		if strings.EqualFold(d.Status, "Running") {
+			return tunnelTarget{client: client, projectID: detail.ID, publicURL: d.URL}, nil
+		}
+	}
+	return tunnelTarget{}, fmt.Errorf("项目 %d 创建成功但 90 秒内未启动", detail.ID)
+}
+
 // tunnelTargets discovers all running projects across every account.
 func (h *Handler) tunnelTargets() []tunnelTarget {
 	var out []tunnelTarget
@@ -142,6 +193,7 @@ func (h *Handler) tunnelTargets() []tunnelTarget {
 }
 
 // run keeps the tunnel alive: discover targets → dial → listen → pump.
+// 如果没有运行中项目且尚未尝试过自动建站，会自动用默认账号创建一个。
 func (t *TunnelManager) run(ctx context.Context) {
 	backoff := 5 * time.Second
 	for {
@@ -149,6 +201,22 @@ func (t *TunnelManager) run(ctx context.Context) {
 			return
 		}
 		targets := t.handler.tunnelTargets()
+		if len(targets) == 0 && !t.autoTried {
+			t.autoTried = true
+			t.setState(tunnelConnecting, "没有运行中项目，自动创建云主机…")
+			slog.Info("tunnel: no running projects, auto-creating one")
+			if tgt, err := t.handler.autoCreateTunnelProject(); err == nil {
+				targets = append(targets, tgt)
+				slog.Info("tunnel: auto-created project", "id", tgt.projectID, "url", tgt.publicURL)
+			} else {
+				slog.Warn("tunnel: auto-create failed", "error", err)
+				t.setState(tunnelBackoff, "自动建站失败: "+err.Error())
+				if !sleepCtx(ctx, backoff) {
+					return
+				}
+				continue
+			}
+		}
 		if len(targets) == 0 {
 			t.setState(tunnelBackoff, "没有运行中的云主机项目")
 			if !sleepCtx(ctx, backoff) {
