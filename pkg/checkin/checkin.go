@@ -56,6 +56,7 @@ const (
 	twBase = "https://api.trae.cn"
 	// twStatusPath 签到状态；twClaimPath 领取签到积分。
 	twStatusPath = "/trae/api/v2/ug/checkin_credits/status"
+	twEntUsagePath = "/trae/api/v2/pay/web_user_ent_usage"
 	twClaimPath  = "/trae/api/v2/ug/checkin_credits/claim"
 
 	// qoderUsagePath 只刷积分，无签到动作（qoder.OpenAPIBase 前缀）。

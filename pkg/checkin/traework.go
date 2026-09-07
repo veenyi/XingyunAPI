@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"io"
 )
 
 // twHeaderUserAgent 未从二进制还原，取浏览器惯例值。
@@ -24,22 +25,35 @@ const twHeaderUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 // twRiskRateLimit 是 TraeWork 风控限流码（随机设备指纹被拒）。
 const twRiskRateLimit = 9074
 
-// twUgHeaders 构造 ug 端点请求头（Bearer + 设备指纹）。
+// twUgHeaders 构造 ug 端点请求头——对齐 wild-work 的 SOLOHeaders + UgHeaders：
+// Authorization 用 Cloud-IDE-JWT 前缀（不是 Bearer），需全套设备指纹头。
 func twUgHeaders(a *Account) http.Header {
 	h := http.Header{
-		"Content-Type": {"application/json"},
-		"Accept":       {"application/json"},
-		"User-Agent":   {twHeaderUserAgent},
+		"Content-Type":    {"application/json"},
+		"Accept":          {"application/json"},
+		"User-Agent":      {twHeaderUserAgent},
+		"X-User-Region":   {"CN"},
+		"X-Device-Type":   {"windows"},
+		"X-OS-Version":    {"Windows 10 Pro"},
+		"X-Device-Brand":  {"20Y5A002XX"},
+		"X-App-Version":   {twIDEVersion},
+		"Request-Traffic-Type": {"prod"},
 	}
 	if a != nil {
 		if a.AccessToken != "" {
-			h.Set("Authorization", "Bearer "+a.AccessToken)
+			h.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
+			h.Set("X-Cloudide-Token", a.AccessToken)
+			h.Set("X-Ide-Token", a.AccessToken)
+		}
+		if a.UID != "" {
+			h.Set("X-Uid", a.UID)
 		}
 		if a.DeviceID != "" {
 			h.Set("x-device-id", a.DeviceID)
+			h.Set("X-Device-Id", a.DeviceID)
 		}
 		if a.MachineID != "" {
-			h.Set("x-machine-id", a.MachineID)
+			h.Set("X-Machine-Id", a.MachineID)
 		}
 	}
 	return h
@@ -176,16 +190,7 @@ func (m *Manager) twCredits(ctx context.Context, a *Account) (map[string]interfa
 
 // twCreditsF64 查询签到状态并宽容换算为 (剩余, 总量)。
 func (m *Manager) twCreditsF64(ctx context.Context, a *Account) (credits, total float64, err error) {
-	out, err := m.twCredits(ctx, a)
-	if err != nil {
-		return 0, 0, err
-	}
-	_, _, data := twEnvelope(out)
-	if len(data) == 0 {
-		data = out
-	}
-	credits, total = m.creditsFrom(data)
-	return credits, total, nil
+	return m.twEntUsage(ctx, a)
 }
 
 // twProbeKeepalive 探测当前 access token 有效性（无设备私钥时的降级保活）。
@@ -213,4 +218,52 @@ func (a *Account) twHost() string {
 		return strings.TrimSpace(a.APIHost)
 	}
 	return twBase
+}
+
+// twEntUsage 查询 TRAE 账号实际剩余积分（对齐 wild-work UserEntUsage）。
+// POST {host}/trae/api/v2/pay/web_user_ent_usage body {"require_usage":true}
+// 剩余 = Σ(credits_limit - credits_amount)。
+func (m *Manager) twEntUsage(ctx context.Context, a *Account) (credits, total float64, err error) {
+	req, err := http.NewRequest(http.MethodPost, a.twHost()+twEntUsagePath, strings.NewReader(`{"require_usage":true}`))
+	if err != nil {
+		return 0, 0, err
+	}
+	for k, vals := range twUgHeaders(a) {
+		for _, v := range vals {
+			req.Header.Add(k, v)
+		}
+	}
+	hc := m.hc
+	if hc == nil {
+		hc = checkinHTTP
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ent_usage 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("ent_usage HTTP %d: %s", resp.StatusCode, string(raw)[:min(200,len(raw))])
+	}
+	var result struct {
+		UserEntitlementPackList []struct {
+			EntitlementBaseInfo struct {
+				Quota struct {
+					CreditsLimit float64 `json:"credits_limit"`
+				} `json:"quota"`
+			} `json:"entitlement_base_info"`
+			Usage struct {
+				CreditsAmount float64 `json:"credits_amount"`
+			} `json:"usage"`
+		} `json:"user_entitlement_pack_list"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return 0, 0, fmt.Errorf("ent_usage 解析失败: %w", err)
+	}
+	for _, p := range result.UserEntitlementPackList {
+		total += p.EntitlementBaseInfo.Quota.CreditsLimit
+		credits += p.EntitlementBaseInfo.Quota.CreditsLimit - p.Usage.CreditsAmount
+	}
+	return credits, total, nil
 }

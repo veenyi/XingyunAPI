@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/veenyi/XingyunAPI/pkg/health"
+	"github.com/veenyi/XingyunAPI/pkg/joycode"
 )
 
 type modelItem struct {
@@ -71,6 +72,11 @@ func (h *Handler) handleModelStatus(w http.ResponseWriter, r *http.Request) {
 		if p := h.router.Primary; p != nil {
 			for _, m := range p.ListModels() {
 				add(p.Name(), m)
+			}
+		} else {
+			// Primary 每请求生成，聚合时可能为 nil：直接用 JoyCode 静态模型表
+			for _, m := range joycode.Models {
+				add("joycode", m)
 			}
 		}
 		for _, p := range h.router.KeylessChannels() {

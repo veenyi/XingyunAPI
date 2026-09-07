@@ -36,6 +36,7 @@ const (
 	twAuthzPath    = "/trae/api/v3/oauth/ExchangeToken"
 	twUserInfoPath = "/cloudide/api/v3/trae/GetUserInfo"
 	twLoginHost    = "https://www.trae.cn"
+	twOAuthHost    = "https://api.trae.com.cn" // 式B 刷新专用 host（wild-work 稳定实现）
 	twPluginVer    = "2.3.79943"
 
 	twLoginTTL = 30 * time.Minute
@@ -310,21 +311,17 @@ func (m *Manager) twExchangeAuthCode(ctx context.Context, s *twLoginSession, cod
 	return m.twExchange(ctx, s.exchangeHost(), body)
 }
 
-// twExchangeRefresh 用 RefreshToken + DeviceProof 续期（式B）。
+// twExchangeRefresh 用 RefreshToken 续期（式B）。
+// 对齐 wild-work（稳定版）：无需 DeviceProof 签名，ClientSecret 用 "-"，
+// host 用 OAuthHost（api.trae.com.cn，非 api.trae.cn / api.trae.com）。
 func (m *Manager) twExchangeRefresh(ctx context.Context, a *Account) (*twTokens, error) {
-	sig, ts, nonce, err := twSignDeviceProof(a.DeviceKey, a.RefreshToken)
-	if err != nil {
-		return nil, err
-	}
 	body := map[string]interface{}{
 		"ClientID":     twClientID,
-		"ClientSecret": "",
 		"RefreshToken": a.RefreshToken,
-		"DeviceInfo":   twDeviceInfo(a.DeviceID, a.MachineID, twPubFromPriv(a.DeviceKey)),
-		"DeviceProof":  map[string]interface{}{"Signature": sig, "Timestamp": ts, "Nonce": nonce},
-		"IDEVersion":   twIDEVersion,
+		"ClientSecret": "-",
+		"UserID":       "",
 	}
-	return m.twExchange(ctx, a.APIHost, body)
+	return m.twExchange(ctx, twOAuthHost, body)
 }
 
 // twExchange 调 ExchangeToken 并宽容解析 {Token, RefreshToken}（平铺或 data/Result 包裹）。

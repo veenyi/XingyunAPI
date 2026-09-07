@@ -89,15 +89,26 @@ type ChatProvider struct{ *Client }
 func (c *Client) AsProvider() *ChatProvider { return &ChatProvider{c} }
 
 func (p *ChatProvider) ListModels() []string {
-	names := make([]string, 0)
+	// 静态表优先（上游 modelList 拉取失败时派单列表不空）；上游成功且有额外型号则合并
+	seen := map[string]bool{}
+	out := make([]string, 0, len(Models))
+	add := func(n string) {
+		if n != "" && !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	for _, m := range Models {
+		add(m)
+	}
 	if ms, err := p.Client.ListModels(); err == nil {
 		for _, m := range ms {
 			if m.Label != "" {
-				names = append(names, m.Label)
+				add(m.Label)
 			}
 		}
 	}
-	return names
+	return out
 }
 
 // GetPoint 查询账号剩余 IDE 积分。

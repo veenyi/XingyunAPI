@@ -9,7 +9,17 @@ import (
 )
 
 // StaticModels 是内置静态模型（strings-notes §4）。
-var StaticModels = []string{"qmodel_latest", "qwen3.7-flash", "qwen3.6-flash"}
+var StaticModels = []string{
+	"qmodel_latest", "qwen3.7-flash", "qwen3.6-flash",
+	"qmodel_38max",  // qwen3.8-max
+	"qmodel",        // qwen3.7-plus
+	"q37fmodel",
+	"q36fmodel",
+	"dmodel",        // deepseek-v4-pro
+	"dfmodel",       // deepseek-v4-flash
+	"gmodel",        // glm-5.3
+	"automodel",     // auto
+}
 
 // ModelEntry 是对外的模型表项：Name 对外暴露，Upstream 发往上游。
 type ModelEntry struct {
@@ -42,6 +52,12 @@ var stdToCustom = map[string]string{
 	"qwen3.6-flash": "qwen3.6-flash",
 	"qwen-flash":    "qwen3.7-flash",
 	"latest":        "qmodel_latest",
+	"qwen3.8-max":   "qmodel_38max",
+	"qwen3.7-plus":  "qmodel",
+	"deepseek-v4-pro":   "dmodel",
+	"deepseek-v4-flash": "dfmodel",
+	"glm-5.3":           "gmodel",
+	"auto":              "automodel",
 }
 
 // customToStd 是 stdToCustom 的反向映射。

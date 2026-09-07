@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -180,7 +181,7 @@ func (h *Handler) handleCheckinRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "缺少账号 id")
 		return
 	}
-	res, err := h.checkin.RunOne(r.Context(), body.ID)
+	res, err := h.checkin.RunOne(context.Background(), body.ID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
