@@ -153,11 +153,11 @@ func TestPrepareBody_ExtraChatIdPassedThrough(t *testing.T) {
 func TestPrepareBody_ExtraFieldsMerged(t *testing.T) {
 	c := NewClient("k", "u")
 	body := c.prepareBody(map[string]interface{}{
-		"model":    "GLM-5",
+		"model":    "Some-Unmapped-Model",
 		"stream":   true,
 		"messages": []string{"hello"},
 	})
-	if body["model"] != "GLM-5" {
+	if body["model"] != "Some-Unmapped-Model" {
 		t.Errorf("extra field model not merged: %v", body["model"])
 	}
 	if body["stream"] != true {

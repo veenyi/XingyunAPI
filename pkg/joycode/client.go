@@ -50,16 +50,24 @@ var colorEndpoints = map[string]colorEndpoint{
 	"/api/saas/anthropic/v1/messages":      {"anthropic_completions", "/api/saas/anthropic/v1/messages"},
 }
 
+// Models 是 JoyCode 渠道模型表（顺序对齐 IDE 下拉）。2026-09-08 补齐 IDE
+// 现役模型：GLM-5.1 / GLM-5 / MiniMax-M2.7（三个实测零扣分=免费）。
 var Models = []string{
 	"JoyAI-Code-1.5",
-	"GLM-5.3",
+	"MiniMax-M2.7",
 	"Kimi-K2.6",
-	"MiniMax-M3",
+	"GLM-5.1",
+	"GLM-5",
 	"Doubao-Seed-2.0-pro",
+	"GLM-5.3",
+	"MiniMax-M3",
 }
 
 // APIModelNames 把模型显示名映射为上游 chatApiModel（modelList 实测
 // 2026-09-04；未列出的名字原样透传，上游对别名宽容）。
+//
+// 只映射付费的 -agent 变体：GLM-5.1 / GLM-5 / MiniMax-M2.7 **必须保持裸名透传**，
+// 2026-09-08 积分实测裸名零扣分（免费），而 -agent 变体每次扣 3~11 分。
 var APIModelNames = map[string]string{
 	"GLM-5.3":             "GLM-5.3-agent",
 	"Kimi-K2.6":           "Kimi-K2.6-agent",
@@ -67,10 +75,16 @@ var APIModelNames = map[string]string{
 	"Doubao-Seed-2.0-pro": "Doubao-Seed-2.0-pro-agent",
 }
 
-// ModelNotes 模型备注（/api/models 的 note 字段）。免费为 2026-09-04
-// tiny-chat 积分实测：JoyAI-Code-1.5 前后 remain 不变，其余每 8-token 回复扣 2~3 分。
+// ModelNotes 模型备注（/api/models 的 note 字段）。免费为 2026-09-08
+// 单账号积分实测（每次 max_tokens 300~400，比对 /api/accounts/{id}/point
+// 的 remain 前后值）：JoyAI-Code-1.5 / GLM-5.1 / GLM-5 / MiniMax-M2.7
+// 裸名零扣分；GLM-5.3 -4、Doubao-Seed-2.0-pro -3、MiniMax-M3 -9、
+// Kimi-K2.6 -10（每次）。
 var ModelNotes = map[string]string{
 	"JoyAI-Code-1.5": "免费",
+	"GLM-5.1":        "免费",
+	"GLM-5":          "免费",
+	"MiniMax-M2.7":   "免费",
 }
 
 // APIModelName 返回上游 chatApiModel（无映射时原样返回）。
