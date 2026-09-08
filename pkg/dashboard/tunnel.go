@@ -227,10 +227,12 @@ func (t *TunnelManager) run(ctx context.Context) {
 		var sshc *ssh.Client
 		var dialErr error
 		var activeURL string
+		var activeID int
 		for _, tgt := range targets {
 			sshc, _, dialErr = tgt.client.DialSSH(tgt.projectID)
 			if dialErr == nil {
 				activeURL = tgt.publicURL
+				activeID = tgt.projectID
 				break
 			}
 			slog.Warn("tunnel: dial failed", "project", tgt.projectID, "error", dialErr)
@@ -243,6 +245,10 @@ func (t *TunnelManager) run(ctx context.Context) {
 			}
 			continue
 		}
+
+		// 自愈：模板默认 nginx 只吐 hello world，必须把 location / 反代到
+		// ssh -R 的 9000 才能从公网看到面板（2026-09-08 多用户报障根因）。
+		ensurePanelNginx(sshc, activeID)
 
 		ln, err := sshc.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tunnelRemotePort))
 		if err != nil {
@@ -339,6 +345,86 @@ func probePublicOK(url string) bool {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
 	return resp.StatusCode == http.StatusOK
+}
+
+// panelNginxConf 是隧道项目的 nginx 配置：location / 反代 ssh -R 的 9000
+// （面板+API，SSE 关缓冲），保留 /app/ /svc/ 子路径玩法。
+const panelNginxConf = `worker_processes auto;
+error_log /dev/stderr;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+    access_log /dev/stdout;
+
+    server {
+        listen 8080;
+        server_name localhost;
+        client_max_body_size 100M;
+
+        # xingyun-panel marker: managed by xingyun-api tunnel (do not edit)
+
+        location / {
+            proxy_pass http://127.0.0.1:9000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+            chunked_transfer_encoding on;
+        }
+    }
+}
+`
+
+// ensurePanelNginx 检查容器 nginx 是否已配置面板反代（xinger marker），
+// 没有则写入并 reload。模板默认 nginx 只会吐 hello world——r27 自动建站
+// 漏了这步导致所有新建 tunnel 项目公网打不开面板（2026-09-08 修）。
+// SSH 用户 abc 免密 sudo root；nginx 主配置即 /config/workspace/nginx.conf。
+func ensurePanelNginx(sshc *ssh.Client, projectID int) {
+	sess, err := sshc.NewSession()
+	if err != nil {
+		slog.Warn("tunnel: nginx check session failed", "error", err)
+		return
+	}
+	defer sess.Close()
+	out, err := sess.CombinedOutput("grep -q 'xingyun-panel marker' /config/workspace/nginx.conf 2>/dev/null && echo ok || echo missing")
+	if err == nil && strings.Contains(string(out), "ok") {
+		return
+	}
+	slog.Info("tunnel: provisioning panel nginx conf", "project", projectID)
+
+	// 写配置（临时文件 + sudo install 覆盖，避免重定向权限问题）
+	wsess, err := sshc.NewSession()
+	if err != nil {
+		slog.Warn("tunnel: nginx write session failed", "error", err)
+		return
+	}
+	defer wsess.Close()
+	wsess.Stdin = strings.NewReader(panelNginxConf)
+	if err := wsess.Run("cat > /tmp/xingyun-nginx.conf && sudo install -m 644 /tmp/xingyun-nginx.conf /config/workspace/nginx.conf && rm -f /tmp/xingyun-nginx.conf"); err != nil {
+		slog.Warn("tunnel: nginx conf write failed", "error", err)
+		return
+	}
+	// 测试 + reload（root 的 nginx -c 用绝对路径；reload 失败回滚不处理——
+	// 模板配置本就不可用，写坏也比 hello world 好；测试失败则保留原样）
+	rsess, err := sshc.NewSession()
+	if err != nil {
+		return
+	}
+	defer rsess.Close()
+	res, err := rsess.CombinedOutput("sudo /usr/sbin/nginx -t -c /config/workspace/nginx.conf 2>&1 && sudo /usr/sbin/nginx -c /config/workspace/nginx.conf -s reload 2>&1 && echo reloaded")
+	slog.Info("tunnel: nginx reload", "project", projectID, "result", strings.TrimSpace(string(res)), "err", err)
 }
 
 // handleTunnel GET=status, POST {action: start|stop|restart}.
