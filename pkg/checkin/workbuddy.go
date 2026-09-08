@@ -23,6 +23,10 @@ import (
 // wbHeaderUserAgent 未从二进制还原，取浏览器惯例值（对齐 workbuddy 包）。
 const wbHeaderUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CodeBuddy/1.0.0 Chrome/133.0.0.0 Safari/537.36"
 
+// wbLoginUA 扫码登录链路专用 UA（workbuddy2api cmd/login：CLI/2.63.2 CodeBuddy/2.63.2，
+// auth/state 实测只认这套头，浏览器 UA 会打到不同网关规则）。
+const wbLoginUA = "CLI/2.63.2 CodeBuddy/2.63.2"
+
 // wbLoginTTL 是扫码登录会话有效期（对齐 qoder sessionTTL）。
 const wbLoginTTL = 5 * time.Minute
 
@@ -33,6 +37,19 @@ func wbCommonHeaders() http.Header {
 		"Accept":          {"application/json"},
 		"User-Agent":      {wbHeaderUserAgent},
 		"Accept-Language": {"zh-CN,zh;q=0.9,en;q=0.8"},
+	}
+}
+
+// wbLoginHeaders 扫码登录链路请求头（对齐 workbuddy2api cmd/login commonHeaders：
+// X-Requested-With: XMLHttpRequest + Origin/Referer codebuddy.cn + CLI UA）。
+func wbLoginHeaders() http.Header {
+	return http.Header{
+		"Content-Type":     {"application/json"},
+		"Accept":           {"application/json, text/plain, */*"},
+		"User-Agent":       {wbLoginUA},
+		"X-Requested-With": {"XMLHttpRequest"},
+		"Origin":           {"https://www.codebuddy.cn"},
+		"Referer":          {"https://www.codebuddy.cn/"},
 	}
 }
 
@@ -184,7 +201,7 @@ type wbLoginSession struct {
 // platform=CLI 是必填查询参数（缺失回 10001 platform is empty，参考
 // workbuddy2api/cmd/login 的实现）。
 func (m *Manager) wbLoginSession(ctx context.Context) (*wbLoginSession, error) {
-	env, err := doEnvelope(ctx, m.hc, http.MethodPost, wbAuthBase+wbAuthStatePath+"?platform=CLI", wbCommonHeaders(), map[string]interface{}{})
+	env, err := doEnvelope(ctx, m.hc, http.MethodPost, wbAuthBase+wbAuthStatePath+"?platform=CLI", wbLoginHeaders(), map[string]interface{}{})
 	if err != nil {
 		return nil, err
 	}
@@ -216,15 +233,21 @@ func (m *Manager) wbLoginSession(ctx context.Context) (*wbLoginSession, error) {
 
 // wbLoginDo 轮询一次登录确认：扫码确认 → 账号（自动入库）；
 // 未确认 → errWBPending；会话失效 → 明确错误。
+// 权威两步流程（workbuddy2api cmd/login poll，2026-09-08 实测：直接 POST
+// login/account 被上游 APISIX 401 HTML 硬拒）：
+//  1. GET /v2/plugin/auth/token?state= —— pending 回业务码 11217 "login ing..."，
+//     完成回 data.accessToken/refreshToken/expiresIn/domain（camelCase）
+//  2. 带 Bearer GET /v2/plugin/login/account?state= —— uid/enterpriseId/nickname
 func (m *Manager) wbLoginDo(ctx context.Context, s *wbLoginSession) (*Account, error) {
-	env, err := doEnvelope(ctx, m.hc, http.MethodPost, wbAuthBase+wbLoginPath, wbCommonHeaders(), map[string]interface{}{"state": s.State})
+	tokEnv, err := doEnvelope(ctx, m.hc, http.MethodGet, wbAuthBase+wbAuthTokenPath+"?state="+s.State, wbLoginHeaders(), nil)
 	if err != nil {
 		return nil, err
 	}
-	candidates := mergedFields(env)
-	access := strAny(candidates, "access_token", "accessToken")
+	tok := mergedFields(tokEnv)
+	access := strAny(tok, "accessToken", "access_token")
 	if access == "" {
-		text := env.text()
+		// 未扫码/未确认：业务码 11217（login ing...）或空 data → pending
+		text := tokEnv.text()
 		if containsFold(text, []string{"过期", "expired", "失效", "invalid", "不存在"}) {
 			if text == "" {
 				text = "登录已过期，请重新扫码"
@@ -233,16 +256,23 @@ func (m *Manager) wbLoginDo(ctx context.Context, s *wbLoginSession) (*Account, e
 		}
 		return nil, errWBPending
 	}
+	h := wbLoginHeaders()
+	h.Set("Authorization", "Bearer "+access)
 	acct := &Account{
 		Platform:     platformWorkBuddy,
-		UID:          strAny(candidates, "user_id", "uid", "userid"),
-		Nickname:     strAny(candidates, "nickname", "display_name", "username"),
 		AccessToken:  access,
-		RefreshToken: strAny(candidates, "refresh_token", "refreshToken"),
-		EnterpriseID: strAny(candidates, "enterprise_id", "enterpriseId"),
-		Domain:       strAny(candidates, "domain"),
-		APIHost:      strAny(candidates, "api_host", "apiHost"),
+		RefreshToken: strAny(tok, "refreshToken", "refresh_token"),
+		Domain:       strAny(tok, "domain"),
 		Enabled:      true,
+	}
+	if acctEnv, err := doEnvelope(ctx, m.hc, http.MethodGet, wbAuthBase+wbLoginPath+"?state="+s.State, h, nil); err == nil {
+		candidates := mergedFields(acctEnv)
+		acct.UID = strAny(candidates, "uid", "user_id", "userid")
+		acct.Nickname = strAny(candidates, "nickname", "display_name", "username")
+		acct.EnterpriseID = strAny(candidates, "enterpriseId", "enterprise_id")
+		if acct.APIHost == "" {
+			acct.APIHost = strAny(candidates, "api_host", "apiHost")
+		}
 	}
 	saved, err := m.addWBAccount(acct)
 	if err != nil {

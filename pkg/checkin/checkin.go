@@ -52,6 +52,7 @@ const (
 
 	wbAuthBase      = "https://copilot.tencent.com"
 	wbAuthStatePath = "/v2/plugin/auth/state"
+	wbAuthTokenPath = "/v2/plugin/auth/token"
 	wbLoginPath     = "/v2/plugin/login/account"
 
 	twBase = "https://api.trae.cn"
