@@ -132,15 +132,23 @@ func (m *Manager) twCheckin(ctx context.Context, a *Account) (string, error) {
 		return "", errors.New(errDeviceFingerprint)
 	}
 	if !twNumericDeviceID(a.DeviceID) {
-		// 存量 UUID 设备 ID 迁移为 15 位纯数字（9074 根治，2026-09-08 实测）
-		a.DeviceID = twNumericID()
+		// 存量 UUID 设备 ID 迁移为 15 位纯数字（9074 根治，2026-09-08 实测）。
+		// a 是 RunOne/RunAll 传入的克隆副本，必须回写主列表再持久化。
+		newID := twNumericID()
+		a.DeviceID = newID
 		m.mu.Lock()
+		for _, cur := range m.accounts {
+			if cur != nil && cur.ID == a.ID {
+				cur.DeviceID = newID
+				break
+			}
+		}
 		err := m.saveStored()
 		m.mu.Unlock()
 		if err != nil {
 			slog.Warn("checkin: TraeWork device_id 迁移持久化失败", "uid", a.UID, "error", err)
 		}
-		slog.Info("checkin: TraeWork device_id 已迁移为数字形态", "uid", a.UID)
+		slog.Info("checkin: TraeWork device_id 已迁移为数字形态", "uid", a.UID, "device_id", newID)
 	}
 	if a.AccessToken == "" {
 		return "", fmt.Errorf("%s：%s", textCheckinUnfinished, errNoAccessToken)
