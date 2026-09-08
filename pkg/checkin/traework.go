@@ -17,43 +17,43 @@ import (
 	"strconv"
 	"strings"
 	"io"
+	"time"
 )
 
-// twHeaderUserAgent 未从二进制还原，取浏览器惯例值。
-const twHeaderUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+// twHeaderUserAgent ug 端点 UA——对齐 wild-work clientUA="Trae/"+IdeVersion。
+const twHeaderUserAgent = "Trae/" + twIDEVersion
 
-// twRiskRateLimit 是 TraeWork 风控限流码（随机设备指纹被拒）。
+// twRiskRateLimit 是 TraeWork 风控限流码（wild-work CheckinClaim 同款处理：
+// 等 8s 重试一次）。
 const twRiskRateLimit = 9074
 
-// twUgHeaders 构造 ug 端点请求头——对齐 wild-work 的 SOLOHeaders + UgHeaders：
-// Authorization 用 Cloud-IDE-JWT 前缀（不是 Bearer），需全套设备指纹头。
+// twCheckinRetryDelay 是 9074 限流后的重试等待（wild-work CheckinRetryDelay 默认 8s）。
+const twCheckinRetryDelay = 8 * time.Second
+
+// twUgHeaders 构造 ug 端点请求头——逐项对齐 wild-work UgHeaders：
+// Authorization 用 Cloud-IDE-JWT 前缀（不是 Bearer）+ 小写设备指纹头集合。
+// 注意 X-Uid/X-Machine-Id 属 SOLOHeaders（聊天），UgHeaders 不带。
 func twUgHeaders(a *Account) http.Header {
 	h := http.Header{
-		"Content-Type":    {"application/json"},
-		"Accept":          {"application/json"},
-		"User-Agent":      {twHeaderUserAgent},
-		"X-User-Region":   {"CN"},
-		"X-Device-Type":   {"windows"},
-		"X-OS-Version":    {"Windows 10 Pro"},
-		"X-Device-Brand":  {"20Y5A002XX"},
-		"X-App-Version":   {twIDEVersion},
-		"Request-Traffic-Type": {"prod"},
+		"Content-Type": {"application/json"},
+		"Accept":       {"application/json"},
+		"User-Agent":   {twHeaderUserAgent},
+		"Authorization": {"Cloud-IDE-JWT " + a.AccessToken},
+		"X-User-Region": {"CN"},
+		// 设备指纹头（官方客户端 bb() 注入；UG 签到/积分接口校验，
+		// 缺任一环节会以 9074 拒绝）——wild-work 用小写 key。
+		"X-Device-Brand": {"20Y5A002XX"},
+		"X-Device-Type":  {"windows"},
+		"X-OS-Version":   {"Windows 10 Pro"},
+		"X-App-Version":  {twIDEVersion},
 	}
 	if a != nil {
 		if a.AccessToken != "" {
-			h.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
 			h.Set("X-Cloudide-Token", a.AccessToken)
 			h.Set("X-Ide-Token", a.AccessToken)
 		}
-		if a.UID != "" {
-			h.Set("X-Uid", a.UID)
-		}
 		if a.DeviceID != "" {
 			h.Set("x-device-id", a.DeviceID)
-			h.Set("X-Device-Id", a.DeviceID)
-		}
-		if a.MachineID != "" {
-			h.Set("X-Machine-Id", a.MachineID)
 		}
 	}
 	return h
@@ -110,56 +110,89 @@ func twEnvelope(raw map[string]interface{}) (code int, msg string, data map[stri
 	return code, msg, data
 }
 
+// twNumericDeviceID 判断 device_id 是否为官方客户端的 15 位纯数字形态。
+// 旧版登录生成的 UUID 形态会被 claim 风控以 9074 拒掉，需迁移。
+func twNumericDeviceID(id string) bool {
+	if len(id) != 15 {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // twCheckin 执行每日签到（claim），返回结果文案。
-// 设备指纹缺失直接报错（9074 前置提示）；风控码 9074 转专用文案。
+// 对齐 wild-work CheckinClaim：body 恒为空 JSON {}（不发设备信息），
+// 9074 限流等 8s 重试一次（CheckinRetryDelay），两试仍限流才报错。
 func (m *Manager) twCheckin(ctx context.Context, a *Account) (string, error) {
 	if a.DeviceID == "" {
 		return "", errors.New(errDeviceFingerprint)
 	}
+	if !twNumericDeviceID(a.DeviceID) {
+		// 存量 UUID 设备 ID 迁移为 15 位纯数字（9074 根治，2026-09-08 实测）
+		a.DeviceID = twNumericID()
+		m.mu.Lock()
+		err := m.saveStored()
+		m.mu.Unlock()
+		if err != nil {
+			slog.Warn("checkin: TraeWork device_id 迁移持久化失败", "uid", a.UID, "error", err)
+		}
+		slog.Info("checkin: TraeWork device_id 已迁移为数字形态", "uid", a.UID)
+	}
 	if a.AccessToken == "" {
 		return "", fmt.Errorf("%s：%s", textCheckinUnfinished, errNoAccessToken)
 	}
-	body := map[string]interface{}{
-		"device_id":    a.DeviceID,
-		"machine_id":   a.MachineID,
-		"machine_type": a.MachineType,
-	}
-	var out map[string]interface{}
-	if err := doJSON(ctx, m.hc, http.MethodPost, a.twHost()+twClaimPath, twUgHeaders(a), body, &out); err != nil {
-		return "", err
-	}
-	code, msg, data := twEnvelope(out)
-	if code == twRiskRateLimit || containsFold(msg, []string{"9074"}) {
-		twRiskRateLimited()
-		return "", errors.New(errRateLimited9074)
-	}
-	if !twOKCode(code) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var out map[string]interface{}
+		if err := doJSON(ctx, m.hc, http.MethodPost, a.twHost()+twClaimPath, twUgHeaders(a), map[string]interface{}{}, &out); err != nil {
+			return "", err
+		}
+		code, msg, data := twEnvelope(out)
+		if code == twRiskRateLimit || containsFold(msg, []string{"9074"}) {
+			if attempt == 0 {
+				twRiskRateLimited()
+				slog.Warn("checkin: 9074 限流，等待后重试", "uid", a.UID, "retry_after", twCheckinRetryDelay.String())
+				select {
+				case <-time.After(twCheckinRetryDelay):
+				case <-ctx.Done():
+					return "", ctx.Err()
+				}
+				continue
+			}
+			return "", errors.New(errRateLimited9074)
+		}
+		if !twOKCode(code) {
+			if containsFold(msg, alreadyCheckedMarkers) {
+				return "", errAlreadyCheckedIn
+			}
+			if containsFold(msg, creditMarkers) {
+				return "", errors.New(msg)
+			}
+			if msg == "" {
+				msg = textCheckinFailed
+			}
+			return "", errors.New(msg)
+		}
+		if data != nil && truthy(data["checked_in"]) {
+			return "", errAlreadyCheckedIn
+		}
+		if data != nil {
+			if v, ok := data["checked_in"]; ok && !truthy(v) {
+				return "", errors.New(textNotCheckedIn)
+			}
+		}
 		if containsFold(msg, alreadyCheckedMarkers) {
 			return "", errAlreadyCheckedIn
 		}
-		if containsFold(msg, creditMarkers) {
-			return "", errors.New(msg)
+		if msg != "" {
+			return msg, nil
 		}
-		if msg == "" {
-			msg = textCheckinFailed
-		}
-		return "", errors.New(msg)
+		return textCheckinOK, nil
 	}
-	if data != nil && truthy(data["checked_in"]) {
-		return "", errAlreadyCheckedIn
-	}
-	if data != nil {
-		if v, ok := data["checked_in"]; ok && !truthy(v) {
-			return "", errors.New(textNotCheckedIn)
-		}
-	}
-	if containsFold(msg, alreadyCheckedMarkers) {
-		return "", errAlreadyCheckedIn
-	}
-	if msg != "" {
-		return msg, nil
-	}
-	return textCheckinOK, nil
+	return "", errors.New(errRateLimited9074)
 }
 
 // twOKCode 判断 TraeWork 业务码是否成功（0/200/负数兼容）。

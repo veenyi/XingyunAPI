@@ -80,7 +80,10 @@ func (m *Manager) TraeLoginStart(_ context.Context) (*QoderLoginResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("生成设备密钥失败: %w", err)
 	}
-	deviceID, machineID := twUUID(), twUUID()
+	// device_id 必须是 15 位纯数字（官方客户端 randNumericID 形态）——
+	// UUID 形态的 device_id 会被 claim 风控以 9074「参与用户太多」拒掉
+	// （2026-09-08 实测：同一 token UUID id 9074，15 位数字 id code=0）。
+	deviceID, machineID := twNumericID(), twUUID()
 
 	s := &twLoginSession{
 		ID:        randHex(12),
@@ -503,6 +506,19 @@ func twUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80
 	h := hex.EncodeToString(b)
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// twNumericID 生成 15 位纯数字设备 ID（对齐 wild-work randNumericID /
+// 官方客户端 device_id 格式；UUID 形态会触发 claim 9074 风控）。
+func twNumericID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		n := time.Now().UnixNano() % 900000000000000
+		return fmt.Sprintf("%015d", 100000000000000+n)
+	}
+	n := uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
+		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
+	return fmt.Sprintf("%015d", n%900000000000000+100000000000000)
 }
 
 // addTraeAccount 把浏览器登录成功的账号加入签到列表（按 UID 去重更新）。
